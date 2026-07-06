@@ -75,6 +75,12 @@ jobs:
         if: steps.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: CCX harness self-tests
+        if: steps.changes.outputs.docs_only != 'true'
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          bash tools/ccx/tests/run-tests.sh
+
       - name: Install sqlite3 (e2e DB assertions)
         if: steps.changes.outputs.docs_only != 'true'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
