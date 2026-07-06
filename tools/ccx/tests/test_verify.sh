@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 # ccx thin harness: shell tests for verify-task.sh. Standalone:
 #   bash tools/ccx/tests/test_verify.sh
-# Builds a scratch git repo per run; contracts are written on the fly into
-# a temp contracts dir (verify-task.sh does not lint, so plain shell
-# commands stand in for acceptance entries). Exits nonzero on any failure
-# and prints PASS/FAIL per scenario.
+# Builds a scratch git repo (a minimal cargo crate) per run; contracts are
+# written on the fly into a temp contracts dir. Acceptance commands are REAL
+# cargo commands: verify-task.sh reads them via `ccx-lint --dump-acceptance`,
+# which is fail-closed and refuses anything outside the cargo grammar, so the
+# fake shell strings a prior version used are no longer valid — the tests
+# exercise the tool exactly as a real contract would. Requires cargo on PATH
+# (this is a Rust repo; the harness self-test already runs after the cargo
+# trio). Exits nonzero on any failure and prints PASS/FAIL per scenario.
 set -uo pipefail
+export CARGO_NET_OFFLINE=true  # the fixture crate has no deps; never hit a registry
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CCX="$ROOT/tools/ccx"
 VERIFY="$CCX/verify-task.sh"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "test_verify: cargo not on PATH — required (this is a Rust repo)" >&2
+  exit 1
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -24,15 +34,24 @@ fail() {
   fi
 }
 
-# --- scratch repo with a `base` branch --------------------------------------
+# --- scratch repo: a minimal, dependency-free cargo crate on a `base` branch -
 SCRATCH="$TMP/scratch"
 git init -q "$SCRATCH"
 git -C "$SCRATCH" config user.name ccx-test
 git -C "$SCRATCH" config user.email ccx@test
 mkdir -p "$SCRATCH/src"
-echo "hello" > "$SCRATCH/src/main.txt"
+cat > "$SCRATCH/Cargo.toml" <<'EOF'
+[package]
+name = "ccx_verify_fixture"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+echo "pub fn ok() -> bool { true }" > "$SCRATCH/src/lib.rs"
 git -C "$SCRATCH" add -A
-git -C "$SCRATCH" commit -qm "init scratch"
+git -C "$SCRATCH" commit -qm "init scratch crate"
 git -C "$SCRATCH" branch base
 
 mkclone() { # <dir>
@@ -43,16 +62,16 @@ mkclone() { # <dir>
 }
 
 # --- patches -----------------------------------------------------------------
-# patch-good: creates src/f.txt on the clean base.
+# patch-good: a benign non-code file, so the crate still builds after apply.
 PGEN="$TMP/patchgen"
 mkclone "$PGEN"
 echo "made it" > "$PGEN/src/f.txt"
 git -C "$PGEN" add -A
 git -C "$PGEN" diff --cached > "$TMP/patch-good.diff"
 
-# stack1 adds src/order.txt; dependent modifies the line stack1 added, so
-# it only applies on top of stack1 (mirrors the pilot clean-base
-# impossibility).
+# stack1 adds src/order.txt; dependent modifies the line stack1 added, so the
+# dependent patch only applies on top of stack1 (the pilot clean-base
+# impossibility). Neither affects the crate build.
 SGEN="$TMP/stackgen"
 mkclone "$SGEN"
 echo "one" > "$SGEN/src/order.txt"
@@ -63,7 +82,11 @@ printf 'one\ntwo\n' > "$SGEN/src/order.txt"
 git -C "$SGEN" add -A
 git -C "$SGEN" diff --cached > "$TMP/dependent.diff"
 
-# --- on-the-fly contracts -----------------------------------------------------
+# --- on-the-fly contracts (real cargo acceptance commands) -------------------
+# PASS command: `cargo build` (the empty crate compiles).
+# FAIL command: `cargo test --test __ccx_missing__` — no such integration test
+#   target, so cargo errors out fast without a full compile. Both are
+#   grammar-valid and metacharacter-free, so --dump-acceptance emits them.
 CONTRACTS="$TMP/contracts"
 mkdir -p "$CONTRACTS"
 
@@ -72,9 +95,9 @@ schema: ccx.contract.v1
 id: ccx-all-green
 acceptance:
   fix:
-    - test -f src/f.txt
+    - cargo build
   guard:
-    - "true"
+    - cargo build
 EOF
 
 cat > "$CONTRACTS/fix-fails.yaml" <<'EOF'
@@ -82,9 +105,9 @@ schema: ccx.contract.v1
 id: ccx-fix-fails
 acceptance:
   fix:
-    - "false"
+    - cargo test --test __ccx_missing__
   guard:
-    - "true"
+    - cargo build
 EOF
 
 cat > "$CONTRACTS/guard-fails.yaml" <<'EOF'
@@ -92,9 +115,9 @@ schema: ccx.contract.v1
 id: ccx-guard-fails
 acceptance:
   fix:
-    - test -f src/f.txt
+    - cargo build
   guard:
-    - "false"
+    - cargo test --test __ccx_missing__
 EOF
 
 cat > "$CONTRACTS/stacked.yaml" <<'EOF'
@@ -102,7 +125,7 @@ schema: ccx.contract.v1
 id: ccx-stacked
 acceptance:
   fix:
-    - test -f src/order.txt
+    - cargo build
   guard: []
 EOF
 
@@ -110,7 +133,19 @@ cat > "$CONTRACTS/v0-flat.yaml" <<'EOF'
 schema: ccx.contract.v0
 id: ccx-v0-flat
 acceptance:
-  - test -f src/f.txt
+  - cargo build
+EOF
+
+# A contract carrying a shell-injection payload behind a cargo prefix. The
+# eval sink must never see it: --dump-acceptance refuses it, so verify-task.sh
+# aborts before running anything.
+cat > "$CONTRACTS/injection.yaml" <<'EOF'
+schema: ccx.contract.v1
+id: ccx-injection
+acceptance:
+  fix:
+    - "cargo test; touch pwned"
+  guard: []
 EOF
 
 # --- 1. all green: exit 0, FIX PASS + GUARD PASS recorded ---------------------
@@ -120,8 +155,8 @@ bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/all-green.yaml" \
   --contracts-dir "$CONTRACTS" --out "$O" --patch "$TMP/patch-good.diff" > "$LOG" 2>&1
 rc=$?
 if [[ $rc -eq 0 ]] \
-  && grep -q "^FIX PASS test -f src/f.txt$" "$O/verify.txt" \
-  && grep -q "^GUARD PASS true$" "$O/verify.txt"; then
+  && grep -q "^FIX PASS cargo build$" "$O/verify.txt" \
+  && grep -q "^GUARD PASS cargo build$" "$O/verify.txt"; then
   pass "1 all green: exit 0, FIX PASS and GUARD PASS recorded"
 else
   fail "1 all green (rc=$rc)" "$LOG"
@@ -134,8 +169,8 @@ bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/fix-fails.yaml" \
   --contracts-dir "$CONTRACTS" --out "$O" --patch "$TMP/patch-good.diff" > "$LOG" 2>&1
 rc=$?
 if [[ $rc -eq 2 ]] \
-  && grep -q "^FIX FAIL false$" "$O/verify.txt" \
-  && grep -q "^GUARD PASS true$" "$O/verify.txt"; then
+  && grep -q "^FIX FAIL cargo test --test __ccx_missing__$" "$O/verify.txt" \
+  && grep -q "^GUARD PASS cargo build$" "$O/verify.txt"; then
   pass "2 fix failure: exit 2, guard set still ran and was recorded"
 else
   fail "2 fix failure (rc=$rc)" "$LOG"
@@ -148,8 +183,8 @@ bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/guard-fails.yaml"
   --contracts-dir "$CONTRACTS" --out "$O" --patch "$TMP/patch-good.diff" > "$LOG" 2>&1
 rc=$?
 if [[ $rc -eq 4 ]] \
-  && grep -q "^FIX PASS test -f src/f.txt$" "$O/verify.txt" \
-  && grep -q "^GUARD FAIL false$" "$O/verify.txt"; then
+  && grep -q "^FIX PASS cargo build$" "$O/verify.txt" \
+  && grep -q "^GUARD FAIL cargo test --test __ccx_missing__$" "$O/verify.txt"; then
   pass "3 guard-only failure: exit 4, FIX PASS + GUARD FAIL recorded"
 else
   fail "3 guard-only failure (rc=$rc)" "$LOG"
@@ -163,7 +198,7 @@ bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/stacked.yaml" \
   --stack "$TMP/stack1.diff" --patch "$TMP/dependent.diff" > "$LOG" 2>&1
 rc=$?
 if [[ $rc -eq 0 ]] \
-  && grep -q "^FIX PASS test -f src/order.txt$" "$O/verify.txt" \
+  && grep -q "^FIX PASS cargo build$" "$O/verify.txt" \
   && [[ "$(cat "$C/src/order.txt" 2>/dev/null)" == "$(printf 'one\ntwo')" ]]; then
   pass "4a stack rebuild: dependent patch verifies with --stack"
 else
@@ -191,11 +226,25 @@ bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/v0-flat.yaml" \
 rc=$?
 if [[ $rc -eq 0 ]] \
   && grep -q "^WARN: v0 flat acceptance treated as fix set$" "$LOG" \
-  && grep -q "^FIX PASS test -f src/f.txt$" "$O/verify.txt" \
+  && grep -q "^FIX PASS cargo build$" "$O/verify.txt" \
   && ! grep -q "^GUARD" "$O/verify.txt"; then
   pass "5 v0 flat acceptance: WARN emitted, flat list ran as fix set"
 else
   fail "5 v0 flat acceptance (rc=$rc)" "$LOG"
+fi
+
+# --- 6. injection payload is refused before any eval --------------------------
+C="$TMP/c6"; O="$TMP/o6"; LOG="$TMP/log6"
+mkclone "$C"; mkdir -p "$O"
+bash "$VERIFY" --clone "$C" --base base --contract "$CONTRACTS/injection.yaml" \
+  --contracts-dir "$CONTRACTS" --out "$O" --patch "$TMP/patch-good.diff" > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] \
+  && grep -q "cannot read acceptance" "$LOG" \
+  && [[ ! -e "$C/pwned" ]]; then
+  pass "6 injection: shell-suffixed acceptance refused before eval, no side effect"
+else
+  fail "6 injection payload not refused (rc=$rc)" "$LOG"
 fi
 
 echo

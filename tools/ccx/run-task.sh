@@ -58,16 +58,13 @@ run_one() {
   local contract="$1" task="$2"
   shift 2
   local out="$OUT/$task"
-  mkdir -p "$out"
+  mkdir -p "$out" || { echo "FATAL: cannot create out dir $out"; exit 1; }
+  # Clear a stale UNKNOWN.md from a prior invocation of this same task, so a
+  # clean re-run after triage is not misread as still-blocked.
+  rm -f "$out/UNKNOWN.md"
   echo "=== ccx run :: $task :: stack[$#] :: $(date +%H:%M:%S)"
 
-  # 1. Lint preflight — a contract that fails lint never reaches an agent.
-  if ! python3 "$CCX/ccx-lint.py" --contracts-dir "$CONTRACTS_DIR" "$contract"; then
-    echo "FATAL: lint gate failed for $contract — fix the contract before any agent run"
-    exit 1
-  fi
-
-  # 2. Rebuild the exact stacked base on a detached HEAD (P1: base never moves).
+  # 1. Rebuild the exact stacked base on a detached HEAD (P1: base never moves).
   if ! ccx_check_clone "$CLONE" "$BASE"; then
     echo "FATAL: clone pre-flight failed for $task"
     exit 1
@@ -77,12 +74,25 @@ run_one() {
     exit 1
   fi
 
+  # 2. Lint preflight against the REBUILT clone — a contract that fails lint
+  # never reaches an agent. --repo-root pins primitive/cap resolution to the
+  # clone (the tree the agent will see), not the caller's cwd; without it a
+  # run launched from a /tmp scratch dir would falsely FATAL on every contract.
+  if ! python3 "$CCX/ccx-lint.py" --contracts-dir "$CONTRACTS_DIR" \
+       --repo-root "$CLONE" "$contract"; then
+    echo "FATAL: lint gate failed for $contract — fix the contract before any agent run"
+    exit 1
+  fi
+
   # 3. Brief + single-sourced task instruction → prompt.
   if ! python3 "$CCX/ccx-brief.py" --contracts-dir "$CONTRACTS_DIR" "$contract" > "$out/brief.txt"; then
     echo "FATAL: brief emission failed for $contract"
     exit 1
   fi
-  cat "$out/brief.txt" "$CCX/prompts/task-instruction.txt" > "$out/prompt.txt"
+  if ! cat "$out/brief.txt" "$CCX/prompts/task-instruction.txt" > "$out/prompt.txt"; then
+    echo "FATAL: prompt composition failed for $task"
+    exit 1
+  fi
 
   # 4. Fresh agent session in the clone.
   local start end status
@@ -92,9 +102,14 @@ run_one() {
   end=$(date +%s)
   echo "$status $((end - start))s" > "$out/exit-and-seconds.txt"
 
-  # 5. Collect the produced patch (dry-run marker never counts as output).
-  git -C "$CLONE" add -A
-  git -C "$CLONE" reset --quiet -- .ccx-dry-run-marker 2>/dev/null
+  # 5. Collect the produced patch. UNKNOWN.md and the dry-run marker are
+  # harness control artifacts, not task output — keep both out of patch.diff
+  # so a preserved patch never carries a stale UNKNOWN.md into a later stack.
+  if ! git -C "$CLONE" add -A; then
+    echo "FATAL: git add failed while collecting patch for $task"
+    exit 1
+  fi
+  git -C "$CLONE" reset --quiet -- .ccx-dry-run-marker UNKNOWN.md 2>/dev/null
   git -C "$CLONE" diff --cached > "$out/patch.diff"
 
   # 6. Stop-on-unknown: a well-formed stop is a success outcome (see
@@ -103,6 +118,14 @@ run_one() {
     cp "$CLONE/UNKNOWN.md" "$out/UNKNOWN.md"
     echo "HALT: $task filed UNKNOWN — chain stops here for author triage"
     exit 2
+  fi
+
+  # 6b. A crashed/unauthenticated agent (no UNKNOWN.md, nonzero exit) must not
+  # pass as success — an empty patch would otherwise clear blast and let a
+  # dependent stack an empty base (the silent clean-base run P1 forbids).
+  if ((status != 0)); then
+    echo "FATAL: agent exited nonzero ($status) for $task with no UNKNOWN.md — see $out/stderr.log"
+    exit 1
   fi
 
   # 7. Blast postflight: the patch must stay inside the contract's radius.
@@ -129,7 +152,7 @@ import sys
 
 import yaml
 
-have_stack = int(sys.argv[1]) > 0
+stack_count = int(sys.argv[1])
 paths = sys.argv[2:]
 info = {}  # id -> (path, deps)
 order_in = []
@@ -147,12 +170,23 @@ for p in paths:
 
 ids = set(info)
 missing = sorted({d for cid in ids for d in info[cid][1] if d not in ids})
-if missing and not have_stack:
+# Every out-of-chain dependency must be covered by its own --stack patch.
+# Requiring stack_count >= len(missing) (not merely "any stack supplied")
+# kills the reproduced bypass where one unrelated patch suppressed refusal
+# for every missing dependency at once. NOTE: --stack patches are opaque
+# files, so this is a count guard, not an id match; an operator can still
+# supply the wrong N patches. Explicit per-id acknowledgement is a tracked
+# follow-up (see the plan Open Questions).
+if missing and len(missing) > stack_count:
     sys.stderr.write(
-        "run-task: chain refusal: dependencies neither in the chain nor "
-        "covered by an explicit --stack patch: " + ", ".join(missing) + "\n"
-        "run-task: add the missing contracts to --chain, or supply their "
-        "patches via --stack\n"
+        "run-task: chain refusal: "
+        + str(len(missing))
+        + " out-of-chain dependencies but only "
+        + str(stack_count)
+        + " --stack patch(es): "
+        + ", ".join(missing)
+        + "\nrun-task: add the missing contracts to --chain, or supply one "
+        "--stack patch per missing dependency\n"
     )
     sys.exit(1)
 

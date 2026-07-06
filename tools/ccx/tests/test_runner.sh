@@ -68,7 +68,13 @@ cat > "$TMP/agent-evil.sh" <<'EOF'
 cat > /dev/null
 echo "rogue write outside allowed_changes" > outside.txt
 EOF
-chmod +x "$TMP/agent-unknown.sh" "$TMP/agent-evil.sh"
+# Crashed/unauthenticated agent: nonzero exit, no UNKNOWN.md, no patch.
+cat > "$TMP/agent-crash.sh" <<'EOF'
+#!/usr/bin/env bash
+cat > /dev/null
+exit 7
+EOF
+chmod +x "$TMP/agent-unknown.sh" "$TMP/agent-evil.sh" "$TMP/agent-crash.sh"
 
 echo "this is not a unified diff" > "$TMP/garbage.diff"
 
@@ -168,6 +174,46 @@ if cmp -s <(cat "$TMP/o1/runner-chain-a/brief.txt" "$CCX/prompts/task-instructio
   pass "8 prompt composition: prompt.txt == brief.txt + task-instruction.txt bytes"
 else
   fail "8 prompt composition: byte mismatch" "$TMP/log1"
+fi
+
+# --- 9. crashed agent (nonzero exit, no UNKNOWN) is fatal ---------------------
+C="$TMP/c9"; O="$TMP/o9"; LOG="$TMP/log9"
+mkclone "$C"
+"$RUN" --clone "$C" --base base --contracts-dir "$FIX" --out "$O" \
+  --agent-cmd "$TMP/agent-crash.sh" "$CHAIN_A" > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q "agent exited nonzero" "$LOG"; then
+  pass "9 crashed agent: nonzero exit with no UNKNOWN is fatal (not silent success)"
+else
+  fail "9 crashed agent (rc=$rc)" "$LOG"
+fi
+
+# --- 10. --stack count guard: one patch cannot cover two missing deps ---------
+cat > "$TMP/runner-multidep.yaml" <<'EOF'
+schema: ccx.contract.v1
+id: ccx-runner-multidep
+revision: 1
+ticket: NER-000
+task: Two out-of-chain dependencies
+interface: |
+  Depends on two contracts that are not in the chain.
+depends_on: [ccx-ext-one, ccx-ext-two]
+acceptance:
+  fix: [cargo build]
+  guard: []
+allowed_changes:
+  paths: [src/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}
+EOF
+C="$TMP/c10"; O="$TMP/o10"; LOG="$TMP/log10"
+mkclone "$C"
+"$RUN" --clone "$C" --base base --contracts-dir "$FIX" --out "$O" \
+  --stack "$TMP/stack1.diff" --dry-run --chain "$TMP/runner-multidep.yaml" > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q "out-of-chain dependencies but only 1" "$LOG"; then
+  pass "10 stack count guard: 2 missing deps + 1 --stack is refused"
+else
+  fail "10 stack count guard (rc=$rc)" "$LOG"
 fi
 
 echo

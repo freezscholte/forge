@@ -43,17 +43,20 @@ done
 [[ -n "$PATCH" ]] || PATCH="$OUT/patch.diff"
 [[ -f "$PATCH" ]] || { echo "verify-task: patch not found: $PATCH" >&2; exit 1; }
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" || { echo "verify-task: cannot create out dir $OUT" >&2; exit 1; }
 VERIFY="$OUT/verify.txt"
 : > "$VERIFY"
 echo "=== ccx verify :: $(basename "$CONTRACT") :: stack[${#STACKS[@]}] :: $(date +%H:%M:%S)"
 
 # 1. Read the contract's acceptance sets up front (before touching the
 # clone): a malformed contract is a usage failure, not a verify result.
-# verify-task.sh does NOT lint — the runner already did.
+# --dump-acceptance is fail-closed — it refuses (nonzero) any command that
+# would not pass the rule-6 grammar/no-metacharacter check, so this eval
+# sink is gated even when verify-task.sh is invoked standalone without the
+# runner's lint preflight.
 if ! ACC_JSON="$(python3 "$CCX/ccx-lint.py" --contracts-dir "$CONTRACTS_DIR" \
   --dump-acceptance "$CONTRACT")"; then
-  echo "verify-task: cannot read acceptance from $CONTRACT" >&2
+  echo "verify-task: cannot read acceptance from $CONTRACT (malformed, or an unsafe acceptance command was refused)" >&2
   exit 1
 fi
 SCHEMA="$(python3 -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1])).get("schema", ""))' "$CONTRACT" 2>/dev/null)"

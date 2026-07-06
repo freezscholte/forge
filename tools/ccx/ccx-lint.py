@@ -65,6 +65,24 @@ REQUIRED_KEYS = [
 SCHEMA_V0 = "ccx.contract.v0"
 SCHEMA_V1 = "ccx.contract.v1"
 COMMAND_GRAMMAR = re.compile(r"^cargo (test|clippy|fmt|build|run)\b")
+# Shell metacharacters that turn a lint-passing `cargo ...` prefix into an
+# injection when the string reaches `eval` in verify-task.sh. The grammar
+# regex is prefix-anchored by design (cargo takes arbitrary trailing args),
+# so command safety is a separate, explicit check: an acceptance entry must
+# BOTH start with an allowed cargo subcommand AND contain no shell control.
+SHELL_METACHARACTERS = ";&|`$(){}<>\n\r\\!*?[]#\"'"
+
+
+def command_is_safe(cmd) -> bool:
+    """A grammar-valid, metacharacter-free acceptance command.
+
+    Enforced identically by lint rule 6 and by --dump-acceptance so every
+    consumer of acceptance commands (notably verify-task.sh, which eval's
+    them) is gated on the same rule regardless of whether it re-runs lint.
+    """
+    if not isinstance(cmd, str) or not COMMAND_GRAMMAR.match(cmd):
+        return False
+    return not any(ch in cmd for ch in SHELL_METACHARACTERS)
 # Single keyword-list constant for filesystem-enumeration signals (rule 5).
 ENUMERATION_SIGNALS = [
     "read_dir",
@@ -616,24 +634,19 @@ class Linter:
             for filt in filters:
                 if any(filt in cand for cand in candidates):
                     continue
-                crate_prefix = f"crates/{crate}/" if crate else "crates/"
-                deliverable = any(
-                    g.startswith(crate_prefix) for g in allow_globs
+                # No deliverable exemption here (unlike the --test branch): a
+                # bare `cargo test <filter>` whose filter matches nothing exits
+                # 0 — vacuously green forever, with nothing forcing a matching
+                # test to appear. That is exactly the pilot's `-p forge-store
+                # provenance` Goodhart defect, so it is always an error. (A
+                # missing `--test <target>`, by contrast, makes cargo fail
+                # loudly, so its deliverable exemption is safe.)
+                self.add(
+                    "R4",
+                    "error",
+                    f"vacuous acceptance: filter {filt!r} in {cmd!r} matches "
+                    "no candidate test path in the crate's code",
                 )
-                if deliverable:
-                    self.add(
-                        "R4",
-                        "warning",
-                        f"acceptance target is a deliverable — verify post-run: "
-                        f"filter {filt!r} in {cmd!r} matches no existing test path",
-                    )
-                else:
-                    self.add(
-                        "R4",
-                        "error",
-                        f"vacuous acceptance: filter {filt!r} in {cmd!r} matches "
-                        "no candidate test path in the crate's code",
-                    )
 
     # ---- R5: exclusion clause -------------------------------------------------
 
@@ -669,7 +682,16 @@ class Linter:
 
     def rule6_grammar(self, fix, guard) -> None:
         for cmd in fix + guard:
-            if not isinstance(cmd, str) or not COMMAND_GRAMMAR.match(cmd):
+            if command_is_safe(cmd):
+                continue
+            if isinstance(cmd, str) and COMMAND_GRAMMAR.match(cmd):
+                self.add(
+                    "R6",
+                    "error",
+                    f"acceptance entry contains shell metacharacters "
+                    f"(reaches eval in verify-task.sh): {cmd!r}",
+                )
+            else:
                 self.add(
                     "R6",
                     "error",
@@ -731,6 +753,17 @@ def dump_acceptance(contract_path: Path) -> int:
     else:
         print("ccx-lint: contract has no acceptance", file=sys.stderr)
         return 1
+    # Fail closed: verify-task.sh eval's these strings and does not re-lint,
+    # so --dump-acceptance is the gate. Refuse to emit any command that would
+    # not pass rule 6 (grammar + no shell metacharacters), regardless of the
+    # contract's schema version — the eval surface is not v0-exempt.
+    for cmd in list(out["fix"]) + list(out["guard"]):
+        if not command_is_safe(cmd):
+            print(
+                f"ccx-lint: unsafe acceptance command refused: {cmd!r}",
+                file=sys.stderr,
+            )
+            return 2
     json.dump(out, sys.stdout, indent=1)
     print()
     return 0

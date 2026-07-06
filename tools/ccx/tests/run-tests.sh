@@ -23,11 +23,15 @@ if [[ "${count:-0}" -eq 0 ]]; then
   exit 1
 fi
 
+# Propagate shell-suite failures: without -e and with each suite as a
+# non-final command, a failing suite would otherwise be swallowed and the
+# gate would go green — the exact vacuous-pass hazard this entrypoint exists
+# to prevent.
 echo "==> ccx shell suite: test_runner.sh"
-bash tools/ccx/tests/test_runner.sh
+bash tools/ccx/tests/test_runner.sh || exit 1
 
 echo "==> ccx shell suite: test_verify.sh"
-bash tools/ccx/tests/test_verify.sh
+bash tools/ccx/tests/test_verify.sh || exit 1
 
 echo
 echo "ccx harness self-tests passed ($count python tests + 2 shell suites)."

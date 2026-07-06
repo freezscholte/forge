@@ -37,16 +37,26 @@ import sys
 
 # Always-forbidden paths, applied regardless of --contract / --allow /
 # --forbid. Mirrors Forge's snapshot/export exclusions.
+# Both root-anchored and any-depth (`**/`) forms: a monorepo `.env` or a
+# nested `sub/.forge/forge.db` must be forbidden even when a broad allowlist
+# (e.g. `**` or `crates/**`) would otherwise cover the subtree. `*`-prefixed
+# suffix patterns (`*.pem`, `*credentials*`) already match at any depth via
+# fnmatch, so they need no `**/` twin.
 DEFAULT_FORBID = [
     ".forge/**",
+    "**/.forge/**",
     ".env",
+    "**/.env",
     ".env.*",
+    "**/.env.*",
     "*.pem",
     "*_rsa",
     "*_ed25519",
     "*.key",
     ".aws/**",
+    "**/.aws/**",
     ".ssh/**",
+    "**/.ssh/**",
     "*credentials*",
 ]
 
@@ -62,6 +72,16 @@ FACADE_NOTE = "facade path — rerun in --diff mode for line-level facade allowa
 # Start of a (possibly multi-line) declaration/re-export statement:
 # `mod x;`, `pub mod x;`, `use …;`, `pub use …;`, `pub(crate) use …;`.
 STMT_RE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:use|mod)\b")
+MOD_RE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\b")
+# Characters that can legitimately appear inside a `use`/`mod` declaration
+# path/group. Deliberately EXCLUDES `(` `)` `=` `!` `<` `>` `"` `'` `.` `|`
+# `&` `#` `/` etc., so any executable code smuggled onto a facade line — a
+# macro call (`include!(…)`), a fn/const/static item, a closure — contains a
+# character outside this set and is rejected. `use`/`mod` paths use only
+# identifiers, `::`, `,`, `{ }` groups, `*` globs, `;`, and whitespace.
+SAFE_DECL_CHARS = set(
+    " \tabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:,{}*;"
+)
 
 
 def matches(path: str, pattern: str) -> bool:
@@ -178,46 +198,82 @@ def parse_diff(text: str):
     return records
 
 
+def _scan_decl_line(code: str, state: list, strict: bool) -> bool:
+    """Consume one line as `use`/`mod` declaration text, updating `state`.
+
+    `state` is `[in_stmt: bool, depth: int]`, carried across the lines of one
+    diff side so a multi-line `pub use foo::{ … };` group is tracked. In
+    `strict` mode (applied to CHANGED lines) every character consumed must be
+    in `SAFE_DECL_CHARS`, a brace-form `mod x { … }` is refused, and code that
+    follows a statement's terminating `;` must itself open another declaration
+    — so nothing executable can ride along on a facade line. In lenient mode
+    (context lines) the scan only advances `state` and never rejects; any
+    mis-tracking there biases a later changed line toward rejection, the safe
+    direction.
+    """
+    i, n = 0, len(code)
+    while i < n:
+        while i < n and code[i] in " \t":
+            i += 1
+        if i >= n or code[i:].startswith("//"):
+            break
+        if not state[0]:
+            rest = code[i:]
+            if not STMT_RE.match(rest):
+                return not strict
+            if strict and MOD_RE.match(rest) and "{" in rest:
+                return False  # brace-form module body, not a bare `mod x;`
+            state[0] = True
+            state[1] = 0
+        while i < n:
+            c = code[i]
+            if strict and c not in SAFE_DECL_CHARS:
+                return False
+            if c == "{":
+                state[1] += 1
+            elif c == "}":
+                state[1] -= 1
+            elif c == ";" and state[1] <= 0:
+                state[0] = False
+                state[1] = 0
+                i += 1
+                break
+            i += 1
+        else:
+            break  # line ended mid-statement; span continues on next line
+    return True
+
+
 def hunks_decl_only(hunks) -> bool:
     """True iff every changed line in every hunk is declaration-only.
 
-    Statement-aware, not per-line: a changed line is allowed when it is
-    blank, a `//` comment, an attribute, or lies within a `mod …;` /
-    `[pub] use …;` statement span. Spans are reconstructed separately for
-    the old side (context + removed) and new side (context + added) of
-    each hunk, so an opener like `pub use foo::{` that only appears as
-    context still licenses added/removed continuation lines inside it.
-    Brace balance is tracked from the statement opener; the span closes at
-    a `;` once braces are balanced. Anything else (fn bodies, structs,
-    non-use code) fails.
+    Statement-aware and character-restricted: a changed line is allowed when
+    it is blank, a `//` comment, an attribute, or consists solely of `use`/
+    `mod` declaration text (see `_scan_decl_line`). Spans are reconstructed
+    separately for the old side (context + removed) and new side (context +
+    added) of each hunk, so an opener like `pub use foo::{` appearing only as
+    context still licenses added/removed continuation lines inside it. Any
+    executable code — a fn/struct/const/static item, a macro call, a closure,
+    a brace-form module body, or code trailing a statement's `;` — fails.
     """
     for hunk in hunks:
         for keep in ("-", "+"):
-            in_stmt = False
-            depth = 0
+            state = [False, 0]
             for tag, body in hunk:
                 if tag not in (" ", keep):
                     continue
+                changed = tag == keep
                 stripped = body.strip()
-                code = stripped.split("//", 1)[0].strip()
-                if not in_stmt and code and STMT_RE.match(code):
-                    in_stmt = True
-                    depth = 0
-                line_in_stmt = in_stmt
-                if in_stmt:
-                    depth += code.count("{") - code.count("}")
-                    if depth <= 0 and code.endswith(";"):
-                        in_stmt = False
-                if tag != keep:
-                    continue
-                allowed = (
+                if (
                     not stripped
                     or stripped.startswith("//")
                     or stripped.startswith("#[")
                     or stripped.startswith("#![")
-                    or line_in_stmt
-                )
-                if not allowed:
+                ):
+                    continue  # blank / comment / attribute; state unchanged
+                code = body.split("//", 1)[0].rstrip()
+                ok = _scan_decl_line(code, state, strict=changed)
+                if changed and not ok:
                     return False
     return True
 

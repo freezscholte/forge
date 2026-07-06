@@ -283,6 +283,8 @@ Recorded because this run proceeded without a scoping confirmation (autonomous s
 - **Open (NER-383, Jan):** refusal semantics for blast-check edge cases; harness keeps pilot behavior (violation = report + exit 2, no new verdicts) and adopts NER-383 outcomes when decided.
 - **Open (from doc review):** should there be a standing `ccx-lint --all <contracts-dir>` entry point wired into run-tests.sh/CI so defective contracts are caught at commit time, not first run? Cheap to add during U3 if it falls out naturally; otherwise revisit at dogfood.
 - **Open (from doc review):** who owns invoking `verify-task.sh` after a chain completes — the operator, or an optional `--verify` flag on the runner's chain form? Ship U5/U6 as independently invocable tools; decide the stitching after the first dogfood run shows the natural workflow.
+- **Deferred (from code review):** the runner's `--stack` guard is a **count** guard (require one `--stack` patch per out-of-chain dependency), not an id match — an operator can still supply the wrong N patches. The reproduced "one patch suppresses all missing deps" bypass is closed; precise per-id acknowledgement (`--stack <id>=<patch>` or an `--assume-dep <id>` flag) is the follow-up.
+- **Deferred (from code review):** `matches()` glob-matching is duplicated verbatim in `ccx-lint.py` and `ccx-blast.py`, and both copies are load-bearing for the same cross-tool invariant (lint R2 satisfiability must agree with blast's classifier on glob semantics). Left as two self-tested copies rather than adding sys.path-dependent sibling imports to standalone CLIs; extract to a shared `tools/ccx/_ccxlib.py` if a third consumer appears or the semantics need to change.
 
 ## Sources & Research
 

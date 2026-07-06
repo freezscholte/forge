@@ -10,6 +10,20 @@
 # failure.
 ccx_check_clone() {
   local clone="$1" base="$2"
+  # Refuse to operate on the harness's OWN repository. ccx_rebuild_base is
+  # destructive (reset --hard + clean -fdq), so a --clone that points at the
+  # forge checkout containing tools/ccx (the CLAUDE.md project-root gotcha)
+  # or the operator's live working copy would erase uncommitted work. The
+  # scratch clone must live elsewhere (e.g. under /tmp).
+  local harness_root clone_root
+  harness_root="$(git -C "${BASH_SOURCE[0]%/*}" rev-parse --show-toplevel 2>/dev/null || true)"
+  clone_root="$(git -C "$clone" rev-parse --show-toplevel 2>/dev/null || true)"
+  echo "ccx: operating on clone $clone_root (base $base)" >&2
+  if [[ -n "$harness_root" && -n "$clone_root" && "$harness_root" == "$clone_root" ]]; then
+    echo "ccx: clone pre-flight failed: --clone resolves to the harness's own repo ($clone_root)" >&2
+    echo "ccx: rebuild is destructive — use a disposable scratch clone outside this repo (e.g. under /tmp)" >&2
+    return 1
+  fi
   if ! git -C "$clone" rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1; then
     echo "ccx: clone pre-flight failed: ref '$base' does not resolve in $clone" >&2
     echo "ccx: fetch it first (git -C '$clone' fetch origin '$base') or pass a ref that exists in the clone" >&2

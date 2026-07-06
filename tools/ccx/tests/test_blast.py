@@ -111,6 +111,63 @@ class BlastDiffModeTests(unittest.TestCase):
             [{"path": FACADE, "kind": "outside allowlist"}],
         )
 
+    def _assert_facade_violation(self, added_line):
+        diff = (
+            f"diff --git a/{FACADE} b/{FACADE}\n"
+            f"--- a/{FACADE}\n"
+            f"+++ b/{FACADE}\n"
+            "@@ -1,1 +1,2 @@\n"
+            " mod bar;\n"
+            f"+{added_line}\n"
+        )
+        proc = run_blast(["--diff", "--allow", "docs/**"], diff)
+        self.assertEqual(proc.returncode, 2, f"{added_line!r}: {proc.stdout}")
+        self.assertEqual(report_of(proc)["verdict"], "violation")
+
+    def test_facade_smuggling_attempts_are_violations(self):
+        # Reproduced review bypasses: a per-line classifier that inherited
+        # line_in_stmt licensed all of these. The statement-aware, charset-
+        # restricted scan must reject every one.
+        self._assert_facade_violation("mod evil { fn steal() { danger(); } }")
+        self._assert_facade_violation('pub use crate::x; include!("/etc/passwd");')
+        self._assert_facade_violation("pub use a::b; static EVIL: u8 = 0;")
+        self._assert_facade_violation("pub use a::b; struct Smuggled;")
+        self._assert_facade_violation("mod evil {}")  # brace-form module body
+
+    def test_facade_unclosed_use_then_code_is_violation(self):
+        # An unclosed multi-line `pub use a::{ … ` opener must not license a
+        # following fn on the continuation line.
+        diff = (
+            f"diff --git a/{FACADE} b/{FACADE}\n"
+            f"--- a/{FACADE}\n"
+            f"+++ b/{FACADE}\n"
+            "@@ -1,1 +1,3 @@\n"
+            " mod bar;\n"
+            "+pub use a::{\n"
+            "+    b, }; fn evil() { danger(); }\n"
+        )
+        proc = run_blast(["--diff", "--allow", "docs/**"], diff)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertEqual(report_of(proc)["verdict"], "violation")
+
+    def test_default_forbid_nested_path(self):
+        # A nested secret file must be forbidden even when the allowlist
+        # covers the subtree (root-anchored globs alone would miss it).
+        diff = (
+            "diff --git a/crates/foo/.env b/crates/foo/.env\n"
+            "--- /dev/null\n"
+            "+++ b/crates/foo/.env\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+SECRET=nested\n"
+        )
+        proc = run_blast(["--diff", "--allow", "crates/**"], diff)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        report = report_of(proc)
+        self.assertEqual(
+            report["violations"],
+            [{"path": "crates/foo/.env", "kind": "default_forbidden"}],
+        )
+
     def test_forbidden_path_violation(self):
         diff = (
             "diff --git a/crates/forge-content-native/src/lib.rs b/crates/forge-content-native/src/lib.rs\n"
