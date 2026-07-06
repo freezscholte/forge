@@ -70,6 +70,7 @@ fn main() -> ExitCode {
         Command::Merge(args) => merge_response(request_id, args),
         Command::Conflict(args) => conflict_response(request_id, args),
         Command::Log(args) => log_response(request_id, args),
+        Command::Blame(args) => blame_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
         Command::Trust(args) => trust_response(request_id, args),

@@ -3,9 +3,8 @@
 //! ADR-0001's 3,000-line ceiling allows justified exceptions when cohesion beats
 //! size. This file is intentionally capped as one native-content engine because
 //! the object framing, tree walking/materialization, diff fingerprinting, and
-//! three-way merge code share private invariants. Splitting it mechanically
-//! would widen those invariants before there is a behavior change to validate.
-//! New native-content domains should still land in sibling modules.
+//! three-way merge code share private invariants. Splitting it mechanically would
+//! widen those invariants first. New native-content domains land in sibling modules.
 
 use anyhow::{anyhow, bail, Context, Result};
 use forge_content::{
@@ -22,13 +21,15 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-// `Command` is now used only by the `#[cfg(test)]` differential harness (slice-1 parity
-// proofs); native base/changed-paths no longer shell git (NER-138 Phase 7 slice 2).
+// `Command` is used only by the `#[cfg(test)]` differential harness (slice-1 parity proofs); native base/changed-paths no longer shell git (NER-138 Phase 7 slice 2).
 #[cfg(test)]
 use std::process::Command;
 
 mod pack;
+pub mod provenance;
 mod status_cache;
+
+pub use provenance::{attribute_lines, path_provenance, LineAttribution, PathProvenanceEntry};
 
 const SCHEMA_VERSION: u32 = 1;
 const HUNK_LIMIT: usize = 4096;
@@ -44,9 +45,8 @@ const LARGE_BLOB_STREAM_THRESHOLD_BYTES: u64 = 1024 * 1024;
 pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 
 /// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
-/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
-/// its matching `is_restore_temp_path` exclusion predicate live in the shared base
-/// crate both backends depend on (NER-132 U4).
+/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and its
+/// matching `is_restore_temp_path` exclusion predicate live in the shared base crate both backends depend on (NER-132 U4).
 pub use forge_content::RESTORE_TEMP_PREFIX;
 
 #[derive(Debug, Clone)]

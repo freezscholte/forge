@@ -43,6 +43,8 @@ pub(crate) enum Command {
     Conflict(ConflictArgs),
     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
     Log(LogArgs),
+    /// Attribute each line of a committed file to the native commit that last changed it.
+    Blame(BlameArgs),
     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
     Checkout(CheckoutArgs),
     /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
@@ -135,6 +137,12 @@ pub(crate) struct LogArgs {
     /// Show only commits recorded under this intent ("show every change under this intent").
     #[arg(long)]
     pub(crate) intent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct BlameArgs {
+    /// Repo-relative path of the committed file whose lines to attribute.
+    pub(crate) path: String,
 }
 
 #[derive(Debug, Args)]

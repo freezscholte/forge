@@ -229,7 +229,7 @@ silently satisfy local, hosted-runner, or third-party policy.
   `attempt attach`, `proposal list`, `review show`, `review export`,
   `review open`, `compare`, `attempt compare`, `diff`
 - intents: `intent list`, `intent show`
-- worktree/history: `restore`, `checkout`, `log`, `undo`
+- worktree/history: `restore`, `checkout`, `log`, `blame`, `undo`
 - native merge: `merge`, `conflict list`, `conflict show`,
   `conflict show --suggest`, `conflict resolve`
 - maintenance: `doctor`, `gc`

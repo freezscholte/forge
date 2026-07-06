@@ -682,6 +682,18 @@ pub struct CommitView {
     pub evidence_digest: Option<String>,
 }
 
+/// The authoritative ledger-derived native history tip, exactly as `native_log`
+/// resolves it (NER-362). Read-only (no lock, no HEAD write): the ref-store HEAD
+/// lags the ledger by design (HEAD-lags-never-leads) and `reconcile_native_head`
+/// runs only for mutating commands, so read-only callers (e.g. `forge blame`)
+/// resolve their tip here instead of reading HEAD. `None` when there is no native
+/// history yet.
+pub fn native_history_tip(cwd: &Path) -> Result<Option<forge_content_native::ObjectId>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    native_tip(&context, &connection)
+}
+
 /// Walk the native commit DAG from the authoritative tip (NER-138 Phase 7 slice 3),
 /// tip→genesis, returning each commit's justification. Read-only (no lock, no HEAD write).
 /// When `intent` is `Some`, only commits whose `intent_id` matches are returned — the literal

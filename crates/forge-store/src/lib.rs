@@ -27,6 +27,7 @@ mod merge;
 mod migrations;
 mod private_overlay;
 mod proposals;
+mod provenance;
 mod publication;
 mod repo_lock;
 mod repository;
@@ -133,6 +134,7 @@ pub(crate) use proposals::{
     latest_proposal_for_attempt, proposal_by_id, proposal_by_id_on, proposal_metadata_for_attempt,
     redact_gate_result, resolve_proposal, verify_evidence_integrity, IntegrityStatus,
 };
+pub use provenance::{provenance_detail, ProvenanceDetail};
 pub(crate) use publication::latest_publication_for_proposal_revision;
 pub use publication::{
     accepted_commit_id_for_revision, build_publication_trailer, decision_for_proposal_revision,
@@ -148,11 +150,11 @@ pub use repository::{
 };
 pub use show::{show, ShowRecord};
 pub use snapshots::{
-    checkout_target_content_ref, expected_content_ref, latest_snapshot_content_ref, native_log,
-    reconcile_native_head, record_checkout, record_restore, record_undo, save_snapshot,
-    save_snapshot_with_private_overlays, set_materialized_expected_content_ref,
-    snapshot_content_ref, snapshot_owner_attempt_id, undo_target, CommitView, SnapshotRecord,
-    SnapshotSummary, UndoTarget,
+    checkout_target_content_ref, expected_content_ref, latest_snapshot_content_ref,
+    native_history_tip, native_log, reconcile_native_head, record_checkout, record_restore,
+    record_undo, save_snapshot, save_snapshot_with_private_overlays,
+    set_materialized_expected_content_ref, snapshot_content_ref, snapshot_owner_attempt_id,
+    undo_target, CommitView, SnapshotRecord, SnapshotSummary, UndoTarget,
 };
 pub(crate) use snapshots::{
     latest_snapshot_for_attempt, latest_snapshot_on, native_tip, set_context_expected_content_ref,

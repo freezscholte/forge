@@ -1031,6 +1031,100 @@ pub(crate) fn log_response(request_id: Option<String>, args: LogArgs) -> Respons
     })
 }
 
+pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> ResponseEnvelope {
+    // Read-only like "log": no lock, no reconcile. The tip is resolved from the LEDGER
+    // (`native_history_tip`, the same resolution `native_log` uses) — never from the
+    // ref-store HEAD, which lags the ledger by design (HEAD-lags-never-leads) and is
+    // only reconciled by mutating commands. Blame therefore attributes correctly even
+    // in the post-accept window where HEAD has not been reconciled yet.
+    command_result("blame", request_id, |cwd, _request_id| {
+        let repo_root = forge_store::repository_root_path(&cwd)?;
+        let tip = forge_store::native_history_tip(&cwd)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "path {} does not exist: repository has no native history yet",
+                args.path
+            )
+        })?;
+        let store = forge_content_native::NativeObjectStore::new(&repo_root);
+        let provenance =
+            forge_content_native::provenance::path_provenance_at(&store, &tip, &args.path)?;
+        let attributions =
+            forge_content_native::provenance::attribute_lines_at(&store, &tip, &args.path)?;
+        let by_commit: std::collections::HashMap<
+            &str,
+            &forge_content_native::provenance::PathProvenanceEntry,
+        > = provenance
+            .iter()
+            .map(|e| (e.commit_id.as_str(), e))
+            .collect();
+        // Ledger enrichment (NER-362 slice 4): one `provenance_detail` read per
+        // distinct (intent, revision, decision) tuple — O(distinct commits), not
+        // O(lines). Ids the ledger doesn't know degrade to None fields inside the
+        // lookup; commits with no intent_id skip the lookup entirely. Joins only
+        // on ids the payload already carries — the tip resolved above is not
+        // re-resolved or altered here.
+        type EnrichmentKey = (String, Option<String>, Option<String>);
+        let mut details: std::collections::HashMap<EnrichmentKey, forge_store::ProvenanceDetail> =
+            std::collections::HashMap::new();
+        for entry in &provenance {
+            let Some(intent_id) = entry.intent_id.as_deref() else {
+                continue;
+            };
+            let key = (
+                intent_id.to_string(),
+                entry.proposal_revision_id.clone(),
+                entry.decision_id.clone(),
+            );
+            if let std::collections::hash_map::Entry::Vacant(slot) = details.entry(key) {
+                let detail = forge_store::provenance_detail(
+                    &cwd,
+                    intent_id,
+                    entry.proposal_revision_id.as_deref(),
+                    entry.decision_id.as_deref(),
+                )?;
+                slot.insert(detail);
+            }
+        }
+        let detail_for = |entry: &forge_content_native::provenance::PathProvenanceEntry| {
+            let intent_id = entry.intent_id.as_deref()?;
+            details.get(&(
+                intent_id.to_string(),
+                entry.proposal_revision_id.clone(),
+                entry.decision_id.clone(),
+            ))
+        };
+        let lines: Vec<Value> = attributions
+            .iter()
+            .map(|line| {
+                let entry = by_commit.get(line.commit_id.as_str());
+                let detail = entry.and_then(|e| detail_for(e));
+                json!({
+                    "line_number": line.line_number,
+                    "content": line.content,
+                    "commit_id": line.commit_id,
+                    "intent_id": entry.and_then(|e| e.intent_id.clone()),
+                    "proposal_revision_id": entry.and_then(|e| e.proposal_revision_id.clone()),
+                    "decision_id": entry.and_then(|e| e.decision_id.clone()),
+                    "actor": entry.and_then(|e| e.actor.clone()),
+                    "authored_time": entry.and_then(|e| e.authored_time),
+                    "intent_title": detail.and_then(|d| d.intent_title.clone()),
+                    "decision_status": detail.and_then(|d| d.decision_status.clone()),
+                    "check_status": detail.and_then(|d| d.check_status.clone()),
+                })
+            })
+            .collect();
+        Ok((
+            None,
+            json!({
+                "path": args.path,
+                "tip_commit_id": tip.to_string(),
+                "lines": lines,
+            }),
+            Vec::new(),
+        ))
+    })
+}
+
 pub(crate) fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("doctor", request_id, |cwd, _request_id| {
         let report = forge_store::doctor(&cwd)?;
@@ -2102,6 +2196,47 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
             }
             "schema" => {
                 println!("{}", serde_json::to_string_pretty(&response.data).unwrap());
+            }
+            "blame" => {
+                let lines = response
+                    .data
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                // Commit legend (NER-362 slice 4): one line per distinct blamed
+                // commit, newest first (authored_time descending; the stable sort
+                // keeps first-appearance order for ties and unknown times last).
+                let mut seen = std::collections::HashSet::new();
+                let mut legend: Vec<(&str, Option<i64>, &str)> = Vec::new();
+                for line in lines {
+                    let commit = line.get("commit_id").and_then(Value::as_str).unwrap_or("");
+                    if seen.insert(commit) {
+                        let title = line
+                            .get("intent_title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("-");
+                        let authored = line.get("authored_time").and_then(Value::as_i64);
+                        legend.push((commit, authored, title));
+                    }
+                }
+                legend.sort_by(|a, b| b.1.cmp(&a.1));
+                for (commit, _, title) in &legend {
+                    // `f1:commit:sha256:<hex>` → the first 12 hex chars of the digest.
+                    let digest = commit.rsplit(':').next().unwrap_or(commit);
+                    let short = &digest[..digest.len().min(12)];
+                    println!("{short} {title}");
+                }
+                for line in lines {
+                    let commit = line.get("commit_id").and_then(Value::as_str).unwrap_or("");
+                    // `f1:commit:sha256:<hex>` → the first 12 hex chars of the digest.
+                    let digest = commit.rsplit(':').next().unwrap_or(commit);
+                    let short = &digest[..digest.len().min(12)];
+                    let intent = line.get("intent_id").and_then(Value::as_str).unwrap_or("-");
+                    let number = line.get("line_number").and_then(Value::as_u64).unwrap_or(0);
+                    let content = line.get("content").and_then(Value::as_str).unwrap_or("");
+                    println!("{short} {intent} {number} {content}");
+                }
             }
             command => println!("{command} succeeded"),
         }
