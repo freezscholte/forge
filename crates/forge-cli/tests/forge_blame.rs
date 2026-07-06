@@ -3,10 +3,16 @@
 //! LEDGER tip (never the ref-store HEAD, which lags by design).
 
 mod common;
+#[path = "support/sync.rs"]
+mod sync_support;
 
-use common::TestRepo;
+use common::{forge_in, TestRepo};
 use serde_json::Value;
 use std::path::Path;
+use sync_support::{
+    cloned_peer_from_bundle, json, native_accept_file_change, native_accept_file_change_in,
+    native_accepted_lifecycle,
+};
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("valid json")
@@ -466,6 +472,112 @@ fn blame_enrichment_degrades_to_null_when_the_ledger_predates_the_ids() {
         stdout.lines().next(),
         Some(format!("{short} -").as_str()),
         "legend degrades to '-' when the intent row is gone: {stdout}"
+    );
+}
+
+/// Native sync-merge commits carry `intent_id: None` (crates/forge-store/src/sync.rs —
+/// `record_sync_merge_commit`), so the ledger-enrichment loop in `blame_response`
+/// (crates/forge-cli/src/commands/core.rs — `let Some(intent_id) = … else { continue }`)
+/// skips them entirely. When such a merge commit is a line's last-change attribution,
+/// the enrichment fields must render as null and the command must still succeed. This
+/// exercises the skip branch end-to-end: a clean divergent `sync pull` makes the merge
+/// commit the blame tip, and — because the walk follows the FIRST parent (the receiver's
+/// own head, which never had the source-side file) — the source-side file is "added" by
+/// the merge commit, so the merge commit owns every one of its lines.
+#[test]
+fn blame_renders_intent_less_sync_merge_commits_with_null_enrichment() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_dir = tempfile::tempdir().expect("sync merge blame bundle dir");
+    let bundle_path = bundle_dir.path().join("sync-merge-blame-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 base bundle path"),
+        ])
+        .assert()
+        .success();
+
+    // Source accepts a multi-line file the receiver never had; the peer accepts a
+    // disjoint file. Disjoint edits merge cleanly (no conflict set), and the merged
+    // tree carries the source-side file.
+    native_accept_file_change(
+        &source,
+        "source only file",
+        "source-only.txt",
+        "sole one\nsole two\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(peer.path(), "peer only file", "peer-only.txt", "peer\n");
+
+    let pulled = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["data"]["merged"], true, "{pulled}");
+    assert_eq!(pulled["data"]["materialized"], true, "{pulled}");
+    let merge_commit_id = pulled["data"]["merge_commit_id"]
+        .as_str()
+        .expect("clean sync pull surfaces a merge commit id")
+        .to_string();
+
+    // JSON blame over the source-side file: the merge commit is the tip and owns every
+    // line, and — being intent-less — its enrichment fields degrade to null, not error.
+    let out = json(
+        forge_in(peer.path())
+            .args(["--json", "blame", "source-only.txt"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["status"], "success", "{out}");
+    assert_eq!(
+        out["data"]["tip_commit_id"],
+        merge_commit_id.as_str(),
+        "blame resolves the sync merge commit as the ledger tip: {out}"
+    );
+    let lines = out["data"]["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2, "{out}");
+    for line in lines {
+        // The intent-less sync merge commit is this line's last-change attribution.
+        assert_eq!(
+            line["commit_id"], merge_commit_id,
+            "line attributed to the sync merge commit: {line}"
+        );
+        // The commit carries intent_id: None → the skip branch fires → every ledger
+        // enrichment field renders null (never an error, never a stale join).
+        assert!(line["intent_id"].is_null(), "intent_id null: {line}");
+        assert!(line["intent_title"].is_null(), "intent_title null: {line}");
+        assert!(
+            line["decision_status"].is_null(),
+            "decision_status null: {line}"
+        );
+        assert!(line["check_status"].is_null(), "check_status null: {line}");
+    }
+
+    // Human mode also degrades cleanly: the legend title for the intent-less merge
+    // commit falls back to "-".
+    let assert = forge_in(peer.path())
+        .args(["blame", "source-only.txt"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
+    let digest = merge_commit_id.rsplit(':').next().unwrap();
+    let short = &digest[..12];
+    assert_eq!(
+        stdout.lines().next(),
+        Some(format!("{short} -").as_str()),
+        "legend title is '-' for the intent-less sync merge commit: {stdout}"
     );
 }
 

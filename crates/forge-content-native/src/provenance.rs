@@ -256,6 +256,17 @@ fn match_lines(parent: &[String], child: &[String]) -> Vec<Option<usize>> {
     if parent_mid.is_empty() || child_mid.is_empty() {
         return matched;
     }
+    // The LCS table below is O(parent_mid * child_mid) memory. A substantial
+    // rewrite of a large file (little common prefix/suffix) would make it
+    // quadratic in the file size at every walk step, so past this bound the
+    // matcher degrades instead of allocating: the trimmed middle stays
+    // unmatched and those lines attribute to the child commit — the same
+    // degrade-not-fail convention as DiffOptions::rename_limit. ~64M cells
+    // (8 bytes each) caps the table at ~512 MiB.
+    const LCS_CELL_LIMIT: usize = 64 * 1024 * 1024;
+    if (parent_mid.len() + 1).saturating_mul(child_mid.len() + 1) > LCS_CELL_LIMIT {
+        return matched;
+    }
     // LCS length table over the trimmed middle; lcs[i][j] covers parent_mid[i..],
     // child_mid[j..].
     let mut lcs = vec![vec![0usize; child_mid.len() + 1]; parent_mid.len() + 1];
@@ -357,6 +368,36 @@ mod tests {
             .iter()
             .map(|e| (e.commit_id.as_str(), e.change.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn match_lines_degrades_without_allocating_past_the_lcs_cell_limit() {
+        // Two fully divergent inputs whose middle crosses LCS_CELL_LIMIT
+        // (8200 * 8200 > 64M cells): the matcher must return all-unmatched
+        // (attributing every line to the child commit) instead of building
+        // the quadratic table — this returns instantly; the unbounded path
+        // would allocate ~½ GiB here.
+        let parent: Vec<String> = (0..8200).map(|i| format!("old line {i}")).collect();
+        let child: Vec<String> = (0..8200).map(|i| format!("new line {i}")).collect();
+        let matched = match_lines(&parent, &child);
+        assert_eq!(matched.len(), child.len());
+        assert!(matched.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn match_lines_still_matches_shared_prefix_and_suffix_past_the_limit() {
+        // Even past the cell limit, prefix/suffix matching still attributes
+        // unchanged flanks to the parent; only the divergent middle degrades.
+        let mut parent: Vec<String> = vec!["keep head".to_string()];
+        parent.extend((0..8200).map(|i| format!("old line {i}")));
+        parent.push("keep tail".to_string());
+        let mut child: Vec<String> = vec!["keep head".to_string()];
+        child.extend((0..8200).map(|i| format!("new line {i}")));
+        child.push("keep tail".to_string());
+        let matched = match_lines(&parent, &child);
+        assert_eq!(matched[0], Some(0));
+        assert_eq!(matched[child.len() - 1], Some(parent.len() - 1));
+        assert!(matched[1..child.len() - 1].iter().all(Option::is_none));
     }
 
     #[test]

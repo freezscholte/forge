@@ -45,7 +45,7 @@ done
 # Absolutize: the patch is applied with `git -C "$CLONE"`, which resolves a
 # relative path inside the clone (NER-384/NER-385 bug family) — the -f check
 # above reads the invoking cwd, so both must point at the same file.
-PATCH="$(cd "$(dirname "$PATCH")" && pwd)/$(basename "$PATCH")" \
+PATCH="$(ccx_abspath "$PATCH")" \
   || { echo "verify-task: cannot resolve patch path: $PATCH" >&2; exit 1; }
 
 mkdir -p "$OUT" || { echo "verify-task: cannot create out dir $OUT" >&2; exit 1; }

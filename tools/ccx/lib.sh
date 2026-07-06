@@ -36,6 +36,19 @@ ccx_check_clone() {
   fi
 }
 
+# ccx_abspath <path>
+# Absolutize a FILE path against the invoking cwd. Needed before any path
+# operand crosses a `git -C`/`cd` boundary (NER-384/NER-385 bug family).
+# NOTE: callers must capture via `x="$(ccx_abspath p)" || fail` — the guard
+# fires on the function's exit status. Never inline a second command
+# substitution into the same assignment: an assignment's exit status is that
+# of its LAST substitution, which silently masks an earlier failure.
+ccx_abspath() {
+  local dir
+  dir="$(cd "$(dirname "$1")" && pwd)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
 # ccx_rebuild_base <clone> <base-ref> [stack-patch...]
 # Rebuild the exact task base: hard-reset to <base>, clean untracked state
 # (keeping target/), detach HEAD at <base>, apply each stack patch with
@@ -68,7 +81,7 @@ ccx_rebuild_base() {
       return 1
     fi
     [[ -s "$patch" ]] || continue # empty patch is a no-op stack entry
-    abs_patch="$(cd "$(dirname "$patch")" && pwd)/$(basename "$patch")" || {
+    abs_patch="$(ccx_abspath "$patch")" || {
       echo "ccx: cannot resolve stack patch path: $patch" >&2
       return 1
     }

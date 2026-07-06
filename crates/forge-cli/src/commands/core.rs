@@ -2220,18 +2220,19 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
                         legend.push((commit, authored, title));
                     }
                 }
+                // `f1:commit:sha256:<hex>` → the first 12 hex chars of the digest.
+                let short_digest = |commit: &str| {
+                    let digest = commit.rsplit(':').next().unwrap_or(commit);
+                    digest[..digest.len().min(12)].to_string()
+                };
                 legend.sort_by(|a, b| b.1.cmp(&a.1));
                 for (commit, _, title) in &legend {
-                    // `f1:commit:sha256:<hex>` → the first 12 hex chars of the digest.
-                    let digest = commit.rsplit(':').next().unwrap_or(commit);
-                    let short = &digest[..digest.len().min(12)];
+                    let short = short_digest(commit);
                     println!("{short} {title}");
                 }
                 for line in lines {
                     let commit = line.get("commit_id").and_then(Value::as_str).unwrap_or("");
-                    // `f1:commit:sha256:<hex>` → the first 12 hex chars of the digest.
-                    let digest = commit.rsplit(':').next().unwrap_or(commit);
-                    let short = &digest[..digest.len().min(12)];
+                    let short = short_digest(commit);
                     let intent = line.get("intent_id").and_then(Value::as_str).unwrap_or("-");
                     let number = line.get("line_number").and_then(Value::as_u64).unwrap_or(0);
                     let content = line.get("content").and_then(Value::as_str).unwrap_or("");
