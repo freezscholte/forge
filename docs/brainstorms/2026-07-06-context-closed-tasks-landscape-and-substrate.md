@@ -212,6 +212,18 @@ record-kind pattern, and the forge-policy revision-bound verdict engine.
 
 ## §6. Unknowns surfaced this session (typed per A4.4)
 
+> **Status update (2026-07-06 end of day, post-pilot):** U1 RESOLVED-yes
+> (T3: shadow dataset dir, zero code). U2 partially resolved (compare our
+> own arms; Shepherd = reference point only). U3 RESOLVED-positive (T2:
+> attempts isolate; per-attempt blast radii compose; `attempt compare`
+> carries the data). U4 still open. U5 partially answered: the pilot's
+> `run-arm-a.sh` is the first working prototype of harness-side brief
+> injection. U6 holds at pilot scale (byte-stable, trivial regen);
+> unverified at neighbor-graph scale. Full pilot outcome:
+> `experiments/ccx/RESULTS.md` (STRONG reading, 2-scorer 8/8 directional
+> agreement); post-pilot design deltas in the v3 doc
+> (2026-07-06-context-closed-tasks-v3.md).
+
 - **U1 (assumption)** — "CooperBench's Harbor adapter can inject a
   per-agent brief and restrict the NL channel" — needed for any
   contracts-vs-chat arm; unverified. → T3 recon.
