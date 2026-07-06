@@ -1,0 +1,17 @@
+schema: ccx.contract.v1
+id: ccx-lint-cycle-b
+revision: 1
+ticket: NER-000
+task: Lint fixture for a depends_on cycle, side B (rule 1)
+interface: |
+  Depends on lint-cycle-a, which depends back on this contract; the
+  depends_on graph must be acyclic, so linting either side must error.
+depends_on:
+  - ccx-lint-cycle-a
+acceptance:
+  fix:
+    - cargo test -p forge-core
+  guard: []
+allowed_changes:
+  paths: [docs/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

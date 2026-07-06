@@ -1,0 +1,16 @@
+schema: ccx.contract.v1
+id: ccx-lint-missing-exclusion
+revision: 1
+ticket: NER-000
+task: Lint fixture for a missing exclusion clause (rule 5)
+interface: |
+  Walk the directory tree under the repository root and compare what is
+  found against the recorded state. No exclusion_contract is declared and
+  no owning walk primitive is named — the drift-guard P1 defect shape.
+acceptance:
+  fix:
+    - cargo test -p forge-core
+  guard: []
+allowed_changes:
+  paths: [crates/forge-core/src/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

@@ -1,0 +1,4 @@
+schema: ccx.contract.v1
+id: ccx-lint-bad-yaml
+task: [unclosed sequence, this is deliberately
+  broken YAML {nope: [

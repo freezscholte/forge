@@ -1,0 +1,18 @@
+schema: ccx.contract.v1
+id: ccx-lint-fenced-primitive
+revision: 1
+ticket: NER-000
+task: Lint fixture for a visibility-fenced primitive (rule 3)
+interface: |
+  Consume tree_fingerprints from forge-content-native while only being
+  allowed to change forge-store code. The primitive is pub(crate), so the
+  contract's consumers cannot see it — the NER-382 defect shape.
+primitives:
+  - { name: tree_fingerprints, crate: forge-content-native, visibility: pub }
+acceptance:
+  fix:
+    - cargo test -p forge-core
+  guard: []
+allowed_changes:
+  paths: [crates/forge-store/src/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

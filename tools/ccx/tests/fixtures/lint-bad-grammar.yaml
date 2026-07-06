@@ -1,0 +1,15 @@
+schema: ccx.contract.v1
+id: ccx-lint-bad-grammar
+revision: 1
+ticket: NER-000
+task: Lint fixture for a command-grammar violation (rule 6)
+interface: |
+  The fix set contains a shell command outside the cargo command family,
+  which the verifier must never be asked to execute.
+acceptance:
+  fix:
+    - bash -c 'echo hi'
+  guard: []
+allowed_changes:
+  paths: [docs/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

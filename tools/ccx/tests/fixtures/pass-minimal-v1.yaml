@@ -1,0 +1,17 @@
+schema: ccx.contract.v1
+id: ccx-pass-minimal-v1
+revision: 1
+ticket: NER-000
+task: Minimal passing lint fixture
+interface: |
+  Self-contained minimal contract used as the shared PASS fixture by the
+  ccx harness test suites. It exercises no code primitives and touches no
+  filesystem-listing behavior; it exists so tools can assert a clean
+  verdict on a fully-formed v1 contract.
+acceptance:
+  fix:
+    - cargo test -p forge-core
+  guard: []
+allowed_changes:
+  paths: [tools/ccx/tests/fixtures/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

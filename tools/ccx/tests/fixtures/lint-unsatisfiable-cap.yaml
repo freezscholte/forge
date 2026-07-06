@@ -1,0 +1,16 @@
+schema: ccx.contract.v1
+id: ccx-lint-unsatisfiable-cap
+revision: 1
+ticket: NER-000
+task: Lint fixture for an unsatisfiable line-count cap (rule 2)
+interface: |
+  The only allowed file is crates/forge-content-native/src/lib.rs, which
+  sits exactly at its allowlisted line-count cap. No glob leaves room for
+  a new file, so no change can land without violating the cap gate.
+acceptance:
+  fix:
+    - cargo test -p forge-core
+  guard: []
+allowed_changes:
+  paths: [crates/forge-content-native/src/lib.rs]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

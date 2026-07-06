@@ -1,0 +1,16 @@
+schema: ccx.contract.v1
+id: ccx-lint-vacuous-filter
+revision: 1
+ticket: NER-000
+task: Lint fixture for a vacuous acceptance filter (rule 4)
+interface: |
+  The fix set filters forge-store tests on a name that matches no test
+  path in the crate, and the allowed paths do not include the crate, so
+  the acceptance command can never prove anything.
+acceptance:
+  fix:
+    - cargo test -p forge-store zzz_nonexistent
+  guard: []
+allowed_changes:
+  paths: [docs/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}
