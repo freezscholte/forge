@@ -1,0 +1,20 @@
+schema: ccx.contract.v1
+id: ccx-runner-chain-b
+revision: 1
+ticket: NER-000
+task: Runner chain fixture, dependent task (stacks on runner-chain-a)
+interface: |
+  Dependent fixture for the run-task.sh chain tests: depends_on names
+  ccx-runner-chain-a, so a --chain listing only this contract must be
+  refused unless the dependency's patch is supplied via --stack. Like its
+  root, it exercises no code primitives and its acceptance entries exist
+  only to satisfy the command grammar (rule 6).
+depends_on:
+  - ccx-runner-chain-a
+acceptance:
+  fix:
+    - cargo build
+  guard: []
+allowed_changes:
+  paths: [src/**, notes/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

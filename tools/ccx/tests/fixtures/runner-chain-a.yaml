@@ -1,0 +1,18 @@
+schema: ccx.contract.v1
+id: ccx-runner-chain-a
+revision: 1
+ticket: NER-000
+task: Runner chain fixture, root task (no dependencies)
+interface: |
+  Self-contained root fixture for the run-task.sh chain tests. It exercises
+  no code primitives; the runner's stub agents write files under src/ and
+  notes/ in a throwaway scratch repository, so allowed_changes covers those
+  paths. Acceptance is never executed by the runner — the entries below
+  exist only to satisfy the command grammar (rule 6).
+acceptance:
+  fix:
+    - cargo build
+  guard: []
+allowed_changes:
+  paths: [src/**, notes/**]
+authority: {source: human, confidence: high, reviewer: ccx-harness-tests}

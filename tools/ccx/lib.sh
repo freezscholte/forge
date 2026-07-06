@@ -1,0 +1,62 @@
+# ccx thin harness: shared rebuild mechanics for run-task.sh / verify-task.sh.
+# Sourced, not executed. Stack commits go on a detached HEAD so the base ref
+# NEVER moves (pilot amendment P1, transcribed from
+# experiments/ccx/run-arm-a-stacked.sh).
+
+# ccx_check_clone <clone> <base>
+# Pre-flight: the base ref must resolve to a commit in the clone and the
+# clone must carry full history (stacked rebuilds on shallow clones fail in
+# confusing ways). Prints an actionable message and returns nonzero on
+# failure.
+ccx_check_clone() {
+  local clone="$1" base="$2"
+  if ! git -C "$clone" rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1; then
+    echo "ccx: clone pre-flight failed: ref '$base' does not resolve in $clone" >&2
+    echo "ccx: fetch it first (git -C '$clone' fetch origin '$base') or pass a ref that exists in the clone" >&2
+    return 1
+  fi
+  if [[ "$(git -C "$clone" rev-parse --is-shallow-repository 2>/dev/null)" != "false" ]]; then
+    echo "ccx: clone pre-flight failed: $clone is a shallow repository" >&2
+    echo "ccx: stacked rebuilds need full history — run: git -C '$clone' fetch --unshallow" >&2
+    return 1
+  fi
+}
+
+# ccx_rebuild_base <clone> <base-ref> [stack-patch...]
+# Rebuild the exact task base: hard-reset to <base>, clean untracked state
+# (keeping target/), detach HEAD at <base>, apply each stack patch with
+# --index --3way in order, then record a single stack commit when any patch
+# applied. Empty patch files (e.g. a dry-run predecessor's patch.diff) are
+# no-ops. Returns nonzero with a message on any failure.
+ccx_rebuild_base() {
+  local clone="$1" base="$2"
+  shift 2
+  git -C "$clone" reset --hard --quiet "$base" || {
+    echo "ccx: reset --hard to '$base' failed in $clone" >&2
+    return 1
+  }
+  git -C "$clone" clean -fdq -e target || {
+    echo "ccx: clean failed in $clone" >&2
+    return 1
+  }
+  git -C "$clone" checkout --quiet --detach "$base" || {
+    echo "ccx: detached checkout of '$base' failed in $clone" >&2
+    return 1
+  }
+  local applied=0 patch
+  for patch in "$@"; do
+    [[ -s "$patch" ]] || continue # empty patch is a no-op stack entry
+    if ! git -C "$clone" apply --index --3way "$patch"; then
+      echo "ccx: stack patch $patch failed to apply on '$base'" >&2
+      return 1
+    fi
+    applied=$((applied + 1))
+  done
+  if ((applied > 0)); then
+    git -C "$clone" -c user.name=ccx -c user.email=ccx@local \
+      commit --quiet -m "ccx stack: $applied patch(es) on $base" || {
+      echo "ccx: stack commit failed in $clone" >&2
+      return 1
+    }
+  fi
+}
