@@ -332,6 +332,63 @@ concurrent-agent coordination: adjacent, benchmarkable, and therefore the
 shiny tangent. It stays pilot 3, behind Part B (decomposition) and pilot 2
 (neighbor ablation). If CooperBench jumps the queue, we are deviating.
 
+### §7.2 Measurement addendum (Jan's question, 2026-07-06: "how do we measure this?")
+
+v2 §B2 already pins the metric set: headline = **unlicensed decisions per
+accepted patch** ("which brief line authorized this decision?", scored
+identically in every arm), plus the five-class defect taxonomy at first
+review, unknown flow (surfaced vs. guessed vs. silent-guess defects,
+first-run vs. post-resolution success scored separately), tokens injected
+at start + total, revisions/task, blast-radius violations, wall-clock and
+cost. The protocol safeguards are also pinned (order-randomized same tasks,
+clean branch per run, anonymized diffs, no session logs before defect
+scoring, pre-registered readings, frozen contracts, pinned Arm B).
+
+Three additions this session, closing real gaps:
+
+1. **Inter-rater check.** "Unlicensed decision" and defect classification
+   are judgment calls. For ≥2 of the ~6 tasks, two reviewers (or one human +
+   one independent agent session) score independently; report agreement.
+   Low agreement → tighten the rubric before trusting the headline number.
+   Write the scoring rubric BEFORE the first arm runs (with the frozen
+   contracts).
+2. **Cache-aware cost accounting.** Raw token counts mislead: Arm B (one
+   continuous session) rides KV/prompt-cache discounts within the session,
+   while Arm A pays fresh-input prices per session unless briefs share a
+   stable prefix. B2's cost metric must separate cached-read vs. fresh
+   input tokens, and report both tokens and $ cost.
+3. **What the spikes measure (pre-pilot):** T1 → brief tokens vs.
+   CLAUDE.md-baseline + authoring cost (lower bound; author had just
+   explored the modules). T2 → binary predicate feasibility + U3. T3 →
+   feasibility verdict. None of these validate H1/H-CORE — they price the
+   pilot, they don't replace it.
+
+Honest limits, recorded: N≈6 is signal, not evidence (v2 §A9.3 already
+concedes this); single-project subject (Forge) limits external validity;
+the authoring-cost datum is contaminated by author familiarity.
+
+### §7.3 KV-cache note (Jan's question: "does Shepherd's cache optimization matter for us?")
+
+Shepherd needs byte-identical history replay because *history is its
+context carrier* — >95% cache hits are what make that affordable. We
+deliberately don't carry history, so their mechanism doesn't transfer. But
+the underlying economics do, in two places:
+
+1. **Byte-stable briefs (new design requirement for `forge brief`).** A
+   brief is a deterministic function of (contract revision, neighbor set,
+   policy) — v2 already requires no-LLM emission. Strengthen that to
+   **canonical serialization**: stable key order, stable contract ordering,
+   no timestamps. Identical inputs → identical bytes → the brief becomes a
+   stable prompt prefix that prompt-caching discounts across every task
+   touching the same neighborhood. Reproducibility (already required for
+   security) buys cache economics for free — but only if byte-stability is
+   specified from day one. Costs nothing now; retrofitting later would.
+2. **Pilot cost honesty** — see §7.2 item 2.
+
+Out of scope until verified-handoff work resumes: mid-task resume (where
+Shepherd's replay actually shines) — our unit is task-scoped fresh
+sessions; C0/C1 interruption stays with the verified-handoffs track.
+
 ## §8. Decision points — resolved 2026-07-06
 
 1. Spike branch + T1/T2/T3 — **approved**; T4 dropped (see §7).
