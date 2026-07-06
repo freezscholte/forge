@@ -1,0 +1,10 @@
+schema: ccx.contract.v1
+id: ccx-blast-allow-all
+revision: 1
+ticket: NER-000
+task: Fixture contract that allows every path (default-forbid must still apply)
+
+allowed_changes:
+  paths: ['**']
+
+authority: {source: fixture, confidence: high, reviewer: test}
