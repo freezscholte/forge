@@ -216,6 +216,54 @@ else
   fail "10 stack count guard (rc=$rc)" "$LOG"
 fi
 
+# --- 11. relative --out: agent redirections resolve against invoking cwd ------
+# Regression (2026-07-06 NER-362 dogfood): the agent step cd's into the clone
+# before redirecting to "$out/...", so a relative --out used to fatal with
+# "prompt.txt: No such file or directory" once the real agent step ran.
+C="$TMP/c11"; LOG="$TMP/log11"
+mkclone "$C"
+mkdir -p "$TMP/w11"
+(cd "$TMP/w11" && "$RUN" --clone "$C" --base base --contracts-dir "$FIX" \
+  --out rel-out --dry-run "$CHAIN_A") > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 0 && -f "$TMP/w11/rel-out/runner-chain-a/prompt.txt" \
+  && -f "$TMP/w11/rel-out/runner-chain-a/patch.diff" \
+  && ! -e "$C/rel-out" ]]; then
+  pass "11 relative --out: canonicalized to invoking cwd, nothing lands in clone"
+else
+  fail "11 relative --out (rc=$rc)" "$LOG"
+fi
+
+# --- 12. relative --stack: patch path resolves against invoking cwd -----------
+# Regression (2026-07-06 NER-362 dogfood): git -C resolves a relative patch
+# path inside the clone; a patch that exists only in the invoking cwd failed
+# with "can't open patch" — and a same-path file committed INSIDE the clone
+# would silently be used instead. Also: a missing patch must be fatal, not a
+# silent no-op skip.
+C="$TMP/c12"; LOG="$TMP/log12"
+mkclone "$C"
+mkdir -p "$TMP/w12"
+cp "$TMP/stack1.diff" "$TMP/w12/rel-stack.diff"
+(cd "$TMP/w12" && "$RUN" --clone "$C" --base base --contracts-dir "$FIX" \
+  --out out12 --stack rel-stack.diff --dry-run "$CHAIN_A") > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 0 && "$(cat "$C/src/order.txt" 2>/dev/null)" == "one" ]]; then
+  pass "12a relative --stack: patch resolved against invoking cwd and applied"
+else
+  fail "12a relative --stack (rc=$rc)" "$LOG"
+fi
+C="$TMP/c12b"; LOG="$TMP/log12b"
+mkclone "$C"
+"$RUN" --clone "$C" --base base --contracts-dir "$FIX" --out "$TMP/o12b" \
+  --stack "$TMP/does-not-exist.diff" --dry-run "$CHAIN_A" > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q "stack patch not found" "$LOG" \
+  && [[ ! -e "$C/.ccx-dry-run-marker" ]]; then
+  pass "12b missing --stack patch: fatal before any agent run, not a silent skip"
+else
+  fail "12b missing --stack patch (rc=$rc)" "$LOG"
+fi
+
 echo
 if ((FAILURES > 0)); then
   echo "test_runner: $FAILURES scenario(s) FAILED"

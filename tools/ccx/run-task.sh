@@ -44,6 +44,11 @@ while (($#)); do
 done
 [[ -n "$CLONE" && -n "$BASE" && -n "$CONTRACTS_DIR" && -n "$OUT" ]] || usage
 ((${#CONTRACTS[@]} >= 1)) || usage
+# Canonicalize --out: the agent step redirects to "$out/..." from inside a
+# subshell that has cd'd into the clone, so a relative --out resolves against
+# the clone instead of the invoking cwd (prompt.txt "No such file" fatal).
+mkdir -p "$OUT" || { echo "run-task: cannot create out dir $OUT" >&2; exit 1; }
+OUT="$(cd "$OUT" && pwd)" || { echo "run-task: cannot resolve out dir $OUT" >&2; exit 1; }
 if ((!CHAIN)) && ((${#CONTRACTS[@]} > 1)); then
   echo "run-task: multiple contracts require --chain" >&2
   usage

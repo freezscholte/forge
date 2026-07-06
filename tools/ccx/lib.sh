@@ -57,10 +57,22 @@ ccx_rebuild_base() {
     echo "ccx: detached checkout of '$base' failed in $clone" >&2
     return 1
   }
-  local applied=0 patch
+  local applied=0 patch abs_patch
   for patch in "$@"; do
+    # A missing patch is an error, never a silent no-op: with `git -C` the
+    # relative path would otherwise resolve INSIDE the clone (and can even
+    # hit an unrelated same-path file committed there), so absolutize
+    # against the invoking cwd first — the same dir the -s check reads.
+    if [[ ! -e "$patch" ]]; then
+      echo "ccx: stack patch not found: $patch" >&2
+      return 1
+    fi
     [[ -s "$patch" ]] || continue # empty patch is a no-op stack entry
-    if ! git -C "$clone" apply --index --3way "$patch"; then
+    abs_patch="$(cd "$(dirname "$patch")" && pwd)/$(basename "$patch")" || {
+      echo "ccx: cannot resolve stack patch path: $patch" >&2
+      return 1
+    }
+    if ! git -C "$clone" apply --index --3way "$abs_patch"; then
       echo "ccx: stack patch $patch failed to apply on '$base'" >&2
       return 1
     fi

@@ -247,6 +247,23 @@ else
   fail "6 injection payload not refused (rc=$rc)" "$LOG"
 fi
 
+# --- 7. relative --patch: resolves against invoking cwd, not the clone ---------
+# Regression (2026-07-06 NER-362 dogfood, NER-384/385 family): the patch is
+# applied with `git -C "$CLONE"`, so a relative --patch used to resolve inside
+# the clone and PATCH-FAIL even though the -f preflight (invoking cwd) passed.
+C="$TMP/c7"; O="$TMP/o7"; LOG="$TMP/log7"
+mkclone "$C"; mkdir -p "$O" "$TMP/w7"
+cp "$TMP/patch-good.diff" "$TMP/w7/rel-patch.diff"
+(cd "$TMP/w7" && bash "$VERIFY" --clone "$C" --base base \
+  --contract "$CONTRACTS/all-green.yaml" --contracts-dir "$CONTRACTS" \
+  --out "$O" --patch rel-patch.diff) > "$LOG" 2>&1
+rc=$?
+if [[ $rc -eq 0 ]] && grep -q "^FIX PASS cargo build$" "$O/verify.txt"; then
+  pass "7 relative --patch: absolutized against invoking cwd, verify green"
+else
+  fail "7 relative --patch (rc=$rc)" "$LOG"
+fi
+
 echo
 if ((FAILURES)); then
   echo "test_verify: $FAILURES scenario(s) FAILED"
