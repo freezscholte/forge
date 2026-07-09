@@ -55,11 +55,11 @@ fn envelope_shape() -> Value {
 fn command_shapes() -> Value {
     let commands = [
         ("init", "Initializes a .forge repository; data carries root_path and the genesis operation."),
-        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id."),
-        ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id."),
+        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id, with workspace_path qualified by workspace_role=\"materialization_target\" (the workspace dir is materialized state, not an editing surface; edits belong in the repo root worktree)."),
+        ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id, with workspace_path qualified by workspace_role=\"materialization_target\" (the workspace dir is materialized state, not an editing surface; edits belong in the repo root worktree after `attempt attach`)."),
         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
         ("attempt show", "Shows one attempt; data carries the attempt detail."),
-        ("attempt attach", "Attaches the active view to an attempt; data carries attempt_id, content_ref, current_view_id."),
+        ("attempt attach", "Attaches the active view to an attempt; refuses with WORKSPACE_DRIFT when the attempt's workspace dir no longer equals its recorded materialized content (pass --discard-workspace-changes to explicitly discard workspace-dir drift; the flag never bypasses DIRTY_WORKTREE); data carries attempt_id, content_ref, current_view_id."),
         ("intent list", "Lists intents; data carries { intents: [...] } with id, title, derived status (accepted if any linked attempt was accepted, else open), the declared gate spec ({ program, args, structured } per gate), and linked attempt ids."),
         ("intent show", "Shows one intent; data carries intent_id, title/text, derived status, the declared gate spec ({ program, args, structured } per gate), and linked attempt ids. Unknown id -> UNKNOWN_INTENT."),
         ("save", "Snapshots the worktree; data carries the saved snapshot + operation_id. Native repos with local private path labels exclude those exact paths from the public forge-tree and record encrypted private overlay payload metadata."),

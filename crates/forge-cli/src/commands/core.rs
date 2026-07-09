@@ -166,7 +166,10 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
                 ))
             })
         }
-        AttemptCommand::Attach { attempt_id } => {
+        AttemptCommand::Attach {
+            attempt_id,
+            discard_workspace_changes,
+        } => {
             command_result("attempt attach", request_id, |cwd, request_id| {
                 // NER-134: worktree/base materialization goes through `ContentBackend`,
                 // not `forge_content_git::` directly, so git-worktree semantics stay out
@@ -190,6 +193,16 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
                         paths: current_content.changed_paths.clone(),
                     }
                     .into());
+                }
+                // NER-382: refuse (WORKSPACE_DRIFT) BEFORE any materialization write when
+                // the target attempt's workspace dir no longer equals its recorded
+                // materialized content — re-materializing below would silently discard
+                // those workspace edits. Checked AFTER the switching-baseline dirty-check
+                // above, and only skipped by the explicit flag, so
+                // --discard-workspace-changes discards workspace-dir drift ONLY and can
+                // never bypass DIRTY_WORKTREE.
+                if !discard_workspace_changes {
+                    forge_store::verify_attempt_workspace_undrifted(&cwd, &attempt_id)?;
                 }
                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
                 {
@@ -1637,6 +1650,18 @@ pub(crate) fn replay_response(
                 if let Some(object) = data.as_object_mut() {
                     for (key, value) in replay_data {
                         object.insert(key.clone(), value.clone());
+                    }
+                    // NER-382 replay gap: `attempt_started` rows recorded before the
+                    // workspace_role upgrade carry workspace_path in replay_data but no
+                    // workspace_role. Inject the constant so a replayed payload matches
+                    // the schema promise (workspace_path is always role-qualified).
+                    if replay_data.contains_key("workspace_path")
+                        && !replay_data.contains_key("workspace_role")
+                    {
+                        object.insert(
+                            "workspace_role".to_string(),
+                            json!(forge_store::WORKSPACE_ROLE_MATERIALIZATION_TARGET),
+                        );
                     }
                     object.insert(
                         "operation_id".to_string(),

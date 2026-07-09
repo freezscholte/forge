@@ -8,6 +8,11 @@ pub(crate) struct WorkspaceMarker {
     pub(crate) attempt_id: String,
 }
 
+/// Role qualifier emitted next to `workspace_path` (NER-382): the workspace dir
+/// is materialized state, not an editing surface. Enum-ready, but this is the
+/// only value today.
+pub const WORKSPACE_ROLE_MATERIALIZATION_TARGET: &str = "materialization_target";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StartAttempt {
     pub intent_id: String,
@@ -15,6 +20,7 @@ pub struct StartAttempt {
     pub base_head: String,
     pub attached: bool,
     pub workspace_path: String,
+    pub workspace_role: &'static str,
     pub operation_id: String,
     pub current_view_id: String,
 }
@@ -37,6 +43,9 @@ pub struct AttemptSummary {
     pub status: String,
     pub attached: bool,
     pub workspace_path: String,
+    /// Additive NER-382 qualifier mirroring [`StartAttempt::workspace_role`]:
+    /// `attempt list`/`attempt show` carry the same role next to `workspace_path`.
+    pub workspace_role: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +218,7 @@ fn create_attempt(
                         "base_head": base_head,
                         "attached": attach,
                         "workspace_path": workspace_rel_path_for_attempt(&attempt_id),
+                        "workspace_role": WORKSPACE_ROLE_MATERIALIZATION_TARGET,
                     }
                 }),
             },
@@ -225,6 +235,7 @@ fn create_attempt(
     Ok(StartAttempt {
         intent_id,
         workspace_path: workspace_rel_path_for_attempt(&attempt_id),
+        workspace_role: WORKSPACE_ROLE_MATERIALIZATION_TARGET,
         attempt_id,
         base_head,
         attached: attach,
@@ -468,6 +479,7 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
             base_head: row.get(3)?,
             status: row.get(4)?,
             workspace_path: row.get(5)?,
+            workspace_role: WORKSPACE_ROLE_MATERIALIZATION_TARGET,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -492,6 +504,7 @@ pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
             base_head: attempt.base_head.clone(),
             status: attempt.status.clone(),
             workspace_path: attempt_workspace_rel_path(&context, &attempt.attempt_id)?,
+            workspace_role: WORKSPACE_ROLE_MATERIALIZATION_TARGET,
         },
         latest_snapshot: latest_snapshot_for_attempt(&context, &attempt.attempt_id)?,
         latest_evidence: latest_evidence_for_attempt(&context, &attempt.attempt_id)?,
@@ -560,4 +573,69 @@ pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
             selector: attempt_id.to_string(),
         })?
         .base_head)
+}
+
+/// NER-382 workspace drift guard: refuse `attempt attach` when the target attempt's
+/// workspace dir no longer holds the content the store recorded materializing into it
+/// (`attempt_workspaces.materialized_content_ref`) — re-materializing would silently
+/// discard those workspace edits. This is an EQUALITY check, not a diff: it delegates
+/// to [`forge_content_native::tree_equality_drift`], the read-only, cache-free
+/// primitive that enumerates the workspace dir under the SAME exclusion contract as
+/// the native snapshot scanner (policy filter + `.forgeignore` + `.gitignore` rooted
+/// at the workspace dir) and hash/byte-compares each file against the recorded tree.
+/// A refusal leaves the workspace untouched.
+///
+/// The attempt's local private path labels are excluded from BOTH sides: an
+/// in-workspace `save` records a private-EXCLUDED public tree while the private
+/// files stay on disk, so counting them would be permanent false drift naming
+/// private paths (and `--discard-workspace-changes` would then delete them).
+///
+/// Skipped (Ok) when nothing was ever materialized: a NULL/absent
+/// `materialized_content_ref` (including every git-backend workspace, which never
+/// records one) has no baseline to drift from.
+pub fn verify_attempt_workspace_undrifted(cwd: &Path, attempt_id: &str) -> Result<()> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let connection = open_connection(&context.database_path)?;
+    let recorded: Option<String> = connection
+        .query_row(
+            "SELECT materialized_content_ref FROM attempt_workspaces
+             WHERE repo_id = ?1 AND attempt_id = ?2",
+            params![context.repo_id, attempt_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    // Only native `forge-tree:` refs are ever recorded (the git arm of workspace
+    // materialization records nothing); stay permissive on any other family.
+    let Some(tree_id) = recorded.strip_prefix(forge_content::FORGE_TREE_PREFIX) else {
+        return Ok(());
+    };
+    // Same labels helper family `save` uses (`local_private_path_exclusions`), minus
+    // its file-existence check: this guard only needs the label *paths*, and the
+    // labeled files live in the workspace dir, not necessarily under `cwd`.
+    let excluded: std::collections::BTreeSet<String> =
+        local_private_path_labels(cwd, "attempt", attempt_id)?
+            .into_iter()
+            .map(|label| label.path)
+            .collect();
+    let workspace = context
+        .root_path
+        .join(attempt_workspace_rel_path(&context, attempt_id)?);
+    let tree = forge_content_native::ObjectId::parse(tree_id)?;
+    let drifted = forge_content_native::tree_equality_drift(
+        &context.root_path,
+        &workspace,
+        &tree,
+        &excluded,
+    )?;
+    if drifted.is_empty() {
+        return Ok(());
+    }
+    Err(ForgeError::WorkspaceDrift { paths: drifted }.into())
 }

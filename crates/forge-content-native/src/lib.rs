@@ -1,10 +1,8 @@
 //! Native content object store, tree materialization, diff, and merge engine.
 //!
-//! ADR-0001's 3,000-line ceiling allows justified exceptions when cohesion beats
-//! size. This file is intentionally capped as one native-content engine because
-//! the object framing, tree walking/materialization, diff fingerprinting, and
-//! three-way merge code share private invariants. Splitting it mechanically would
-//! widen those invariants first. New native-content domains land in sibling modules.
+//! ADR-0001's 3,000-line ceiling allows exceptions when cohesion beats size: object framing,
+//! tree walking/materialization, diff fingerprinting, and three-way merge share private
+//! invariants that mechanical splitting would widen. New domains land in sibling modules.
 
 use anyhow::{anyhow, bail, Context, Result};
 use forge_content::{
@@ -28,6 +26,8 @@ use std::process::Command;
 mod pack;
 pub mod provenance;
 mod status_cache;
+mod workspace_equality;
+pub use workspace_equality::tree_equality_drift;
 
 pub use provenance::{attribute_lines, path_provenance, LineAttribution, PathProvenanceEntry};
 

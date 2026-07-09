@@ -225,13 +225,30 @@ pub(crate) struct AttemptArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum AttemptCommand {
+    /// Start a new attempt for an existing intent.
+    ///
+    /// The reported workspace_path (.forge/worktrees/<attempt-id>) is
+    /// materialized state, not an editing surface; the repo root worktree
+    /// (after `attempt attach`) is where edits belong.
     Start(AttemptStartArgs),
     List,
     Show {
         attempt_id: String,
     },
+    /// Attach the repo root worktree to an attempt and materialize its tree there.
+    ///
+    /// The attempt's .forge/worktrees/<attempt-id> workspace dir is
+    /// materialized state, not an editing surface; the repo root worktree
+    /// (after attach) is where edits belong.
     Attach {
         attempt_id: String,
+        /// Proceed even when the attempt's workspace dir (.forge/worktrees/<attempt>)
+        /// has drifted from its recorded materialized content, discarding the drifted
+        /// workspace edits (NER-382). Without this flag such an attach refuses with
+        /// WORKSPACE_DRIFT. Discards workspace-dir drift ONLY — it never bypasses the
+        /// repo-root DIRTY_WORKTREE or ATTEMPT_WORKTREE_MISMATCH protections.
+        #[arg(long)]
+        discard_workspace_changes: bool,
     },
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),

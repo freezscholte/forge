@@ -300,6 +300,16 @@ pub enum ForgeError {
         principal_id: String,
         reason: String,
     },
+    /// `attempt attach` found the target attempt's workspace dir no longer equal to
+    /// its recorded `attempt_workspaces.materialized_content_ref` (NER-382):
+    /// re-materializing would silently discard those workspace edits. `paths` lists
+    /// the drifted workspace-relative paths, secret-risk redacted in
+    /// [`ForgeError::details`] exactly like `DirtyWorktree`. Deterministic — save the
+    /// drifted content elsewhere, or re-run `attempt attach` with
+    /// `--discard-workspace-changes` to explicitly discard it. The override discards
+    /// workspace-dir drift ONLY; it never bypasses `DIRTY_WORKTREE` or
+    /// `ATTEMPT_WORKTREE_MISMATCH`.
+    WorkspaceDrift { paths: Vec<String> },
 }
 
 impl ForgeError {
@@ -350,6 +360,7 @@ impl ForgeError {
             ForgeError::PrivateDecryptAuthorityMissing { .. } => {
                 "PRIVATE_DECRYPT_AUTHORITY_MISSING"
             }
+            ForgeError::WorkspaceDrift { .. } => "WORKSPACE_DRIFT",
         }
     }
 
@@ -392,6 +403,17 @@ impl ForgeError {
                 ]
             }),
             ForgeError::DirtyWorktree { paths } => redact_paths(paths),
+            ForgeError::WorkspaceDrift { paths } => {
+                // Same secret-redacted paths payload as DirtyWorktree, plus additive
+                // recovery keys (NER-382 review): name the explicit override flag so
+                // an agent can act on the refusal without parsing the human message.
+                let mut details = redact_paths(paths);
+                details["override_flag"] = json!("--discard-workspace-changes");
+                details["recovery_hint"] = json!(
+                    "Save the drifted workspace edits elsewhere, then re-run `attempt attach` with --discard-workspace-changes to explicitly discard them."
+                );
+                details
+            }
             ForgeError::AmbiguousAttempt { candidate_ids }
             | ForgeError::AmbiguousProposal { candidate_ids } => {
                 json!({ "candidate_ids": candidate_ids })
@@ -801,6 +823,10 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "principal {principal_id} lacks private decrypt authority: {reason}"
             ),
+            ForgeError::WorkspaceDrift { .. } => write!(
+                f,
+                "attempt workspace dir has drifted from its recorded materialized content; save the drifted edits elsewhere, or re-run `attempt attach` with --discard-workspace-changes to discard them"
+            ),
         }
     }
 }
@@ -1095,6 +1121,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["principal_id", "reason"],
+        },
+        ErrorCodeSpec {
+            code: "WORKSPACE_DRIFT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["paths", "redacted_count", "override_flag", "recovery_hint"],
         },
     ]
 }
@@ -1650,6 +1682,48 @@ mod tests {
         assert_eq!(details["redacted_count"], 2);
     }
 
+    /// `WorkspaceDrift` shares `redact_paths` with `DirtyWorktree` (NER-382): the
+    /// drifted-path list is a machine-visible egress, so secret-risk names must be
+    /// replaced with the placeholder while the redaction count stays observable.
+    #[test]
+    fn workspace_drift_details_redact_secret_paths() {
+        let error = ForgeError::WorkspaceDrift {
+            paths: vec![
+                "src/main.rs".into(),
+                ".env".into(),
+                "server/private.pem".into(),
+            ],
+        };
+        assert_eq!(error.code(), "WORKSPACE_DRIFT");
+        let details = error.details();
+        let paths = details["paths"].as_array().expect("paths array");
+        let serialized = Value::Array(paths.clone()).to_string();
+        assert!(serialized.contains("src/main.rs"));
+        assert!(
+            !serialized.contains(".env"),
+            "secret filename must not appear in details"
+        );
+        assert!(
+            !serialized.contains("private.pem"),
+            "secret filename must not appear in details"
+        );
+        assert_eq!(details["redacted_count"], 2);
+        // Additive recovery keys (NER-382 review): the override flag is structured,
+        // not only prose, and matches the registry's details_keys.
+        assert_eq!(details["override_flag"], "--discard-workspace-changes");
+        assert!(
+            details["recovery_hint"]
+                .as_str()
+                .expect("recovery_hint string")
+                .contains("--discard-workspace-changes"),
+            "recovery_hint must name the override flag"
+        );
+        // The human-readable message must name the override flag and never a path.
+        let message = error.to_string();
+        assert!(message.contains("--discard-workspace-changes"));
+        assert!(!message.contains("src/main.rs"));
+    }
+
     #[test]
     fn round_trips_through_anyhow() {
         let error: anyhow::Error = ForgeError::NoSnapshot.into();
@@ -1803,6 +1877,7 @@ mod tests {
                 principal_id: "actor_x".into(),
                 reason: "missing_active_encryption_key".into(),
             },
+            ForgeError::WorkspaceDrift { paths: vec![] },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1849,7 +1924,8 @@ mod tests {
                 | ForgeError::OrgAlreadyEnabled { .. }
                 | ForgeError::OrgAuthorityRequired { .. }
                 | ForgeError::PrivateContentInvalid { .. }
-                | ForgeError::PrivateDecryptAuthorityMissing { .. } => {}
+                | ForgeError::PrivateDecryptAuthorityMissing { .. }
+                | ForgeError::WorkspaceDrift { .. } => {}
             }
         }
 
