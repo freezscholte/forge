@@ -143,6 +143,9 @@ pub(crate) struct LogArgs {
 pub(crate) struct BlameArgs {
     /// Repo-relative path of the committed file whose lines to attribute.
     pub(crate) path: String,
+    /// Attribute at this native commit id (`f1:commit:sha256:...`) instead of the ledger tip.
+    #[arg(long)]
+    pub(crate) at: Option<String>,
 }
 
 #[derive(Debug, Args)]

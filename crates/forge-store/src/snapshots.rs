@@ -344,36 +344,9 @@ pub fn checkout_target_content_ref(cwd: &Path, commit_id: &str) -> Result<String
         Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => id,
         _ => bail!("unknown commit: not a native commit id in this repository"),
     };
-    let connection = open_connection(&context.database_path)?;
     let commit = match store.read_commit(&id) {
         Ok(commit) => commit,
-        Err(_) => {
-            let query = format!(
-                "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2
-                 UNION ALL
-                 SELECT 1
-                   FROM operations o
-                   JOIN views v ON v.id = o.resulting_view_id
-                  WHERE o.repo_id = ?1
-                    AND o.kind IN ({})
-                    AND json_extract(v.state_json, '$.commit_id') = ?2
-                 LIMIT 1",
-                sync::SYNC_MERGED_OP_KIND_SQL_IN
-            );
-            let referenced: bool = connection
-                .query_row(&query, params![context.repo_id, commit_id], |_| Ok(true))
-                .optional()?
-                .unwrap_or(false);
-            if referenced {
-                return Err(ForgeError::NativeHistoryCorrupt {
-                    kind: NativeHistoryCorruptKind::DanglingCommitId,
-                    commit_id: commit_id.to_string(),
-                    related_id: None,
-                }
-                .into());
-            }
-            bail!("unknown commit: not in this repository's native history");
-        }
+        Err(_) => return Err(classify_missing_commit(cwd, commit_id)?),
     };
     let content_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
     // The tree (and everything it reaches) must exist before we clobber the worktree.
@@ -385,6 +358,48 @@ pub fn checkout_target_content_ref(cwd: &Path, commit_id: &str) -> Result<String
             related_id: Some(commit.tree.clone()),
         })?;
     Ok(content_ref)
+}
+
+/// Classify a native commit id whose object is absent from the store (its `read_commit`
+/// failed) as either genuine corruption or a user error. When the ledger still references
+/// the id — a `decisions.commit_id` row or a recorded sync-merge tip — the object should
+/// exist, so its absence is genuine corruption → `NativeHistoryCorrupt::DanglingCommitId`.
+/// Otherwise the id is a typo / never-written commit → a path-free "unknown commit" user
+/// error (so a typo never inflates the perceived corruption rate). Returns the error to
+/// raise; the `Err` arm is a genuine DB read failure to propagate. Shared by
+/// [`checkout_target_content_ref`] and `blame`'s `--at` selector so a store-missing commit
+/// classifies identically on both paths.
+pub fn classify_missing_commit(cwd: &Path, commit_id: &str) -> Result<anyhow::Error> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let query = format!(
+        "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2
+         UNION ALL
+         SELECT 1
+           FROM operations o
+           JOIN views v ON v.id = o.resulting_view_id
+          WHERE o.repo_id = ?1
+            AND o.kind IN ({})
+            AND json_extract(v.state_json, '$.commit_id') = ?2
+         LIMIT 1",
+        sync::SYNC_MERGED_OP_KIND_SQL_IN
+    );
+    let referenced: bool = connection
+        .query_row(&query, params![context.repo_id, commit_id], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    if referenced {
+        Ok(ForgeError::NativeHistoryCorrupt {
+            kind: NativeHistoryCorruptKind::DanglingCommitId,
+            commit_id: commit_id.to_string(),
+            related_id: None,
+        }
+        .into())
+    } else {
+        Ok(anyhow::anyhow!(
+            "unknown commit: not in this repository's native history"
+        ))
+    }
 }
 
 /// Record a `forge checkout` in the op-log (NER-138 Phase 7 slice 3) so `undo` can reverse

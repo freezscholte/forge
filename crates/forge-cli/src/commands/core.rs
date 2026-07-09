@@ -1052,17 +1052,82 @@ pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> Res
     // in the post-accept window where HEAD has not been reconciled yet.
     command_result("blame", request_id, |cwd, _request_id| {
         let repo_root = forge_store::repository_root_path(&cwd)?;
-        let tip = forge_store::native_history_tip(&cwd)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "path {} does not exist: repository has no native history yet",
-                args.path
-            )
-        })?;
         let store = forge_content_native::NativeObjectStore::new(&repo_root);
+        // NER-387: `--at <commit_id>` selects an explicit historical tip; without it the
+        // tip comes from the ledger exactly as before. Rejection mirrors `forge checkout`'s
+        // commit-id convention (`checkout_target_content_ref`): a non-parseable /
+        // non-commit / absent id is a path-free "unknown commit" user error that
+        // `error_to_object` maps to COMMAND_FAILED — no new error code.
+        let tip = match args.at.as_deref() {
+            Some(at) => {
+                let id = match forge_content_native::ObjectId::parse(at) {
+                    Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => {
+                        id
+                    }
+                    _ => anyhow::bail!("unknown commit: not a native commit id in this repository"),
+                };
+                if store.read_commit(&id).is_err() {
+                    // Parity with `forge checkout`: a store-missing id that the ledger
+                    // still references is genuine corruption (NATIVE_HISTORY_CORRUPT), not
+                    // a user typo. The shared classifier keeps both paths identical.
+                    return Err(forge_store::classify_missing_commit(&cwd, at)?);
+                }
+                id
+            }
+            None => forge_store::native_history_tip(&cwd)?.ok_or_else(|| {
+                anyhow::Error::from(ForgeError::NoNativeHistory {
+                    path: args.path.clone(),
+                })
+            })?,
+        };
+        // Map the walk's typed content-native errors onto the ForgeError taxonomy by
+        // downcast (never by message text): forge-content-native cannot construct a
+        // ForgeError — the dependency runs the other way — so it raises its own
+        // ProvenanceError classifier and the bridging happens here (NER-386).
+        let map_provenance_error = |error: anyhow::Error| -> anyhow::Error {
+            use forge_content_native::provenance::{ProvenanceCorruptionKind, ProvenanceError};
+            match error.downcast_ref::<ProvenanceError>() {
+                Some(ProvenanceError::BinaryBlob) => ForgeError::BinaryBlob {
+                    path: args.path.clone(),
+                }
+                .into(),
+                Some(ProvenanceError::PathMissingAtTip { tip }) => ForgeError::PathNotFound {
+                    path: args.path.clone(),
+                    tip: tip.clone(),
+                }
+                .into(),
+                Some(ProvenanceError::StoreCorrupt {
+                    kind,
+                    commit_id,
+                    missing_id,
+                }) => ForgeError::NativeHistoryCorrupt {
+                    kind: match kind {
+                        ProvenanceCorruptionKind::DanglingTipCommit => {
+                            forge_store::NativeHistoryCorruptKind::DanglingCommitId
+                        }
+                        ProvenanceCorruptionKind::DanglingParent => {
+                            forge_store::NativeHistoryCorruptKind::DanglingParent
+                        }
+                        ProvenanceCorruptionKind::DanglingTree => {
+                            forge_store::NativeHistoryCorruptKind::DanglingTree
+                        }
+                    },
+                    commit_id: commit_id.clone(),
+                    related_id: missing_id.clone(),
+                }
+                .into(),
+                // A walk-invariant violation is a should-never-happen inconsistency with
+                // no dedicated code; its Display is path-free by construction, so it may
+                // fall through to COMMAND_FAILED without leaking the queried path.
+                Some(ProvenanceError::WalkInconsistent { .. }) | None => error,
+            }
+        };
         let provenance =
-            forge_content_native::provenance::path_provenance_at(&store, &tip, &args.path)?;
+            forge_content_native::provenance::path_provenance_at(&store, &tip, &args.path)
+                .map_err(map_provenance_error)?;
         let attributions =
-            forge_content_native::provenance::attribute_lines_at(&store, &tip, &args.path)?;
+            forge_content_native::provenance::attribute_lines_at(&store, &tip, &args.path)
+                .map_err(map_provenance_error)?;
         let by_commit: std::collections::HashMap<
             &str,
             &forge_content_native::provenance::PathProvenanceEntry,

@@ -8,7 +8,128 @@
 use crate::{
     diff_native_trees, CommitObject, DiffOptions, NativeObjectStore, NativeRefStore, ObjectId,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+
+/// Which history-referenced object the provenance walk failed to dereference.
+/// A closed classifier only — `ForgeError` lives in `forge-store` (which depends
+/// on this crate), so the CLI maps these onto the existing
+/// `NATIVE_HISTORY_CORRUPT` taxonomy; this crate never constructs a `ForgeError`.
+/// Mirrors the `NativeMergeConflictKind` bridging pattern in `lib.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceCorruptionKind {
+    /// The tip commit object itself is absent from the store.
+    DanglingTipCommit,
+    /// A commit's declared (dereferenced) parent commit object is absent.
+    DanglingParent,
+    /// A commit's tree — or a blob that tree references — is absent.
+    DanglingTree,
+}
+
+/// Typed domain failures of the provenance walk (`path_provenance_at` /
+/// `attribute_lines_at`), carried inside `anyhow::Error` and recovered by the
+/// CLI via `downcast_ref` (never by message text). Deliberately carries NO
+/// file path: the queried path is user-supplied and may be secret-risk, so it
+/// is re-attached (and redacted) only at the CLI's `ForgeError` layer. Every
+/// `Display` below is therefore path-free by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvenanceError {
+    /// The queried path's blob at the tip is not UTF-8 text.
+    BinaryBlob,
+    /// The queried path has no committed content at the resolved tip.
+    PathMissingAtTip { tip: String },
+    /// An object referenced by committed history is absent from the store —
+    /// genuine corruption, not a user error. `commit_id` is the subject commit
+    /// of the walk step; `missing_id` the dereferenced object that failed to
+    /// read, when distinct. Both are opaque `f1:` ids, never paths.
+    StoreCorrupt {
+        kind: ProvenanceCorruptionKind,
+        commit_id: String,
+        missing_id: Option<String>,
+    },
+    /// A structural invariant of the line-attribution walk was violated at
+    /// `commit_id` — genuine store/history inconsistency, not a user error (e.g. a
+    /// modified/renamed path whose parent revision has no blob, an unsupported
+    /// change kind, or a HEAD line left unattributed after reaching genesis).
+    /// `reason` is a closed, path-free static string. Carries NO path: the queried
+    /// path is user-supplied and may be secret-risk, so `Display` stays path-free.
+    WalkInconsistent {
+        commit_id: String,
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for ProvenanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProvenanceError::BinaryBlob => write!(
+                f,
+                "cannot attribute lines: the blob at the queried path is binary (not UTF-8 text)"
+            ),
+            ProvenanceError::PathMissingAtTip { tip } => {
+                write!(f, "the queried path does not exist at commit {tip}")
+            }
+            ProvenanceError::StoreCorrupt {
+                kind,
+                commit_id,
+                missing_id,
+            } => {
+                let kind = match kind {
+                    ProvenanceCorruptionKind::DanglingTipCommit => "dangling tip commit",
+                    ProvenanceCorruptionKind::DanglingParent => "dangling parent",
+                    ProvenanceCorruptionKind::DanglingTree => "dangling tree",
+                };
+                match missing_id {
+                    Some(missing) => write!(
+                        f,
+                        "native object store is missing a history-referenced object ({kind}) at commit {commit_id} (missing {missing})"
+                    ),
+                    None => write!(
+                        f,
+                        "native object store is missing a history-referenced object ({kind}) at commit {commit_id}"
+                    ),
+                }
+            }
+            ProvenanceError::WalkInconsistent { commit_id, reason } => write!(
+                f,
+                "native line attribution walk hit an inconsistency at commit {commit_id}: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProvenanceError {}
+
+/// Wrap a failed `read_commit` of `commit_id` as store corruption: the tip
+/// itself when `commit_id == tip`, otherwise a dangling dereferenced parent.
+fn corrupt_commit_read(tip: &ObjectId, commit_id: &ObjectId) -> ProvenanceError {
+    if commit_id == tip {
+        ProvenanceError::StoreCorrupt {
+            kind: ProvenanceCorruptionKind::DanglingTipCommit,
+            commit_id: tip.to_string(),
+            missing_id: None,
+        }
+    } else {
+        ProvenanceError::StoreCorrupt {
+            kind: ProvenanceCorruptionKind::DanglingParent,
+            commit_id: commit_id.to_string(),
+            missing_id: None,
+        }
+    }
+}
+
+/// Wrap a failed dereference of `missing` (a parent commit, tree, or blob)
+/// declared by `commit_id` as store corruption of the given `kind`.
+fn corrupt_dereference(
+    kind: ProvenanceCorruptionKind,
+    commit_id: &ObjectId,
+    missing: &str,
+) -> ProvenanceError {
+    ProvenanceError::StoreCorrupt {
+        kind,
+        commit_id: commit_id.to_string(),
+        missing_id: Some(missing.to_string()),
+    }
+}
 
 /// One commit's touch of the queried path, tip-first. Provenance fields are copied
 /// verbatim from [`CommitObject`] — never synthesized or defaulted to non-`None`.
@@ -56,19 +177,41 @@ pub fn path_provenance_at(
     let mut tracked = path.to_string();
     let mut cursor = Some(tip.clone());
     while let Some(commit_id) = cursor {
-        let commit = store.read_commit(&commit_id)?;
+        let commit = store
+            .read_commit(&commit_id)
+            .map_err(|_| corrupt_commit_read(tip, &commit_id))?;
         let tree = ObjectId::parse(&commit.tree)?;
         let Some(first_parent) = commit.parents.first() else {
             // Genesis: no parent to diff against; the path counts as added iff it
             // exists in the genesis tree.
-            if store.tree_fingerprints(&tree)?.contains_key(&tracked) {
+            let fingerprints = store.tree_fingerprints(&tree).map_err(|_| {
+                corrupt_dereference(
+                    ProvenanceCorruptionKind::DanglingTree,
+                    &commit_id,
+                    &commit.tree,
+                )
+            })?;
+            if fingerprints.contains_key(&tracked) {
                 entries.push(entry_for(&commit_id, &commit, "added"));
             }
             break;
         };
         let parent_id = ObjectId::parse(first_parent)?;
-        let parent_tree = ObjectId::parse(&store.read_commit(&parent_id)?.tree)?;
-        let diff = diff_native_trees(store, &parent_tree, &tree, &options)?;
+        let parent_commit = store.read_commit(&parent_id).map_err(|_| {
+            corrupt_dereference(
+                ProvenanceCorruptionKind::DanglingParent,
+                &commit_id,
+                first_parent,
+            )
+        })?;
+        let parent_tree = ObjectId::parse(&parent_commit.tree)?;
+        let diff = diff_native_trees(store, &parent_tree, &tree, &options).map_err(|_| {
+            corrupt_dereference(
+                ProvenanceCorruptionKind::DanglingTree,
+                &commit_id,
+                &commit.tree,
+            )
+        })?;
         for file in &diff.files {
             if file.path != tracked {
                 continue;
@@ -115,10 +258,18 @@ pub fn attribute_lines_at(
     tip: &ObjectId,
     path: &str,
 ) -> Result<Vec<LineAttribution>> {
-    let head_tree = ObjectId::parse(&store.read_commit(tip)?.tree)?;
-    let mut current_lines = match blob_lines(store, &head_tree, path)? {
+    let tip_commit = store
+        .read_commit(tip)
+        .map_err(|_| corrupt_commit_read(tip, tip))?;
+    let head_tree = ObjectId::parse(&tip_commit.tree)?;
+    let mut current_lines = match blob_lines(store, tip, &head_tree, path)? {
         Some(lines) => lines,
-        None => bail!("path {path} does not exist at {tip}"),
+        None => {
+            return Err(ProvenanceError::PathMissingAtTip {
+                tip: tip.to_string(),
+            }
+            .into())
+        }
     };
     // pending[i] = Some(h): line i of the version at the walk cursor is (so far)
     // unchanged since HEAD line h and still awaits an owning commit.
@@ -132,7 +283,9 @@ pub fn attribute_lines_at(
     let mut tracked = path.to_string();
     let mut cursor = tip.clone();
     loop {
-        let commit = store.read_commit(&cursor)?;
+        let commit = store
+            .read_commit(&cursor)
+            .map_err(|_| corrupt_commit_read(tip, &cursor))?;
         let tree = ObjectId::parse(&commit.tree)?;
         let Some(first_parent) = commit.parents.first() else {
             // Genesis: every line still pending was introduced here.
@@ -140,8 +293,21 @@ pub fn attribute_lines_at(
             break;
         };
         let parent_id = ObjectId::parse(first_parent)?;
-        let parent_tree = ObjectId::parse(&store.read_commit(&parent_id)?.tree)?;
-        let diff = diff_native_trees(store, &parent_tree, &tree, &options)?;
+        let parent_commit = store.read_commit(&parent_id).map_err(|_| {
+            corrupt_dereference(
+                ProvenanceCorruptionKind::DanglingParent,
+                &cursor,
+                first_parent,
+            )
+        })?;
+        let parent_tree = ObjectId::parse(&parent_commit.tree)?;
+        let diff = diff_native_trees(store, &parent_tree, &tree, &options).map_err(|_| {
+            corrupt_dereference(
+                ProvenanceCorruptionKind::DanglingTree,
+                &cursor,
+                &commit.tree,
+            )
+        })?;
         if let Some(file) = diff.files.iter().find(|f| f.path == tracked) {
             match change_label(&file.status)? {
                 "added" => {
@@ -150,11 +316,14 @@ pub fn attribute_lines_at(
                 }
                 "modified" | "renamed" => {
                     let parent_path = file.old_path.as_deref().unwrap_or(&tracked).to_string();
-                    let Some(parent_lines) = blob_lines(store, &parent_tree, &parent_path)? else {
-                        bail!(
-                            "native line attribution walk lost path {parent_path} \
-                             in parent of commit {cursor}"
-                        );
+                    let Some(parent_lines) =
+                        blob_lines(store, &parent_id, &parent_tree, &parent_path)?
+                    else {
+                        return Err(ProvenanceError::WalkInconsistent {
+                            commit_id: cursor.to_string(),
+                            reason: "a modified/renamed path has no blob in the parent revision",
+                        }
+                        .into());
                     };
                     let matched = match_lines(&parent_lines, &current_lines);
                     let mut next_pending: Vec<Option<usize>> = vec![None; parent_lines.len()];
@@ -171,10 +340,13 @@ pub fn attribute_lines_at(
                     current_lines = parent_lines;
                     pending = next_pending;
                 }
-                other => bail!(
-                    "unsupported change {other} for path {tracked} \
-                     in native line attribution walk at commit {cursor}"
-                ),
+                _ => {
+                    return Err(ProvenanceError::WalkInconsistent {
+                        commit_id: cursor.to_string(),
+                        reason: "an unsupported change kind reached the line-attribution walk",
+                    }
+                    .into())
+                }
             }
         }
         if attributions.iter().all(Option::is_some) {
@@ -187,11 +359,9 @@ pub fn attribute_lines_at(
         .zip(attributions)
         .enumerate()
         .map(|(idx, (content, commit_id))| {
-            let commit_id = commit_id.with_context(|| {
-                format!(
-                    "native line attribution walk left line {} of {path} unattributed",
-                    idx + 1
-                )
+            let commit_id = commit_id.ok_or_else(|| ProvenanceError::WalkInconsistent {
+                commit_id: tip.to_string(),
+                reason: "a HEAD line was left unattributed after reaching genesis",
             })?;
             Ok(LineAttribution {
                 line_number: idx + 1,
@@ -212,21 +382,32 @@ fn attribute_pending(
     }
 }
 
-/// Read the blob at `path` inside `tree` and split it into lines (trailing newline
-/// dropped; a missing final newline still yields a last line). `None` when the path
-/// has no file leaf in the tree; a typed error when the blob is not UTF-8 text.
+/// Read the blob at `path` inside `tree` (declared by `commit_id`, for corruption
+/// attribution) and split it into lines (trailing newline dropped; a missing final
+/// newline still yields a last line). `None` when the path has no file leaf in the
+/// tree; a typed [`ProvenanceError`] when the blob is not UTF-8 text or a
+/// history-referenced object is absent from the store.
 fn blob_lines(
     store: &NativeObjectStore,
+    commit_id: &ObjectId,
     tree: &ObjectId,
     path: &str,
 ) -> Result<Option<Vec<String>>> {
-    let fingerprints = store.tree_fingerprints(tree)?;
+    let fingerprints = store.tree_fingerprints(tree).map_err(|_| {
+        corrupt_dereference(
+            ProvenanceCorruptionKind::DanglingTree,
+            commit_id,
+            &tree.to_string(),
+        )
+    })?;
     let Some((blob_id, _mode)) = fingerprints.get(path) else {
         return Ok(None);
     };
-    let bytes = store.read_object(&ObjectId::parse(blob_id)?)?;
+    let bytes = store.read_object(&ObjectId::parse(blob_id)?).map_err(|_| {
+        corrupt_dereference(ProvenanceCorruptionKind::DanglingTree, commit_id, blob_id)
+    })?;
     let Ok(text) = String::from_utf8(bytes) else {
-        bail!("cannot attribute lines of {path}: blob is binary (not UTF-8 text)");
+        return Err(ProvenanceError::BinaryBlob.into());
     };
     Ok(Some(
         text.split_terminator('\n').map(str::to_string).collect(),
@@ -727,6 +908,16 @@ mod tests {
             err.to_string().contains("binary"),
             "unexpected error: {err}"
         );
+        // The failure is typed (recoverable by downcast, never by message text)
+        // and its Display carries no path — the queried path may be secret-risk.
+        assert_eq!(
+            err.downcast_ref::<ProvenanceError>(),
+            Some(&ProvenanceError::BinaryBlob)
+        );
+        assert!(
+            !err.to_string().contains("app.bin"),
+            "Display must be path-free: {err}"
+        );
     }
 
     #[test]
@@ -745,10 +936,46 @@ mod tests {
         set_head(repo, &genesis);
 
         let err = attribute_lines(&store, "app.txt").unwrap_err();
-        assert!(
-            err.to_string().contains("app.txt"),
-            "unexpected error: {err}"
+        // Typed missing-path failure carrying the tip; Display is path-free
+        // (the queried path may be secret-risk and is redacted at the CLI).
+        assert_eq!(
+            err.downcast_ref::<ProvenanceError>(),
+            Some(&ProvenanceError::PathMissingAtTip {
+                tip: genesis.to_string()
+            })
         );
+        assert!(
+            !err.to_string().contains("app.txt"),
+            "Display must be path-free: {err}"
+        );
+    }
+
+    #[test]
+    fn walk_inconsistent_display_is_path_free() {
+        // The invariant-violation variant carries only an opaque commit id and a closed,
+        // static reason — never the queried path (which may be secret-risk). Its Display
+        // reaches the un-redacted envelope message/stderr via COMMAND_FAILED, so it must
+        // leak neither a path nor a separator.
+        for reason in [
+            "a modified/renamed path has no blob in the parent revision",
+            "an unsupported change kind reached the line-attribution walk",
+            "a HEAD line was left unattributed after reaching genesis",
+        ] {
+            let err = ProvenanceError::WalkInconsistent {
+                commit_id: "f1:commit:sha256:deadbeef".to_string(),
+                reason,
+            };
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("f1:commit:sha256:deadbeef"),
+                "carries the opaque commit id: {rendered}"
+            );
+            assert!(rendered.contains(reason), "carries the reason: {rendered}");
+            assert!(
+                !rendered.contains(".env"),
+                "Display must be path-free: {rendered}"
+            );
+        }
     }
 
     #[test]

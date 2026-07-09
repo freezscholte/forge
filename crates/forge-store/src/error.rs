@@ -310,6 +310,19 @@ pub enum ForgeError {
     /// workspace-dir drift ONLY; it never bypasses `DIRTY_WORKTREE` or
     /// `ATTEMPT_WORKTREE_MISMATCH`.
     WorkspaceDrift { paths: Vec<String> },
+    /// `blame` was requested but the repository has no native history yet
+    /// (`native_history_tip` returned `None`). Deterministic — accept a proposal
+    /// (or sync) first. `path` is the user-supplied queried path: secret-risk
+    /// redacted in [`ForgeError::details`], never printed by `Display`.
+    NoNativeHistory { path: String },
+    /// The queried path has no committed content at the resolved tip (NER-386).
+    /// Deterministic. `path` is user-supplied (secret-risk redacted in `details`,
+    /// omitted from `Display`); `tip` is the opaque resolved commit id.
+    PathNotFound { path: String, tip: String },
+    /// The queried path's blob at the resolved tip is not UTF-8 text, so lines
+    /// cannot be attributed (NER-386). Deterministic. `path` is user-supplied
+    /// (secret-risk redacted in `details`, omitted from `Display`).
+    BinaryBlob { path: String },
 }
 
 impl ForgeError {
@@ -361,6 +374,9 @@ impl ForgeError {
                 "PRIVATE_DECRYPT_AUTHORITY_MISSING"
             }
             ForgeError::WorkspaceDrift { .. } => "WORKSPACE_DRIFT",
+            ForgeError::NoNativeHistory { .. } => "NO_NATIVE_HISTORY",
+            ForgeError::PathNotFound { .. } => "PATH_NOT_FOUND",
+            ForgeError::BinaryBlob { .. } => "BINARY_BLOB",
         }
     }
 
@@ -590,8 +606,24 @@ impl ForgeError {
                 principal_id,
                 reason,
             } => json!({ "principal_id": principal_id, "reason": reason }),
+            ForgeError::NoNativeHistory { path } => json!({ "path": redacted_path(path) }),
+            ForgeError::PathNotFound { path, tip } => {
+                json!({ "path": redacted_path(path), "tip": tip })
+            }
+            ForgeError::BinaryBlob { path } => json!({ "path": redacted_path(path) }),
             _ => Value::Object(Default::default()),
         }
+    }
+}
+
+/// Redact a single user-supplied queried path for `details` (NER-386): the same
+/// `is_secret_risk_path` gate `redact_paths` applies per entry, for variants that
+/// carry exactly one path.
+fn redacted_path(path: &str) -> String {
+    if forge_content::is_secret_risk_path(path) {
+        REDACTED_PATH_PLACEHOLDER.to_string()
+    } else {
+        path.to_string()
     }
 }
 
@@ -826,6 +858,21 @@ impl std::fmt::Display for ForgeError {
             ForgeError::WorkspaceDrift { .. } => write!(
                 f,
                 "attempt workspace dir has drifted from its recorded materialized content; save the drifted edits elsewhere, or re-run `attempt attach` with --discard-workspace-changes to discard them"
+            ),
+            // The three blame variants below never print the queried path: it is
+            // user-supplied and may be secret-risk, and this Display reaches the
+            // response `message` and stderr un-redacted (details() redacts instead).
+            ForgeError::NoNativeHistory { .. } => write!(
+                f,
+                "cannot blame: repository has no native history yet; accept a proposal first"
+            ),
+            ForgeError::PathNotFound { tip, .. } => write!(
+                f,
+                "queried path has no committed content at the resolved tip {tip}"
+            ),
+            ForgeError::BinaryBlob { .. } => write!(
+                f,
+                "cannot blame: the blob at the queried path is binary (not UTF-8 text)"
             ),
         }
     }
@@ -1127,6 +1174,24 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["paths", "redacted_count", "override_flag", "recovery_hint"],
+        },
+        ErrorCodeSpec {
+            code: "NO_NATIVE_HISTORY",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["path"],
+        },
+        ErrorCodeSpec {
+            code: "PATH_NOT_FOUND",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["path", "tip"],
+        },
+        ErrorCodeSpec {
+            code: "BINARY_BLOB",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["path"],
         },
     ]
 }
@@ -1724,6 +1789,77 @@ mod tests {
         assert!(!message.contains("src/main.rs"));
     }
 
+    /// NER-386 security invariant: the three blame variants carry the user-supplied
+    /// queried path, so `details` must redact a secret-risk path through the same
+    /// `is_secret_risk_path` gate as `DirtyWorktree`/`WorkspaceDrift`, and `Display`
+    /// (which reaches the response `message` and stderr un-redacted) must never
+    /// print the path at all.
+    #[test]
+    fn blame_variant_details_redact_secret_paths_and_display_is_path_free() {
+        let plain = ForgeError::PathNotFound {
+            path: "src/main.rs".into(),
+            tip: "f1:commit:sha256:aa".into(),
+        };
+        let details = plain.details();
+        assert_eq!(details["path"], "src/main.rs");
+        assert_eq!(details["tip"], "f1:commit:sha256:aa");
+        assert_eq!(
+            details.as_object().expect("details object").len(),
+            2,
+            "details carry exactly path + tip"
+        );
+
+        for (error, expected_keys) in [
+            (
+                ForgeError::NoNativeHistory {
+                    path: ".env".into(),
+                },
+                vec!["path"],
+            ),
+            (
+                ForgeError::PathNotFound {
+                    path: ".env".into(),
+                    tip: "f1:commit:sha256:aa".into(),
+                },
+                vec!["path", "tip"],
+            ),
+            (
+                ForgeError::BinaryBlob {
+                    path: "server/private.pem".into(),
+                },
+                vec!["path"],
+            ),
+        ] {
+            assert!(!error.retryable(), "{}", error.code());
+            assert_eq!(error.after_ms(), None, "{}", error.code());
+            let details = error.details();
+            let object = details.as_object().expect("details object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                expected_keys,
+                "{}",
+                error.code()
+            );
+            let serialized = details.to_string();
+            assert!(
+                !serialized.contains(".env") && !serialized.contains("private.pem"),
+                "secret filename must not appear in {} details: {serialized}",
+                error.code()
+            );
+            assert!(
+                serialized.contains(REDACTED_PATH_PLACEHOLDER),
+                "{} details must carry the redaction placeholder: {serialized}",
+                error.code()
+            );
+            let message = error.to_string();
+            assert!(
+                !message.contains(".env") && !message.contains("private.pem"),
+                "{} Display must be path-free: {message}",
+                error.code()
+            );
+        }
+    }
+
     #[test]
     fn round_trips_through_anyhow() {
         let error: anyhow::Error = ForgeError::NoSnapshot.into();
@@ -1878,6 +2014,16 @@ mod tests {
                 reason: "missing_active_encryption_key".into(),
             },
             ForgeError::WorkspaceDrift { paths: vec![] },
+            ForgeError::NoNativeHistory {
+                path: "feature.txt".into(),
+            },
+            ForgeError::PathNotFound {
+                path: "feature.txt".into(),
+                tip: "f1:commit:sha256:aa".into(),
+            },
+            ForgeError::BinaryBlob {
+                path: "blob.bin".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1925,7 +2071,10 @@ mod tests {
                 | ForgeError::OrgAuthorityRequired { .. }
                 | ForgeError::PrivateContentInvalid { .. }
                 | ForgeError::PrivateDecryptAuthorityMissing { .. }
-                | ForgeError::WorkspaceDrift { .. } => {}
+                | ForgeError::WorkspaceDrift { .. }
+                | ForgeError::NoNativeHistory { .. }
+                | ForgeError::PathNotFound { .. }
+                | ForgeError::BinaryBlob { .. } => {}
             }
         }
 

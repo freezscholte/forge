@@ -182,8 +182,16 @@ fn blame_errors_on_a_path_missing_at_the_tip() {
             .failure(),
     );
     assert_eq!(out["status"], "error");
-    let message = out["errors"][0]["message"].as_str().expect("message");
-    assert!(message.contains("missing.txt"), "unexpected: {message}");
+    // NER-386: the failure is typed, not COMMAND_FAILED. The message is path-free
+    // (the queried path may be secret-risk); details carry the redactable path and
+    // the opaque resolved tip instead.
+    assert_eq!(out["errors"][0]["code"], "PATH_NOT_FOUND");
+    assert_eq!(out["errors"][0]["details"]["path"], "missing.txt");
+    assert!(
+        out["errors"][0]["details"]["tip"].is_string(),
+        "details carry the resolved tip: {out}"
+    );
+    assert_eq!(out["retry"]["retryable"], false);
 }
 
 #[test]
@@ -211,8 +219,41 @@ fn blame_errors_on_a_binary_blob() {
             .failure(),
     );
     assert_eq!(out["status"], "error");
+    // NER-386: the failure is typed, not COMMAND_FAILED; the path rides (redactable)
+    // in details, never in the message.
+    assert_eq!(out["errors"][0]["code"], "BINARY_BLOB");
+    assert_eq!(out["errors"][0]["details"]["path"], "blob.bin");
     let message = out["errors"][0]["message"].as_str().expect("message");
     assert!(message.contains("binary"), "unexpected: {message}");
+    assert!(
+        !message.contains("blob.bin"),
+        "message must be path-free: {message}"
+    );
+}
+
+/// NER-386: a native repo with no accepts (init only, never `start`ed) has no
+/// native history tip, so blame surfaces the typed `NO_NATIVE_HISTORY` — not the
+/// generic COMMAND_FAILED.
+#[test]
+fn blame_errors_with_no_native_history_before_any_accept() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["schema_version"], "forge.cli.v0");
+    assert_eq!(out["status"], "error");
+    assert_eq!(out["errors"][0]["code"], "NO_NATIVE_HISTORY");
+    assert_eq!(out["errors"][0]["details"]["path"], "feature.txt");
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(
+        !message.contains("feature.txt"),
+        "message must be path-free: {message}"
+    );
 }
 
 #[test]
@@ -590,4 +631,275 @@ fn schema_lists_the_blame_command() {
         commands.iter().any(|command| command["command"] == "blame"),
         "schema command registry must include blame"
     );
+}
+
+#[test]
+fn blame_at_an_early_commit_attributes_the_old_content() {
+    // NER-387: `--at <first commit>` blames the file as it existed AT that commit —
+    // the later rewrite is invisible to the historical walk.
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    let first = accept_change(&repo, "first change", "feature.txt", "one\ntwo\n");
+    let second = accept_change(&repo, "second change", "feature.txt", "one\nTWO\nthree\n");
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", &first])
+            .assert()
+            .success(),
+    );
+
+    assert_eq!(out["schema_version"], "forge.cli.v0");
+    assert_eq!(out["status"], "success");
+    // tip_commit_id reports the resolved --at commit, not the ledger tip.
+    assert_eq!(out["data"]["tip_commit_id"], first.as_str());
+    let lines = out["data"]["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2, "historical content has two lines: {out}");
+    assert_eq!(lines[0]["content"], "one");
+    assert_eq!(lines[1]["content"], "two");
+    for line in lines {
+        assert_eq!(
+            line["commit_id"],
+            first.as_str(),
+            "every historical line predates the second commit: {line}"
+        );
+        assert_ne!(line["commit_id"], second.as_str());
+    }
+
+    // Sanity: tip blame of the same path sees the rewritten three-line content.
+    let tip_out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(tip_out["data"]["lines"].as_array().expect("lines").len(), 3);
+}
+
+#[test]
+fn blame_at_rejects_an_unknown_or_unparseable_commit_id() {
+    // NER-387: rejection mirrors `forge checkout`'s commit-id convention — a path-free
+    // "unknown commit" user error and a non-zero exit. No hard-pinned code (386 owns
+    // blame's error-code taxonomy); `.failure()` plus the error object suffice.
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    accept_change(&repo, "seed change", "feature.txt", "one\n");
+
+    // Unparseable id.
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", "not-a-commit-id"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(message.contains("unknown commit"), "unexpected: {message}");
+
+    // Well-formed commit id absent from this repository's native history.
+    let absent = format!("f1:commit:sha256:{}", "0".repeat(64));
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", &absent])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(message.contains("unknown commit"), "unexpected: {message}");
+}
+
+#[test]
+fn blame_at_the_current_tip_matches_blame_without_at() {
+    // NER-387: `--at <current tip>` is byte-equivalent to the default ledger-tip
+    // resolution — compared as PARSED JSON so envelope and payload both pin.
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    accept_change(&repo, "first change", "feature.txt", "one\ntwo\n");
+    let tip = accept_change(&repo, "second change", "feature.txt", "one\nTWO\nthree\n");
+
+    let default_out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt"])
+            .assert()
+            .success(),
+    );
+    let at_out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", &tip])
+            .assert()
+            .success(),
+    );
+
+    assert_eq!(default_out["schema_version"], "forge.cli.v0");
+    assert_eq!(default_out, at_out);
+}
+
+// --- Validated code-review fix bundle (NER-386/387 hardening). Additive coverage
+// for the typed-corruption bridge, path redaction, and `--at` classification. ---
+
+/// The `.forge/objects/sha256/<aa>/<full>` file backing an `f1:*:sha256:<digest>` id.
+fn object_path_for_id(repo: &Path, id: &str) -> std::path::PathBuf {
+    let digest = id.rsplit(':').next().expect("digest tail");
+    repo.join(".forge/objects/sha256")
+        .join(&digest[..2])
+        .join(digest)
+}
+
+/// Locate the loose native object whose stored bytes contain `needle` (mirrors the
+/// object-deletion pattern in `forge_doctor_gc.rs`).
+fn object_path_containing(repo: &Path, needle: &str) -> Option<std::path::PathBuf> {
+    let objects = repo.join(".forge/objects/sha256");
+    for prefix in std::fs::read_dir(objects).ok()? {
+        let prefix = prefix.ok()?;
+        for object in std::fs::read_dir(prefix.path()).ok()? {
+            let object = object.ok()?;
+            if String::from_utf8_lossy(&std::fs::read(object.path()).ok()?).contains(needle) {
+                return Some(object.path());
+            }
+        }
+    }
+    None
+}
+
+/// (a) A store object the blame walk dereferences is missing → the typed
+/// `ProvenanceError::StoreCorrupt` bridges to `NATIVE_HISTORY_CORRUPT`, not the
+/// generic COMMAND_FAILED, with populated (path-free) corruption details.
+#[test]
+fn blame_bridges_store_corruption_to_native_history_corrupt() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    accept_change(
+        &repo,
+        "corrupt store",
+        "feature.txt",
+        "sole one\nsole two\n",
+    );
+
+    // Delete the blob the line-attribution walk must read at the tip.
+    let blob = object_path_containing(repo.path(), "sole one").expect("locate feature blob");
+    std::fs::remove_file(&blob).expect("remove reachable blob");
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    assert_eq!(out["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT");
+    let details = &out["errors"][0]["details"];
+    assert!(details["kind"].is_string(), "kind populated: {out}");
+    assert!(
+        details["commit_id"].is_string(),
+        "commit_id populated: {out}"
+    );
+    // The corruption message is path-free (the queried path may be secret-risk).
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(
+        !message.contains("feature.txt"),
+        "message must be path-free: {message}"
+    );
+}
+
+/// (b) A well-formed but NON-commit object id passed to `--at` is a user error:
+/// the parse/kind-check rejects it with the path-free "unknown commit" message.
+#[test]
+fn blame_at_rejects_a_well_formed_non_commit_object_id() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    accept_change(&repo, "seed change", "feature.txt", "one\n");
+
+    let tree_id = format!("f1:tree:sha256:{}", "0".repeat(64));
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", &tree_id])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(message.contains("unknown commit"), "unexpected: {message}");
+}
+
+/// (c) Blaming a secret-risk path that is missing at the tip must redact the path in
+/// the machine-visible `details` and never echo it in the message.
+#[test]
+fn blame_redacts_a_secret_risk_path_in_path_not_found_details() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    // Accept an unrelated file so native history exists; `.env` was never committed
+    // (and is secret-risk excluded), so blame resolves a tip then reports it missing.
+    accept_change(&repo, "unrelated change", "feature.txt", "one\n");
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", ".env"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    assert_eq!(out["errors"][0]["code"], "PATH_NOT_FOUND");
+    assert_eq!(
+        out["errors"][0]["details"]["path"], "[secret-risk path redacted]",
+        "secret-risk path must be redacted in details: {out}"
+    );
+    let message = out["errors"][0]["message"].as_str().expect("message");
+    assert!(
+        !message.contains(".env"),
+        "message must not echo the secret-risk path: {message}"
+    );
+}
+
+/// (d) `--at` at an early commit where the path does not yet exist → `PATH_NOT_FOUND`
+/// whose `details.tip` is the resolved `--at` commit, not the ledger tip.
+#[test]
+fn blame_at_reports_path_not_found_against_the_at_commit_not_the_ledger_tip() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    let early = accept_change(&repo, "first file", "early.txt", "early\n");
+    let tip = accept_change(&repo, "later file", "later.txt", "later one\nlater two\n");
+    assert_ne!(early, tip);
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "later.txt", "--at", &early])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    assert_eq!(out["errors"][0]["code"], "PATH_NOT_FOUND");
+    assert_eq!(
+        out["errors"][0]["details"]["tip"],
+        early.as_str(),
+        "PATH_NOT_FOUND reports the --at commit as the resolved tip: {out}"
+    );
+}
+
+/// (e) F1 parity: `--at` a ledger-referenced commit whose object is store-missing →
+/// `NATIVE_HISTORY_CORRUPT` (DanglingCommitId), classified exactly as `forge checkout`
+/// does, via the shared `classify_missing_commit` helper.
+#[test]
+fn blame_at_a_ledger_referenced_but_store_missing_commit_is_corrupt() {
+    let repo = TestRepo::new_git();
+    init_native(&repo);
+    let commit = accept_change(&repo, "vanishing commit", "feature.txt", "one\ntwo\n");
+
+    // The decisions ledger still references this commit, but its object is gone.
+    std::fs::remove_file(object_path_for_id(repo.path(), &commit))
+        .expect("remove accepted commit object");
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "blame", "feature.txt", "--at", &commit])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["status"], "error");
+    assert_eq!(out["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT");
+    assert_eq!(
+        out["errors"][0]["details"]["kind"], "dangling_commit_id",
+        "ledger-referenced missing commit is DanglingCommitId: {out}"
+    );
+    assert_eq!(out["errors"][0]["details"]["commit_id"], commit.as_str());
 }
