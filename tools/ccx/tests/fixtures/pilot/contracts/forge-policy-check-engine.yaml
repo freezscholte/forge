@@ -1,0 +1,105 @@
+# Contract: forge-policy check engine (crates/forge-policy)
+# Schema: A4.1 minimal (docs/brainstorms/2026-07-05-context-closed-tasks-v2.md)
+schema: ccx.contract.v0
+id: ccx-forge-policy-check-engine
+revision: 1
+module: crates/forge-policy
+
+interface: |
+  Pure evaluation crate, one public entry point and its types (all in
+  src/lib.rs, serde snake_case where serialized):
+
+    pub fn evaluate(spec: &CheckSpec, proposed_snapshot_id: &str,
+                    facts: &[EvidenceFact]) -> CheckOutcome
+    pub fn identity_string(program: &str, args: &[String]) -> String
+
+    pub struct Gate { program: String, args: Vec<String>,
+                      #[serde(default)] require_structured_pass: bool }
+    pub struct CheckSpec { gates: Vec<Gate> }        # empty => default mode
+    pub struct EvidenceFact { evidence_id, program, args, exit_code,
+                              snapshot_id: Option<String>, created_at_ms,
+                              seq, structured_failures: Option<u64> }
+    pub enum GateVerdict { Passed, Failed, Missing, Stale }
+    pub enum VerdictDetail { NoEvidence, StaleOffSnapshot, ExitCodeOnly,
+                             Parsed, StructuredRequiredButUnparsed }
+    pub struct GateResult { program, args, verdict, evidence_id: Option,
+                            exit_code: Option, structured_failures: Option,
+                            verdict_detail }
+    pub struct CheckOutcome { status: String, reason: String,
+                              gates: Vec<GateResult> }
+      # status in {"passed","failed","missing","stale"}; .passed(),
+      # .unmet_identities() -> Vec<String>
+
+invariants:
+  - Gate identity is (program, args) STRING EQUALITY; a different command can
+    never satisfy a declared gate (closes the failing-test-then-`echo ok`
+    footgun, NER-135).
+  - Latest matching evidence ON THE PROPOSED SNAPSHOT decides pass/fail;
+    latest = max (created_at_ms, seq), mirroring the store's
+    ORDER BY created_at_ms DESC, rowid DESC.
+  - Matching evidence only on a DIFFERENT snapshot => Stale; none at all =>
+    Missing. Declared-gate rollup precedence: failed > missing > stale >
+    passed.
+  - Default mode (empty gates) synthesizes one gate per distinct command
+    identity observed on the proposed snapshot; passes iff at least one
+    exists and all pass; a lone trivial success (`run -- true`) passes (the
+    acknowledged trivial case).
+  - Structured gate (require_structured_pass): nonzero exit fails BEFORE the
+    parsed count is consulted (detail=exit_code_only); exit 0 with parsed
+    Some(0) => Passed, Some(n>0) => Failed (both detail=parsed); exit 0 with
+    None => Missing with detail=structured_required_but_unparsed.
+  - verdict and verdict_detail are computed together in verdict_for(); they
+    must never be able to drift (single source of truth, NER-254).
+  - The stale reason string contains "latest evidence does not match proposal
+    revision snapshot" (historic contract, tested).
+  - evaluate() is a PURE function: no I/O, no store access, no clock reads —
+    the store re-evaluates it inside the accept transaction.
+
+acceptance:
+  - cargo test -p forge-policy
+  - cargo clippy -p forge-policy --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not add SQLite/store access, file I/O, or process execution to
+      this crate.
+    scope: {paths: [crates/forge-policy/**], operations: [add-dependency, io]}
+    reason: Purity is what allows in-transaction re-evaluation at accept and
+      table-driven unit testing; the store projects EvidenceFacts in.
+    source_evidence: crates/forge-store/src/proposals.rs accept path
+      (evaluate_check_on re-runs evaluate() in-txn).
+  - rule: Do not change the meaning of existing GateVerdict/VerdictDetail
+      variants or CheckOutcome.status strings; extend additively only.
+    scope: {paths: [crates/forge-policy/src/lib.rs], operations: [modify-enum]}
+    reason: Serialized into `check`/`compare` --json under forge.cli.v0;
+      consumers parse these strings.
+    source_evidence: NER-254 (VerdictDetail introduced additive); lib.rs docs
+      "existing variants must not change meaning".
+  - rule: Do not remove #[serde(default)] from require_structured_pass or
+      rename CheckSpec/Gate fields.
+    scope: {paths: [crates/forge-policy/src/lib.rs], operations: [modify-serde]}
+    reason: CheckSpec round-trips as JSON in intents.check_spec_json on
+      upgraded databases; a rename orphans persisted specs.
+    source_evidence: migration 003 (check_spec_json), lib.rs Gate docs.
+  - rule: Do not weaken the identity-equality or latest-matching-wins rules
+      (e.g. fuzzy command matching, "any evidence passes").
+    scope: {paths: [crates/forge-policy/**], operations: [modify-logic]}
+    reason: These ARE the anti-Goodhart property; weakening reopens the
+      `echo ok` bypass.
+    source_evidence: NER-135 R9; tests run_true_cannot_satisfy_a_declared_gate,
+      failing_test_then_echo_ok_does_not_flip_declared_gate_green.
+
+neighbors:
+  - ccx-forge-evidence-capture   # produces the EvidenceFacts (structured counts)
+  # forge-store proposals/accept (consumer) — contract not yet authored;
+  # inspect requests for it are unknowns, not license to read the module.
+
+authority:
+  source: test          # invariants are pinned by the crate's test suite
+  confidence: high
+  reviewer: Jan Skolte (pending — draft authored 2026-07-06 by Claude)
+
+allowed_changes:
+  paths: [crates/forge-policy/**]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**,
+                    crates/forge-evidence/**]
+  public_api_change_policy: contract-update-required

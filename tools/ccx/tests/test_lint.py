@@ -13,7 +13,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 LINT = REPO / "tools" / "ccx" / "ccx-lint.py"
 FIXTURES = REPO / "tools" / "ccx" / "tests" / "fixtures"
-PILOT_CONTRACTS = REPO / "experiments" / "ccx" / "contracts"
+# Frozen pilot contracts, relocated from experiments/ccx/contracts/ when the
+# experiment records were archived to forge-research (2026-07-10).
+PILOT_CONTRACTS = FIXTURES / "pilot" / "contracts"
 
 
 def run_lint(contract, contracts_dir=None, extra=None):

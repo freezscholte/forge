@@ -1,0 +1,55 @@
+schema: ccx.contract.v0
+id: ccx-task-382-1-payload-honesty
+revision: 1
+ticket: NER-382
+task: Qualify workspace_path as a materialization target in payloads/help
+
+interface: |
+  In the JSON payloads of `forge start` and `forge attempt start` (the
+  replay_data/state and the StartAttempt result struct in
+  crates/forge-store/src/attempts.rs), add an ADDITIVE sibling field next
+  to every emitted `workspace_path`:
+
+    "workspace_role": "materialization_target"
+
+  (constant string; enum-ready but only one value today). Update the help
+  text of `attempt start`/`attempt attach` and any docs mentioning
+  `.forge/worktrees/` to state: the workspace dir is materialized state,
+  not an editing surface; the repo root worktree (after `attempt attach`)
+  is where edits belong.
+
+invariants:
+  - Additive only: `workspace_path` keeps its exact key, value, and
+    position semantics; no existing field changes (forge.cli.v0).
+  - The new field appears in BOTH `start` (auto-attach) and
+    `attempt start` payloads, and in the replayed (`--request-id`) result.
+  - `forge schema` output reflects the new field if payload fields are
+    registered there.
+
+acceptance:
+  - cargo test -p forge-cli --test forge_attempts
+  - cargo test -p forge-store
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not implement drift detection or change attach behavior in
+      this task (that is task 382-2).
+    scope: {paths: [crates/forge-store/src/attempts.rs], operations: [modify-logic]}
+    reason: Task isolation for the pilot's defect attribution.
+    source_evidence: experiments/ccx/PILOT.md §2.
+  - rule: Do not rename or remove workspace_path.
+    scope: {paths: [crates/**], operations: [modify-serde]}
+    reason: Envelope is additive-only; consumers parse it.
+    source_evidence: CLAUDE.md conventions.
+
+neighbors:
+  - ccx-task-382-2-drift-guard
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/attempts.rs, crates/forge-cli/src/args.rs,
+          crates/forge-cli/src/commands/**, crates/forge-cli/src/schema.rs,
+          crates/forge-cli/tests/forge_attempts.rs, docs/**]
+  forbidden_paths: [crates/forge-content-native/**, crates/forge-store/migrations/**]
+  public_api_change_policy: contract-update-required

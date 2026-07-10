@@ -1,0 +1,68 @@
+schema: ccx.contract.v0
+id: ccx-task-362-1-provenance-walk
+revision: 1
+ticket: NER-362
+task: Path provenance walk over native history
+
+interface: |
+  New file `crates/forge-content-native/src/provenance.rs` (declared from
+  lib.rs with a one-line `pub mod provenance;` + re-export only):
+
+    pub struct PathProvenanceEntry {
+        pub commit_id: String,          // ObjectId display form (f1:commit:sha256:…)
+        pub change: String,             // "added" | "modified" | "deleted" | "renamed"
+        pub intent_id: Option<String>,
+        pub proposal_revision_id: Option<String>,
+        pub decision_id: Option<String>,
+        pub evidence_digest: Option<String>,   // Hex64 display form
+        pub actor: Option<String>,
+        pub authored_time: Option<i64>,
+    }
+
+    pub fn path_provenance(store: &NativeObjectStore, path: &str)
+        -> anyhow::Result<Vec<PathProvenanceEntry>>
+
+  Semantics: walk commits tip→genesis (read_head → read_commit → first
+  parent), emit one entry per commit whose tree diff AGAINST ITS FIRST
+  PARENT touches `path` (use the existing diff_native_trees / DiffOptions
+  primitives — do not write a new diff). Genesis counts as "added" if the
+  path exists in its tree. Order: tip first. Empty result if the path never
+  existed. Rename detection: report the commit as "renamed" when the diff
+  classifies it so; continue following the OLD name further back.
+
+invariants:
+  - Read-only over the object store; no ledger/SQLite access from this
+    module (ledger enrichment is task 362-4, in forge-store).
+  - Provenance fields are copied verbatim from CommitObject; never
+    synthesized or defaulted to non-None.
+  - Deterministic: same store state + path => byte-identical result.
+  - Multi-parent (merge) commits: diff against FIRST parent only, matching
+    the existing `forge log` walk convention.
+
+acceptance:
+  - cargo test -p forge-content-native provenance
+  - cargo clippy -p forge-content-native --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not add code to crates/forge-content-native/src/lib.rs beyond
+      the module declaration + re-export lines.
+    scope: {paths: [crates/forge-content-native/src/lib.rs], operations: [grow-file]}
+    reason: lib.rs sits on an allowlisted line cap (4730) that may shrink
+      but MUST NOT grow (scripts/check-rust-line-count.sh).
+    source_evidence: NER-381 resolution; check-rust-line-count.sh allowlist.
+  - rule: Do not implement a new tree-diff; use diff_native_trees/DiffOptions.
+    scope: {paths: [crates/forge-content-native/src/provenance.rs], operations: [add-logic]}
+    reason: One diff engine is a correctness invariant (rename detection,
+      mode handling live there); a second drifts.
+    source_evidence: forge-content-native/src/lib.rs:71-110.
+
+neighbors:
+  - ccx-task-362-2-line-attribution
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-content-native/src/provenance.rs,
+          crates/forge-content-native/src/lib.rs]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**]
+  public_api_change_policy: contract-update-required

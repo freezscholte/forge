@@ -1,0 +1,53 @@
+schema: ccx.contract.v0
+id: ccx-task-362-5-tests-docs
+revision: 1
+ticket: NER-362
+task: Blame integration tests + docs
+
+interface: |
+  New integration test file `crates/forge-cli/tests/forge_blame.rs` using
+  the existing assert_cmd + tempfile pattern (mirror forge_attempts.rs):
+
+  Required scenarios (each drives the real binary in a temp native repo):
+    1. init → start → edit file → save → propose → accept → blame shows
+       every line attributed to the accepting commit with its intent_id.
+    2. Second intent modifies SOME lines → blame attributes changed lines
+       to commit 2, unchanged lines still to commit 1.
+    3. blame --json: envelope shape, snake_case fields, additive payload
+       per the 362-3 contract (assert on parsed JSON, not string match).
+    4. blame on a path missing at HEAD → typed error, non-zero exit.
+    5. blame without .forge/forge.db → standard repo-not-found error.
+
+  Docs: add a `forge blame` section to the CLI help/docs where `log` is
+  documented (same location and style).
+
+invariants:
+  - Tests use the compiled binary (assert_cmd), never library shortcuts.
+  - Tests run in temp dirs (tempfile), never in the repo worktree.
+  - No test may weaken or skip existing suites; forge_blame.rs is additive.
+
+acceptance:
+  - cargo test -p forge-cli --test forge_blame
+  - cargo test --workspace
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not modify production code in this task; tests + docs only.
+      If a test exposes a defect in 362-1..4, STOP and surface it as an
+      unknown (it is a finding, not your fix).
+    scope: {paths: [crates/forge-cli/src/**, crates/forge-store/src/**,
+                    crates/forge-content-native/src/**], operations: [modify]}
+    reason: The pilot measures per-task defects; cross-task fixes destroy
+      attribution.
+    source_evidence: experiments/ccx/PILOT.md §4 (defect taxonomy).
+
+neighbors:
+  - ccx-task-362-3-cli-blame
+  - ccx-task-362-4-ledger-enrichment
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-cli/tests/forge_blame.rs, docs/**, README.md]
+  forbidden_paths: [crates/**/src/**]
+  public_api_change_policy: none

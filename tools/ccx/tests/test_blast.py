@@ -14,8 +14,11 @@ SCRIPT = REPO_ROOT / "tools" / "ccx" / "ccx-blast.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FACADE = "crates/forge-store/src/lib.rs"
 
-REPLAY_CONTRACT = REPO_ROOT / "experiments/ccx/contracts/task-382-2-drift-guard.yaml"
-REPLAY_PATCH = REPO_ROOT / "experiments/ccx/runs/A-382-2-r2/patch.diff"
+# Frozen pilot replay fixtures, relocated from experiments/ccx/ when the
+# experiment records were archived to the private forge-research repo
+# (2026-07-10); byte-identical copies of the originals.
+REPLAY_CONTRACT = FIXTURES / "pilot" / "contracts" / "task-382-2-drift-guard.yaml"
+REPLAY_PATCH = FIXTURES / "replay" / "A-382-2-r2-patch.diff"
 
 
 def run_blast(args, stdin_text):

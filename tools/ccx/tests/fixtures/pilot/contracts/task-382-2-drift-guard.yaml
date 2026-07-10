@@ -1,0 +1,87 @@
+schema: ccx.contract.v0
+id: ccx-task-382-2-drift-guard
+revision: 2
+# rev 2 (2026-07-06): resolves blocking unknown from run A-382-2 —
+# diff_working_vs_tree writes a status cache into the scanned root, so
+# "use the existing diff" and "never mutate the workspace dir" contradicted.
+# Resolution: equality check, not diff; read-only comparison required.
+ticket: NER-382
+task: Refuse attach when the target workspace dir has drifted
+
+interface: |
+  In `forge attempt attach` (store-side logic in
+  crates/forge-store/src/attempts.rs + the attach command path):
+
+  Before re-materializing the target attempt's workspace dir, decide
+  whether its current content still equals the recorded
+  `attempt_workspaces.materialized_content_ref`. This is an EQUALITY
+  check, not a diff: read the recorded tree via the existing native-store
+  read primitives and compare workspace file bytes/paths against it
+  (hash or byte comparison per file). Do NOT use `diff_working_vs_tree`
+  here — it writes a status cache into the scanned root, which would
+  violate the read-only invariant below. If content differs:
+
+    - refuse with a NEW typed error `WORKSPACE_DRIFT` (sibling of
+      DIRTY_WORKTREE / ATTEMPT_WORKTREE_MISMATCH in
+      crates/forge-store/src/error.rs), whose details list the drifted
+      paths (secret-risk filtered like other path lists) and whose message
+      names the override flag;
+    - unless the new flag `--discard-workspace-changes` is passed, in
+      which case attach proceeds as today (drifted content is discarded).
+
+  When `materialized_content_ref` is NULL/absent (never materialized),
+  attach proceeds without the check. Error code registered in the error
+  registry / `forge schema` output.
+
+invariants:
+  - Attach without drift behaves byte-identically to today (no new
+    prompts, no output changes beyond the additive schema registration).
+  - The drift check reads the workspace dir only; it never mutates it.
+  - Refusal happens BEFORE any materialization write — a refused attach
+    leaves both the workspace dir and current_state untouched.
+  - The override flag discards workspace-dir drift ONLY; it must not
+    bypass the repo-root DIRTY_WORKTREE or ATTEMPT_WORKTREE_MISMATCH
+    protections.
+  - New error code follows the existing envelope error shape
+    (code/message/details) and is snake_case in details.
+
+acceptance:
+  - cargo test -p forge-store
+  - cargo test -p forge-cli --test forge_attempts
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: No schema/migration changes; materialized_content_ref already
+      exists.
+    scope: {paths: [crates/forge-store/migrations/**], operations: [add-migration]}
+    reason: The substrate is already persisted (record_attempt_workspace_
+      materialized); this task is a guard, not a data model change.
+    source_evidence: crates/forge-store/src/attempts.rs (attempt_workspaces
+      update); NER-382 ticket.
+  - rule: Do not write a new diff ENGINE (hunk/rename machinery); a plain
+      per-file equality comparison (tree read + hash/byte compare) is the
+      required approach. Do not call diff_working_vs_tree on the workspace
+      dir.
+    scope: {paths: [crates/forge-store/**], operations: [add-logic]}
+    reason: diff_working_vs_tree mutates the scanned root (status cache),
+      violating the read-only invariant; equality needs no diff engine.
+    source_evidence: run A-382-2 UNKNOWN (2026-07-06) — contract rev 1
+      contradiction; forge-content-native diff_working_vs_tree side effect.
+  - rule: Do not auto-snapshot drifted content in this task (ticket's
+      optional recovery layer is explicitly deferred).
+    scope: {paths: [crates/forge-store/src/attempts.rs], operations: [add-feature]}
+    reason: Scope pinned by ticket + pilot task isolation.
+    source_evidence: NER-382 "Proposed fix" item 3 (deferred).
+
+neighbors:
+  - ccx-task-382-1-payload-honesty
+  - ccx-task-382-3-tests
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/attempts.rs, crates/forge-store/src/error.rs,
+          crates/forge-cli/src/args.rs, crates/forge-cli/src/commands/**,
+          crates/forge-cli/src/schema.rs]
+  forbidden_paths: [crates/forge-content-native/**, crates/forge-store/migrations/**]
+  public_api_change_policy: contract-update-required

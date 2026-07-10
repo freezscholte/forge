@@ -1,0 +1,423 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index 9dfac52..c7b5789 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -224,6 +224,13 @@ pub(crate) enum AttemptCommand {
+     },
+     Attach {
+         attempt_id: String,
++        /// Proceed even when the attempt's workspace dir (.forge/worktrees/<attempt>)
++        /// has drifted from its recorded materialized content, discarding the drifted
++        /// workspace edits (NER-382). Without this flag such an attach refuses with
++        /// WORKSPACE_DRIFT. Discards workspace-dir drift ONLY — it never bypasses the
++        /// repo-root DIRTY_WORKTREE or ATTEMPT_WORKTREE_MISMATCH protections.
++        #[arg(long)]
++        discard_workspace_changes: bool,
+     },
+     /// Compare competing attempts (per intent) on verified evidence + rank them.
+     Compare(CompareArgs),
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index 1b6568f..9dab360 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -166,7 +166,10 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
+                 ))
+             })
+         }
+-        AttemptCommand::Attach { attempt_id } => {
++        AttemptCommand::Attach {
++            attempt_id,
++            discard_workspace_changes,
++        } => {
+             command_result("attempt attach", request_id, |cwd, request_id| {
+                 // NER-134: worktree/base materialization goes through `ContentBackend`,
+                 // not `forge_content_git::` directly, so git-worktree semantics stay out
+@@ -191,6 +194,16 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
+                     }
+                     .into());
+                 }
++                // NER-382: refuse (WORKSPACE_DRIFT) BEFORE any materialization write when
++                // the target attempt's workspace dir no longer equals its recorded
++                // materialized content — re-materializing below would silently discard
++                // those workspace edits. Checked AFTER the switching-baseline dirty-check
++                // above, and only skipped by the explicit flag, so
++                // --discard-workspace-changes discards workspace-dir drift ONLY and can
++                // never bypass DIRTY_WORKTREE.
++                if !discard_workspace_changes {
++                    forge_store::verify_attempt_workspace_undrifted(&cwd, &attempt_id)?;
++                }
+                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
+                 {
+                     Some(content_ref) => content_ref,
+diff --git a/crates/forge-store/src/attempts.rs b/crates/forge-store/src/attempts.rs
+index 396b5d2..4156e5d 100644
+--- a/crates/forge-store/src/attempts.rs
++++ b/crates/forge-store/src/attempts.rs
+@@ -561,3 +561,230 @@ pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
+         })?
+         .base_head)
+ }
++
++/// NER-382 workspace drift guard: refuse `attempt attach` when the target attempt's
++/// workspace dir no longer holds the content the store recorded materializing into it
++/// (`attempt_workspaces.materialized_content_ref`) — re-materializing would silently
++/// discard those workspace edits. This is an EQUALITY check, not a diff: the recorded
++/// tree is walked via the native store's read primitives and each workspace file is
++/// hash/byte-compared against it. Deliberately NOT `diff_working_vs_tree`, which
++/// writes a status cache into the scanned root — this check reads the workspace dir
++/// only and never mutates it, so a refusal leaves the workspace untouched.
++///
++/// Skipped (Ok) when nothing was ever materialized: a NULL/absent
++/// `materialized_content_ref` (including every git-backend workspace, which never
++/// records one) has no baseline to drift from.
++pub fn verify_attempt_workspace_undrifted(cwd: &Path, attempt_id: &str) -> Result<()> {
++    let context = open_repository(cwd)?;
++    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
++        selector: attempt_id.to_string(),
++    })?;
++    let connection = open_connection(&context.database_path)?;
++    let recorded: Option<String> = connection
++        .query_row(
++            "SELECT materialized_content_ref FROM attempt_workspaces
++             WHERE repo_id = ?1 AND attempt_id = ?2",
++            params![context.repo_id, attempt_id],
++            |row| row.get::<_, Option<String>>(0),
++        )
++        .optional()?
++        .flatten();
++    let Some(recorded) = recorded else {
++        return Ok(());
++    };
++    // Only native `forge-tree:` refs are ever recorded (the git arm of workspace
++    // materialization records nothing); stay permissive on any other family.
++    let Some(tree_id) = recorded.strip_prefix(forge_content::FORGE_TREE_PREFIX) else {
++        return Ok(());
++    };
++    let workspace = context
++        .root_path
++        .join(attempt_workspace_rel_path(&context, attempt_id)?);
++    let drifted = workspace_drift_paths(&context.root_path, &workspace, tree_id)?;
++    if drifted.is_empty() {
++        return Ok(());
++    }
++    Err(ForgeError::WorkspaceDrift { paths: drifted }.into())
++}
++
++/// The tree-entry mode for a symlink (git's `120000`, mirroring the native backend's
++/// symlink representation): the blob holds the link *target* bytes, so equality
++/// compares the target string — the link is never followed.
++const WORKSPACE_SYMLINK_MODE: u32 = 0o120000;
++
++/// Plain per-file equality comparison of a workspace dir against a recorded native
++/// tree. Expected side: the recorded tree walked via `NativeObjectStore::read_object`,
++/// skipping `is_ignored_by_policy` entries exactly like materialization does (those
++/// were never written into the workspace, so they cannot have drifted). Actual side:
++/// a read-only filesystem walk of the workspace dir under the same policy filter
++/// (which also excludes the workspace marker and secret-risk names on both sides).
++/// A path drifts when it is missing, added, of the wrong type, or its bytes hash to
++/// a different blob id. Bytes/paths only — an executable-bit-only change is not
++/// reported (the recorded tree pins content identity, not permissions).
++fn workspace_drift_paths(repo_root: &Path, workspace: &Path, tree_id: &str) -> Result<Vec<String>> {
++    let store = forge_content_native::NativeObjectStore::new(repo_root);
++    let root = forge_content_native::ObjectId::parse(tree_id)?;
++    let mut expected = std::collections::BTreeMap::new();
++    collect_expected_tree_files(&store, &root, "", &mut expected)?;
++    let mut actual = std::collections::BTreeSet::new();
++    if workspace.is_dir() {
++        collect_workspace_paths(workspace, workspace, &mut actual)?;
++    }
++    let mut drifted = std::collections::BTreeSet::new();
++    for path in &actual {
++        if !expected.contains_key(path) {
++            drifted.insert(path.clone());
++        }
++    }
++    for (path, (mode, object)) in &expected {
++        // Short-circuit: a recorded path absent from the walk is a deletion — no
++        // per-file compare needed.
++        let matches = actual.contains(path)
++            && workspace_file_matches_blob(&store, &workspace.join(path), *mode, object)?;
++        if !matches {
++            drifted.insert(path.clone());
++        }
++    }
++    Ok(drifted.into_iter().collect())
++}
++
++/// Recursively collect `rel path -> (mode, blob object id)` for every file entry of a
++/// recorded native tree, via the store's read primitives. The tree payload is the
++/// content-addressed native tree object (`{ schema_version, entries: [{ name, kind,
++/// mode, object }] }`); `read_object` has already verified its hash, so a malformed
++/// shape here is store corruption, surfaced path-free.
++fn collect_expected_tree_files(
++    store: &forge_content_native::NativeObjectStore,
++    tree_id: &forge_content_native::ObjectId,
++    prefix: &str,
++    out: &mut std::collections::BTreeMap<String, (u32, String)>,
++) -> Result<()> {
++    let payload = store.read_object(tree_id)?;
++    let tree: Value = serde_json::from_slice(&payload)?;
++    let entries = tree
++        .get("entries")
++        .and_then(Value::as_array)
++        .ok_or_else(|| anyhow!("malformed native tree object"))?;
++    for entry in entries {
++        let name = entry
++            .get("name")
++            .and_then(Value::as_str)
++            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
++        let kind = entry
++            .get("kind")
++            .and_then(Value::as_str)
++            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
++        let mode = entry
++            .get("mode")
++            .and_then(Value::as_u64)
++            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
++        let object = entry
++            .get("object")
++            .and_then(Value::as_str)
++            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
++        let rel = if prefix.is_empty() {
++            name.to_string()
++        } else {
++            format!("{prefix}/{name}")
++        };
++        if forge_content::is_ignored_by_policy(&rel) {
++            continue;
++        }
++        match kind {
++            "file" => {
++                out.insert(rel, (mode as u32, object.to_string()));
++            }
++            "dir" => collect_expected_tree_files(
++                store,
++                &forge_content_native::ObjectId::parse(object)?,
++                &rel,
++                out,
++            )?,
++            _ => bail!("malformed native tree entry kind"),
++        }
++    }
++    Ok(())
++}
++
++/// Read-only recursive walk of the workspace dir: collects the forward-slash relative
++/// path of every regular file and symlink, skipping `is_ignored_by_policy` paths
++/// (`.forge/`, `.git/`, the workspace marker, restore temps, secret-risk names) and
++/// never descending through symlinked directories. A path that vanishes mid-walk is
++/// skipped as benign (mirrors the native scanner).
++fn collect_workspace_paths(
++    root: &Path,
++    dir: &Path,
++    out: &mut std::collections::BTreeSet<String>,
++) -> Result<()> {
++    let entries =
++        fs::read_dir(dir).map_err(|error| anyhow!("read workspace dir: {}", error.kind()))?;
++    for entry in entries {
++        let entry = entry.map_err(|error| anyhow!("read workspace dir: {}", error.kind()))?;
++        let full = entry.path();
++        let Some(rel) = workspace_rel(root, &full) else {
++            continue;
++        };
++        if forge_content::is_ignored_by_policy(&rel) {
++            continue;
++        }
++        let metadata = match fs::symlink_metadata(&full) {
++            Ok(metadata) => metadata,
++            Err(_) => continue,
++        };
++        if metadata.is_dir() {
++            collect_workspace_paths(root, &full, out)?;
++        } else {
++            out.insert(rel);
++        }
++    }
++    Ok(())
++}
++
++/// Workspace-relative, forward-slash path (only `Normal` components; lossy UTF-8) —
++/// matching the native scanner's path normalization so the two sides key identically.
++fn workspace_rel(root: &Path, full: &Path) -> Option<String> {
++    let rel = full.strip_prefix(root).ok()?;
++    let parts: Vec<String> = rel
++        .components()
++        .filter_map(|component| match component {
++            Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
++            _ => None,
++        })
++        .collect();
++    if parts.is_empty() {
++        return None;
++    }
++    Some(parts.join("/"))
++}
++
++/// Per-file equality against one recorded tree entry. A symlink entry compares the
++/// link target bytes to the recorded blob payload (never following the link); a
++/// regular file hashes its bytes into a blob `ObjectId` and compares ids — no file
++/// content ever leaves this function, and the workspace is only read.
++fn workspace_file_matches_blob(
++    store: &forge_content_native::NativeObjectStore,
++    full: &Path,
++    mode: u32,
++    object: &str,
++) -> Result<bool> {
++    let metadata = match fs::symlink_metadata(full) {
++        Ok(metadata) => metadata,
++        Err(_) => return Ok(false), // vanished since the walk: content differs
++    };
++    if mode == WORKSPACE_SYMLINK_MODE {
++        if !metadata.file_type().is_symlink() {
++            return Ok(false);
++        }
++        let target = fs::read_link(full)
++            .map_err(|error| anyhow!("read workspace symlink: {}", error.kind()))?;
++        let expected = store.read_object(&forge_content_native::ObjectId::parse(object)?)?;
++        return Ok(target.to_string_lossy().as_bytes() == expected.as_slice());
++    }
++    if !metadata.is_file() {
++        return Ok(false); // dir or symlink where a regular file was recorded
++    }
++    let bytes = fs::read(full).map_err(|error| anyhow!("read workspace file: {}", error.kind()))?;
++    let actual =
++        forge_content_native::ObjectId::new(forge_content_native::ObjectKind::Blob, &bytes);
++    Ok(actual.to_string() == object)
++}
+diff --git a/crates/forge-store/src/error.rs b/crates/forge-store/src/error.rs
+index 21f1b5a..ad900df 100644
+--- a/crates/forge-store/src/error.rs
++++ b/crates/forge-store/src/error.rs
+@@ -300,6 +300,16 @@ pub enum ForgeError {
+         principal_id: String,
+         reason: String,
+     },
++    /// `attempt attach` found the target attempt's workspace dir no longer equal to
++    /// its recorded `attempt_workspaces.materialized_content_ref` (NER-382):
++    /// re-materializing would silently discard those workspace edits. `paths` lists
++    /// the drifted workspace-relative paths, secret-risk redacted in
++    /// [`ForgeError::details`] exactly like `DirtyWorktree`. Deterministic — save the
++    /// drifted content elsewhere, or re-run `attempt attach` with
++    /// `--discard-workspace-changes` to explicitly discard it. The override discards
++    /// workspace-dir drift ONLY; it never bypasses `DIRTY_WORKTREE` or
++    /// `ATTEMPT_WORKTREE_MISMATCH`.
++    WorkspaceDrift { paths: Vec<String> },
+ }
+ 
+ impl ForgeError {
+@@ -350,6 +360,7 @@ impl ForgeError {
+             ForgeError::PrivateDecryptAuthorityMissing { .. } => {
+                 "PRIVATE_DECRYPT_AUTHORITY_MISSING"
+             }
++            ForgeError::WorkspaceDrift { .. } => "WORKSPACE_DRIFT",
+         }
+     }
+ 
+@@ -391,7 +402,9 @@ impl ForgeError {
+                     "forge accept"
+                 ]
+             }),
+-            ForgeError::DirtyWorktree { paths } => redact_paths(paths),
++            ForgeError::DirtyWorktree { paths } | ForgeError::WorkspaceDrift { paths } => {
++                redact_paths(paths)
++            }
+             ForgeError::AmbiguousAttempt { candidate_ids }
+             | ForgeError::AmbiguousProposal { candidate_ids } => {
+                 json!({ "candidate_ids": candidate_ids })
+@@ -801,6 +814,10 @@ impl std::fmt::Display for ForgeError {
+                 f,
+                 "principal {principal_id} lacks private decrypt authority: {reason}"
+             ),
++            ForgeError::WorkspaceDrift { .. } => write!(
++                f,
++                "attempt workspace dir has drifted from its recorded materialized content; save the drifted edits elsewhere, or re-run `attempt attach` with --discard-workspace-changes to discard them"
++            ),
+         }
+     }
+ }
+@@ -1096,6 +1113,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
+             after_ms: None,
+             details_keys: &["principal_id", "reason"],
+         },
++        ErrorCodeSpec {
++            code: "WORKSPACE_DRIFT",
++            retryable: false,
++            after_ms: None,
++            details_keys: &["paths", "redacted_count"],
++        },
+     ]
+ }
+ 
+@@ -1650,6 +1673,38 @@ mod tests {
+         assert_eq!(details["redacted_count"], 2);
+     }
+ 
++    /// `WorkspaceDrift` shares `redact_paths` with `DirtyWorktree` (NER-382): the
++    /// drifted-path list is a machine-visible egress, so secret-risk names must be
++    /// replaced with the placeholder while the redaction count stays observable.
++    #[test]
++    fn workspace_drift_details_redact_secret_paths() {
++        let error = ForgeError::WorkspaceDrift {
++            paths: vec![
++                "src/main.rs".into(),
++                ".env".into(),
++                "server/private.pem".into(),
++            ],
++        };
++        assert_eq!(error.code(), "WORKSPACE_DRIFT");
++        let details = error.details();
++        let paths = details["paths"].as_array().expect("paths array");
++        let serialized = Value::Array(paths.clone()).to_string();
++        assert!(serialized.contains("src/main.rs"));
++        assert!(
++            !serialized.contains(".env"),
++            "secret filename must not appear in details"
++        );
++        assert!(
++            !serialized.contains("private.pem"),
++            "secret filename must not appear in details"
++        );
++        assert_eq!(details["redacted_count"], 2);
++        // The human-readable message must name the override flag and never a path.
++        let message = error.to_string();
++        assert!(message.contains("--discard-workspace-changes"));
++        assert!(!message.contains("src/main.rs"));
++    }
++
+     #[test]
+     fn round_trips_through_anyhow() {
+         let error: anyhow::Error = ForgeError::NoSnapshot.into();
+@@ -1803,6 +1858,7 @@ mod tests {
+                 principal_id: "actor_x".into(),
+                 reason: "missing_active_encryption_key".into(),
+             },
++            ForgeError::WorkspaceDrift { paths: vec![] },
+         ];
+ 
+         // Exhaustiveness check: if a variant is added, this match fails to compile
+@@ -1849,7 +1905,8 @@ mod tests {
+                 | ForgeError::OrgAlreadyEnabled { .. }
+                 | ForgeError::OrgAuthorityRequired { .. }
+                 | ForgeError::PrivateContentInvalid { .. }
+-                | ForgeError::PrivateDecryptAuthorityMissing { .. } => {}
++                | ForgeError::PrivateDecryptAuthorityMissing { .. }
++                | ForgeError::WorkspaceDrift { .. } => {}
+             }
+         }
+ 
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 81833ad..0eb9983 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -42,8 +42,9 @@ mod visibility;
+ pub use attempts::{
+     attach_attempt, attempt_base_head, attempt_materialization_ref, attempt_workspace_path,
+     ensure_attempt_workspace_marker, list_attempts, record_attempt_workspace_materialized,
+-    resolve_attempt, show_attempt, start_attempt, start_attempt_for_intent, verify_save_target,
+-    AttemptRecord, AttemptShowRecord, AttemptSummary, ResolvedAttempt, StartAttempt,
++    resolve_attempt, show_attempt, start_attempt, start_attempt_for_intent,
++    verify_attempt_workspace_undrifted, verify_save_target, AttemptRecord, AttemptShowRecord,
++    AttemptSummary, ResolvedAttempt, StartAttempt,
+ };
+ pub(crate) use attempts::{
+     attempt_by_id, resolve_attempt_in_context, verify_worktree_binding, WorkspaceMarker,

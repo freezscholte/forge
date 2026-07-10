@@ -15,7 +15,10 @@ FIXTURES = TESTS_DIR / "fixtures"
 CCX_DIR = TESTS_DIR.parent
 REPO_ROOT = CCX_DIR.parent.parent
 BRIEF_PY = CCX_DIR / "ccx-brief.py"
-PILOT_DIR = REPO_ROOT / "experiments" / "ccx"
+# Frozen pilot record, relocated from experiments/ccx/ when the experiment
+# records were archived to the private forge-research repo (2026-07-10);
+# byte-identical copies (brief.sh resolves contracts/ relative to itself).
+PILOT_DIR = CCX_DIR / "tests" / "fixtures" / "pilot"
 PILOT_CONTRACTS = PILOT_DIR / "contracts"
 
 
@@ -62,7 +65,8 @@ class TestBrief(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             for f in FIXTURES.iterdir():
-                shutil.copy(f, tmpdir / f.name)
+                if f.is_file():  # skip nested fixture dirs (pilot/, replay/)
+                    shutil.copy(f, tmpdir / f.name)
             task = tmpdir / "brief-task.yaml"
             task.write_text(
                 task.read_text().replace(
@@ -91,7 +95,7 @@ class TestBrief(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             for f in FIXTURES.iterdir():
-                if f.name != "_global-policy.yaml":
+                if f.is_file() and f.name != "_global-policy.yaml":
                     shutil.copy(f, tmpdir / f.name)
             res = run_brief(
                 "--contracts-dir", str(tmpdir), str(tmpdir / "brief-task.yaml")

@@ -1,0 +1,96 @@
+# Contract: forge-evidence command capture (crates/forge-evidence)
+# Schema: A4.1 minimal (docs/brainstorms/2026-07-05-context-closed-tasks-v2.md)
+schema: ccx.contract.v0
+id: ccx-forge-evidence-capture
+revision: 1
+module: crates/forge-evidence
+
+interface: |
+  Subprocess capture with bounded, redacted excerpts and a structured parse
+  (src/lib.rs + src/parsers.rs):
+
+    pub fn capture(repo_root: &Path, argv: &[String]) -> Result<CapturedCommand>
+    pub fn capture_with_timeout(repo_root, argv, timeout_ms) -> Result<CapturedCommand>
+    pub const EXCERPT_LIMIT: usize = 4096
+    pub const DEFAULT_TIMEOUT_MS: u64 = 30_000
+
+    pub struct CapturedCommand { command, args, cwd, exit_code,
+        started_at_ms, ended_at_ms, stdout_excerpt, stderr_excerpt,
+        stdout_truncated, stderr_truncated, timed_out, sensitivity,
+        visibility, trust, structured_json: Option<String>,
+        redactions: Vec<RedactionKind> }
+
+    parsers::parse_structured(program, args, stdout, stderr)
+        -> Option<StructuredOutcome>   # {passed, failed} per tool parser
+
+invariants:
+  - Persisted excerpts are at most EXCERPT_LIMIT (4096) bytes, truncated on a
+    UTF-8 char boundary; *_truncated is true whenever raw output exceeded the
+    cap.
+  - Redaction runs over a 4x window (REDACTION_WINDOW) BEFORE truncation, so
+    a secret straddling byte 4096 never persists even a prefix (NER-136 §U4).
+  - The structured parse reads the FULL output tail (up to PARSE_LIMIT =
+    1 MiB), not the excerpt — summary lines sit past the excerpt cap.
+  - sensitivity is "normal" iff zero redactions were applied, else the
+    secret-risk sensitivity; every applied redaction is enumerated in
+    redactions[] so the CLI can emit one warning per redaction.
+  - Local worktree paths (incl. /tmp vs /private/tmp and /var vs
+    /private/var variants) are replaced with [REPO_ROOT] in excerpts.
+  - trust is asserted as "locally_observed" only; higher rungs (signed,
+    hosted-runner, third-party) are granted by the store/attestation flows,
+    never by this crate.
+  - On timeout the child is killed, exit_code reflects the wait, and
+    timed_out is true.
+  - Memory is bounded: no code path reads an unbounded command output into
+    memory (REDACTION_WINDOW for excerpts, tail-seek PARSE_LIMIT for parsing).
+
+acceptance:
+  - cargo test -p forge-evidence
+  - cargo clippy -p forge-evidence --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Never raise EXCERPT_LIMIT, skip redaction, or persist raw
+      (pre-redaction) output anywhere.
+    scope: {paths: [crates/forge-evidence/**], operations: [modify-logic]}
+    reason: Security default — excerpts are stored in the ledger and can be
+      synced/exported; a raw secret in the DB is unrecoverable exposure.
+    source_evidence: CLAUDE.md "Security defaults (do not weaken without
+      asking)"; NER-136 §U4 straddle fix.
+  - rule: Do not compute the excerpt hash over anything but the persisted
+      (redacted + truncated) bytes.
+    scope: {paths: [crates/forge-evidence/**, crates/forge-store/**],
+            operations: [modify-logic]}
+    reason: doctor recomputes verification from persisted bytes; hashing
+      pre-redaction bytes makes every redacted row fail verification.
+    source_evidence: excerpt_file() doc comment, forge-store integrity
+      verification.
+  - rule: Do not have this crate assert any trust rung above
+      locally_observed.
+    scope: {paths: [crates/forge-evidence/**], operations: [modify-logic]}
+    reason: Trust upgrades require signatures/attestations verified by the
+      store; a self-asserted higher rung breaks the trust-policy model.
+    source_evidence: crates/forge-store/src/trust.rs 6-rung ladder.
+  - rule: Do not make parsers guess — parse_structured returns None when no
+      tool-specific parser matches; never fabricate a {passed, failed} count.
+    scope: {paths: [crates/forge-evidence/src/parsers.rs], operations: [modify-logic]}
+    reason: A fabricated zero-failure count silently satisfies structured
+      gates (forge-policy treats Some(0) as pass) — the exact silent-failure
+      class NER-253 fixed.
+    source_evidence: NER-253/254; forge-policy
+      StructuredRequiredButUnparsed verdict detail.
+
+neighbors:
+  - ccx-forge-policy-check-engine   # consumes structured_failures via store projection
+  # forge-store evidence.rs (persists + digests + signs) — contract not yet
+  # authored; inspect requests for it are unknowns.
+
+authority:
+  source: test
+  confidence: high
+  reviewer: Jan Skolte (pending — draft authored 2026-07-06 by Claude)
+
+allowed_changes:
+  paths: [crates/forge-evidence/**]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**,
+                    crates/forge-policy/**, crates/forge-content/**]
+  public_api_change_policy: contract-update-required

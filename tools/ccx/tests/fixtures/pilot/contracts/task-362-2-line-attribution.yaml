@@ -1,0 +1,61 @@
+schema: ccx.contract.v0
+id: ccx-task-362-2-line-attribution
+revision: 1
+ticket: NER-362
+task: Line attribution engine (blame core)
+
+interface: |
+  Extend `crates/forge-content-native/src/provenance.rs`:
+
+    pub struct LineAttribution {
+        pub line_number: usize,          // 1-based, in the HEAD version
+        pub content: String,             // the line text, no trailing newline
+        pub commit_id: String,           // commit that last changed this line
+    }
+
+    pub fn attribute_lines(store: &NativeObjectStore, path: &str)
+        -> anyhow::Result<Vec<LineAttribution>>
+
+  Semantics: for the file at HEAD, attribute every line to the most recent
+  commit (tip→genesis walk, first-parent) in which that line's content was
+  introduced or last changed, computed from blob content diffs between
+  consecutive versions of the path (line-based LCS/Myers over the blob
+  text; a simple line-hash match-up is acceptable — the contract fixes
+  observable behavior, not the algorithm).
+
+invariants:
+  - Result covers EVERY line of the HEAD blob exactly once, in order.
+  - A line unchanged since a commit C is attributed to C, not to later
+    commits that touched other lines of the file.
+  - Binary blobs (non-UTF-8) => typed error (anyhow) with a message
+    containing "binary", not a panic or lossy attribution.
+  - Missing path at HEAD => typed error mentioning the path.
+  - Deterministic for a given store state + path.
+  - Read-only; no ledger access (enrichment is 362-4).
+
+acceptance:
+  - cargo test -p forge-content-native provenance
+  - cargo clippy -p forge-content-native --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not grow crates/forge-content-native/src/lib.rs (module decl +
+      re-export lines only).
+    scope: {paths: [crates/forge-content-native/src/lib.rs], operations: [grow-file]}
+    reason: Allowlisted line cap must not grow.
+    source_evidence: scripts/check-rust-line-count.sh; NER-381.
+  - rule: No new external crate dependencies for the diff/LCS.
+    scope: {paths: [crates/forge-content-native/Cargo.toml], operations: [add-dependency]}
+    reason: Supply-chain surface is a reviewed decision; a hand-rolled
+      line matcher is acceptable and sufficient here.
+    source_evidence: workspace dependency policy (Cargo workspace, minimal deps).
+
+neighbors:
+  - ccx-task-362-1-provenance-walk
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-content-native/src/provenance.rs,
+          crates/forge-content-native/src/lib.rs]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**]
+  public_api_change_policy: contract-update-required

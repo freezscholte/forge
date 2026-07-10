@@ -1,0 +1,65 @@
+schema: ccx.contract.v0
+id: ccx-task-362-3-cli-blame
+revision: 1
+ticket: NER-362
+task: forge blame CLI command + JSON envelope
+
+interface: |
+  New subcommand `forge blame <path>` wired through the existing clap
+  dispatch (args.rs + a new commands module or the matching commands file;
+  follow the existing command-module pattern, e.g. how `log` is wired):
+
+    forge blame <path> [--json]
+
+  Human output: one row per line: `<short-commit> <intent-or-"-"> <line#> <content>`.
+  JSON output: standard forge.cli.v0 envelope; data payload:
+
+    { "path": "<path>",
+      "lines": [ { "line_number": n, "content": "...",
+                   "commit_id": "...", "intent_id": null|"...",
+                   "proposal_revision_id": null|"...",
+                   "decision_id": null|"...", "actor": null|"...",
+                   "authored_time": null|ms } ] }
+
+  Implementation composes 362-1 + 362-2 outputs (join per line via
+  commit_id). No ledger enrichment yet (362-4 adds it): provenance fields
+  here come straight from the CommitObject via the provenance module.
+
+invariants:
+  - JSON is serde snake_case inside the standard envelope
+    (schema_version "forge.cli.v0"); the new payload is additive — no
+    existing command's output changes.
+  - Requires an initialized repo; missing .forge/forge.db => the standard
+    repository-not-found error, same as other repo commands.
+  - Errors from the provenance module surface as typed envelope errors,
+    not panics; exit code non-zero on error, zero on success.
+  - `forge schema` gains the new command entry (the command registry stays
+    complete).
+
+acceptance:
+  - cargo test -p forge-cli blame
+  - cargo clippy -p forge-cli --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not add logic to crates/forge-cli/src/main.rs beyond dispatch
+      wiring (facade rule).
+    scope: {paths: [crates/forge-cli/src/main.rs], operations: [grow-file]}
+    reason: main.rs is a facade per ADR-0001; new behavior lands in
+      command modules.
+    source_evidence: docs/adr/0001-domain-modules.md; CLAUDE.md domain rule.
+  - rule: Do not change any existing envelope field or error code.
+    scope: {paths: [crates/forge-cli/**], operations: [modify-serde]}
+    reason: forge.cli.v0 is additive-only.
+    source_evidence: CLAUDE.md conventions; forge-protocol crate.
+
+neighbors:
+  - ccx-task-362-1-provenance-walk
+  - ccx-task-362-2-line-attribution
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-cli/src/args.rs, crates/forge-cli/src/main.rs,
+          crates/forge-cli/src/commands/**, crates/forge-cli/src/schema.rs]
+  forbidden_paths: [crates/forge-store/**, crates/forge-content-native/**]
+  public_api_change_policy: contract-update-required

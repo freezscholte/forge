@@ -1,0 +1,49 @@
+schema: ccx.contract.v0
+id: ccx-task-382-3-tests
+revision: 1
+ticket: NER-382
+task: Integration tests for workspace drift guard
+
+interface: |
+  Extend `crates/forge-cli/tests/forge_attempts.rs` (assert_cmd +
+  tempfile, real binary, temp native repos) with:
+
+    1. The original silent-loss repro (edit inside
+       .forge/worktrees/<attempt2>/ before attach) now fails loudly:
+       attach exits non-zero with error code WORKSPACE_DRIFT and the
+       drifted path listed in details.
+    2. attach --discard-workspace-changes on the same state succeeds and
+       the drifted edit is gone (documented discard).
+    3. attach with NO drift behaves as before (success, no new warnings).
+    4. attach on a never-materialized workspace proceeds without the
+       check.
+    5. start/attempt start payloads carry workspace_role =
+       "materialization_target" (JSON-parsed assertion).
+
+invariants:
+  - Tests drive the compiled binary only; temp dirs only.
+  - Assertions on JSON parse the envelope; no brittle full-string matches.
+  - Additive: existing tests in the file are not modified or weakened.
+
+acceptance:
+  - cargo test -p forge-cli --test forge_attempts
+  - cargo test --workspace
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not modify production code; if a scenario cannot pass because
+      382-1/382-2 shipped a defect, STOP and surface the unknown.
+    scope: {paths: [crates/**/src/**], operations: [modify]}
+    reason: Per-task defect attribution (pilot measurement).
+    source_evidence: experiments/ccx/PILOT.md §4.
+
+neighbors:
+  - ccx-task-382-1-payload-honesty
+  - ccx-task-382-2-drift-guard
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-cli/tests/forge_attempts.rs]
+  forbidden_paths: [crates/**/src/**]
+  public_api_change_policy: none

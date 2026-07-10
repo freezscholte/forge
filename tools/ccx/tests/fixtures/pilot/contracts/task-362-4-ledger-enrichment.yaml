@@ -1,0 +1,64 @@
+schema: ccx.contract.v0
+id: ccx-task-362-4-ledger-enrichment
+revision: 1
+ticket: NER-362
+task: Ledger enrichment for blame output
+
+interface: |
+  New module `crates/forge-store/src/provenance.rs` (declared from the
+  forge-store facade lib.rs with module decl + re-export only):
+
+    pub struct ProvenanceDetail {
+        pub intent_id: String,
+        pub intent_title: Option<String>,     // intents row, if present
+        pub decision_id: Option<String>,
+        pub decision_status: Option<String>,  // "accepted" | "rejected"
+        pub check_status: Option<String>,     // latest check_results.status
+                                              // for the proposal revision
+    }
+
+    pub fn provenance_detail(cwd: &Path, intent_id: &str,
+                             proposal_revision_id: Option<&str>,
+                             decision_id: Option<&str>)
+        -> anyhow::Result<ProvenanceDetail>
+
+  And: `forge blame --json` payload lines gain OPTIONAL (additive) fields
+  `intent_title`, `decision_status`, `check_status`, populated by calling
+  this per distinct (intent, revision, decision) tuple (deduplicate — do
+  not query per line). Human output gains intent title when available.
+
+invariants:
+  - Read-only SQLite access via the existing open_repository/connection
+    helpers; no schema changes, no migrations.
+  - Unknown/missing ids degrade to None fields, never an error — blame on
+    history that predates some ledger rows must still render.
+  - Query count is O(distinct commits in the blame), not O(lines).
+  - New JSON fields are additive under forge.cli.v0.
+
+acceptance:
+  - cargo test -p forge-store provenance
+  - cargo test -p forge-cli blame
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: No new tables, columns, or migrations.
+    scope: {paths: [crates/forge-store/migrations/**], operations: [add-migration]}
+    reason: Enrichment is a read model over existing rows; schema changes
+      need their own reviewed slice.
+    source_evidence: migrations discipline (numbered, checksummed).
+  - rule: Do not grow the forge-store facade lib.rs beyond decl+re-export.
+    scope: {paths: [crates/forge-store/src/lib.rs], operations: [grow-file]}
+    reason: Facade rule, ADR-0001.
+    source_evidence: docs/adr/0001-domain-modules.md.
+
+neighbors:
+  - ccx-task-362-3-cli-blame
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/provenance.rs, crates/forge-store/src/lib.rs,
+          crates/forge-cli/src/commands/**, crates/forge-cli/src/args.rs]
+  forbidden_paths: [crates/forge-store/migrations/**,
+                    crates/forge-content-native/**]
+  public_api_change_policy: contract-update-required
