@@ -373,6 +373,13 @@ pub struct ContractRunTaskRecord {
     pub patch_content_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_exit_code: Option<i64>,
+    /// Redacted excerpt of the agent subprocess stdout (R7/R16). `None` when no
+    /// agent ran (a resumed or skipped task) or the stream was empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stdout_excerpt: Option<String>,
+    /// Redacted excerpt of the agent subprocess stderr (R7/R16).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stderr_excerpt: Option<String>,
 }
 
 /// One dependency-ordered chain run against a frozen contract revision (R7).
@@ -417,6 +424,10 @@ pub struct ContractRunTaskInput {
     pub outcome: String,
     pub patch_content_ref: Option<String>,
     pub agent_exit_code: Option<i64>,
+    /// Already-redacted agent stdout/stderr excerpts (the CLI runs the redaction
+    /// pass at capture time, KTD3 redact-before-sign). Folded into the run digest.
+    pub agent_stdout_excerpt: Option<String>,
+    pub agent_stderr_excerpt: Option<String>,
 }
 
 /// The machine-readable `outcome` discriminator carried in a `contract run`
@@ -513,7 +524,9 @@ fn contract_run_digest(input: &RecordContractRunInput, created_at_ms: i64) -> St
             .i64(task.task_index)
             .str(&task.outcome)
             .opt_str(task.patch_content_ref.as_deref())
-            .opt_i64(task.agent_exit_code);
+            .opt_i64(task.agent_exit_code)
+            .opt_str(task.agent_stdout_excerpt.as_deref())
+            .opt_str(task.agent_stderr_excerpt.as_deref());
     }
     digest.finish()
 }
@@ -584,8 +597,9 @@ pub fn record_contract_run(
             tx.execute(
                 "INSERT INTO contract_run_tasks (
                     id, repo_id, run_id, task_id, task_index, outcome, patch_content_ref,
-                    agent_exit_code, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                    agent_exit_code, agent_stdout_excerpt, agent_stderr_excerpt,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     task_row_id,
                     context.repo_id,
@@ -595,6 +609,8 @@ pub fn record_contract_run(
                     task.outcome,
                     task.patch_content_ref,
                     task.agent_exit_code,
+                    task.agent_stdout_excerpt,
+                    task.agent_stderr_excerpt,
                     now,
                 ],
             )?;
@@ -604,6 +620,8 @@ pub fn record_contract_run(
                 outcome: task.outcome.clone(),
                 patch_content_ref: task.patch_content_ref.clone(),
                 agent_exit_code: task.agent_exit_code,
+                agent_stdout_excerpt: task.agent_stdout_excerpt.clone(),
+                agent_stderr_excerpt: task.agent_stderr_excerpt.clone(),
             });
         }
         signer.sign_subject(
@@ -681,7 +699,8 @@ pub fn contract_run(cwd: &Path, run_id: &str) -> Result<Option<ContractRunRecord
         .optional()?;
     let Some(run) = run else { return Ok(None) };
     let mut statement = connection.prepare(
-        "SELECT task_id, task_index, outcome, patch_content_ref, agent_exit_code
+        "SELECT task_id, task_index, outcome, patch_content_ref, agent_exit_code,
+                agent_stdout_excerpt, agent_stderr_excerpt
          FROM contract_run_tasks
          WHERE run_id = ?1
          ORDER BY task_index",
@@ -694,6 +713,8 @@ pub fn contract_run(cwd: &Path, run_id: &str) -> Result<Option<ContractRunRecord
                 outcome: row.get(2)?,
                 patch_content_ref: row.get(3)?,
                 agent_exit_code: row.get(4)?,
+                agent_stdout_excerpt: row.get(5)?,
+                agent_stderr_excerpt: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1740,6 +1761,8 @@ mod tests {
                     outcome: "stopped".to_string(),
                     patch_content_ref: None,
                     agent_exit_code: Some(0),
+                    agent_stdout_excerpt: Some("hello from the agent".to_string()),
+                    agent_stderr_excerpt: Some("password=[REDACTED]".to_string()),
                 },
                 ContractRunTaskInput {
                     task_id: "t2".to_string(),
@@ -1747,6 +1770,8 @@ mod tests {
                     outcome: "skipped".to_string(),
                     patch_content_ref: None,
                     agent_exit_code: None,
+                    agent_stdout_excerpt: None,
+                    agent_stderr_excerpt: None,
                 },
             ],
         };
@@ -1761,8 +1786,18 @@ mod tests {
         assert_eq!(read.tasks.len(), 2);
         assert_eq!(read.tasks[0].task_id, "t1");
         assert_eq!(read.tasks[0].outcome, "stopped");
+        // The captured agent excerpts round-trip on the per-task row (R7/R16).
+        assert_eq!(
+            read.tasks[0].agent_stdout_excerpt.as_deref(),
+            Some("hello from the agent")
+        );
+        assert_eq!(
+            read.tasks[0].agent_stderr_excerpt.as_deref(),
+            Some("password=[REDACTED]")
+        );
         assert_eq!(read.tasks[1].task_id, "t2");
         assert_eq!(read.tasks[1].outcome, "skipped");
+        assert_eq!(read.tasks[1].agent_stdout_excerpt, None);
     }
 
     #[test]

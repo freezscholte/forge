@@ -1587,18 +1587,33 @@ fn assemble_prompt(brief: &str) -> String {
     format!("{brief}{CONTRACT_TASK_INSTRUCTION}")
 }
 
+/// The captured, redacted outcome of one opaque agent subprocess (R7/R16).
+struct AgentOutcome {
+    exit_code: i32,
+    /// Redacted, EXCERPT_LIMIT-capped agent stdout — `None` when the stream was
+    /// empty. Redacted BEFORE it is stored, hashed, and signed (KTD3).
+    stdout_excerpt: Option<String>,
+    stderr_excerpt: Option<String>,
+}
+
 /// Execute the opaque agent command once via `sh -c` in `workspace`, feeding the
-/// prompt on stdin and capturing only the exit status (R7). No retries or
-/// supervision. Agent stdout/stderr is discarded in v1 (the run's captured
-/// artifact is the produced patch, not the agent's chatter).
-fn run_agent(agent_cmd: &str, workspace: &Path, prompt: &str) -> Result<i32> {
+/// prompt on stdin (R7). Stdout/stderr are captured to files (so a chatty agent
+/// cannot deadlock against the stdin pipe), then redacted through the shared
+/// evidence pass and capped at `EXCERPT_LIMIT` before they are returned for storage
+/// on the per-task run row (R16 defense-in-depth). No retries or supervision.
+fn run_agent(agent_cmd: &str, workspace: &Path, prompt: &str) -> Result<AgentOutcome> {
+    let capture = tempfile::tempdir().context("create agent capture dir")?;
+    let stdout_path = capture.path().join("stdout");
+    let stderr_path = capture.path().join("stderr");
+    let stdout_file = std::fs::File::create(&stdout_path).context("create agent stdout capture")?;
+    let stderr_file = std::fs::File::create(&stderr_path).context("create agent stderr capture")?;
     let mut child = ProcessCommand::new("sh")
         .arg("-c")
         .arg(agent_cmd)
         .current_dir(workspace)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .with_context(|| format!("cannot spawn agent command via sh -c: {agent_cmd:?}"))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -1607,7 +1622,45 @@ fn run_agent(agent_cmd: &str, workspace: &Path, prompt: &str) -> Result<i32> {
         // `stdin` drops here, closing the pipe so a reader sees EOF before wait().
     }
     let status = child.wait().context("agent subprocess wait failed")?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(AgentOutcome {
+        exit_code: status.code().unwrap_or(-1),
+        stdout_excerpt: redacted_excerpt(&stdout_path)?,
+        stderr_excerpt: redacted_excerpt(&stderr_path)?,
+    })
+}
+
+/// Read a capture file, redact it through the shared `redact_evidence_excerpt`
+/// pass, and cap it at `EXCERPT_LIMIT` bytes — the same redact-then-truncate
+/// ordering the evidence pipeline uses so a secret straddling the cap is removed
+/// before its prefix is persisted. Returns `None` for an empty stream.
+fn redacted_excerpt(path: &Path) -> Result<Option<String>> {
+    // Read a bounded window (4x the cap) so a secret near the boundary is redacted
+    // before truncation, without loading an unbounded stream into memory.
+    let window = forge_evidence::EXCERPT_LIMIT * 4;
+    let mut file = std::fs::File::open(path).context("open agent capture")?;
+    let mut bytes = vec![0u8; window + 1];
+    let read = std::io::Read::read(&mut file, &mut bytes)?;
+    bytes.truncate(read.min(window));
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let (redacted, _kinds) =
+        forge_content::redact_evidence_excerpt(&String::from_utf8_lossy(&bytes));
+    let capped = truncate_to_char_boundary(&redacted, forge_evidence::EXCERPT_LIMIT);
+    Ok((!capped.is_empty()).then(|| capped.to_string()))
+}
+
+/// Truncate `text` to at most `limit` bytes on a UTF-8 char boundary (never split
+/// a multi-byte scalar), mirroring the evidence excerpt cap.
+fn truncate_to_char_boundary(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The four required stop fields (R8). A best-effort labelled parse: `What:`,
@@ -1658,6 +1711,51 @@ fn parse_unknown_fields(
     (what, why, kind, evidence, malformed)
 }
 
+/// One per-task row accumulated during a run, including the redacted agent
+/// stdout/stderr excerpts (R7/R16). Agentless rows (a resumed replay or a skipped
+/// dependent) carry `None` for the agent fields.
+struct TaskState {
+    task_id: String,
+    outcome: String,
+    patch_content_ref: Option<String>,
+    agent_exit_code: Option<i64>,
+    agent_stdout_excerpt: Option<String>,
+    agent_stderr_excerpt: Option<String>,
+}
+
+impl TaskState {
+    /// A task recorded without running an agent this run (resumed replay or a
+    /// skipped dependent): no exit code, no captured output.
+    fn agentless(task_id: String, outcome: &str, patch: Option<String>) -> Self {
+        Self {
+            task_id,
+            outcome: outcome.to_string(),
+            patch_content_ref: patch,
+            agent_exit_code: None,
+            agent_stdout_excerpt: None,
+            agent_stderr_excerpt: None,
+        }
+    }
+
+    /// A task whose agent ran: capture its exit code and redacted stdout/stderr
+    /// excerpts on the row (R7/R16).
+    fn from_agent(
+        task_id: String,
+        outcome: &str,
+        patch: Option<String>,
+        agent: &AgentOutcome,
+    ) -> Self {
+        Self {
+            task_id,
+            outcome: outcome.to_string(),
+            patch_content_ref: patch,
+            agent_exit_code: Some(i64::from(agent.exit_code)),
+            agent_stdout_excerpt: agent.stdout_excerpt.clone(),
+            agent_stderr_excerpt: agent.stderr_excerpt.clone(),
+        }
+    }
+}
+
 /// Build the run-record input, folding the per-task completion states plus the
 /// integrate-time reconstruction context (baseline ref, base commit, ack map) into
 /// `dependency_stack_json` (R7/KTD8/KTD9).
@@ -1671,7 +1769,7 @@ fn build_run_input(
     exit_code: i64,
     agent_exit: Option<i64>,
     patch_ref: Option<String>,
-    task_states: &[(String, String, Option<String>, Option<i64>)],
+    task_states: &[TaskState],
 ) -> RecordContractRunInput {
     let dependency_stack_json = json!({
         "baseline_ref": baseline_ref,
@@ -1691,28 +1789,24 @@ fn build_run_input(
         tasks: task_states
             .iter()
             .enumerate()
-            .map(
-                |(index, (task_id, outcome, patch, agent))| ContractRunTaskInput {
-                    task_id: task_id.clone(),
-                    task_index: index as i64,
-                    outcome: outcome.clone(),
-                    patch_content_ref: patch.clone(),
-                    agent_exit_code: *agent,
-                },
-            )
+            .map(|(index, state)| ContractRunTaskInput {
+                task_id: state.task_id.clone(),
+                task_index: index as i64,
+                outcome: state.outcome.clone(),
+                patch_content_ref: state.patch_content_ref.clone(),
+                agent_exit_code: state.agent_exit_code,
+                agent_stdout_excerpt: state.agent_stdout_excerpt.clone(),
+                agent_stderr_excerpt: state.agent_stderr_excerpt.clone(),
+            })
             .collect(),
     }
 }
 
 /// Append `skipped` task rows for every plan task after `stopped_index` (dependents
 /// do not execute past a halt or failure, R8/R11).
-fn fill_skipped(
-    task_states: &mut Vec<(String, String, Option<String>, Option<i64>)>,
-    plan: &[PlannedTask],
-    stopped_index: usize,
-) {
+fn fill_skipped(task_states: &mut Vec<TaskState>, plan: &[PlannedTask], stopped_index: usize) {
     for task in &plan[stopped_index + 1..] {
-        task_states.push((task.task_id(), "skipped".to_string(), None, None));
+        task_states.push(TaskState::agentless(task.task_id(), "skipped", None));
     }
 }
 
@@ -1795,19 +1889,18 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
         }
 
         let mut completed_outputs: BTreeMap<String, String> = BTreeMap::new();
-        let mut task_states: Vec<(String, String, Option<String>, Option<i64>)> = Vec::new();
+        let mut task_states: Vec<TaskState> = Vec::new();
         let mut final_baseline: Option<String> = None;
 
         for (index, task) in plan.iter().enumerate() {
             // KTD9 resume: a task the prior run completed is replayed from its
-            // recorded output — no agent session.
+            // recorded output — no agent session, so no captured output.
             if let Some(prev) = resume_outputs.get(&task.task_id()) {
                 completed_outputs.insert(task.contract_id.clone(), prev.clone());
-                task_states.push((
+                task_states.push(TaskState::agentless(
                     task.task_id(),
-                    "completed".to_string(),
+                    "completed",
                     Some(prev.clone()),
-                    None,
                 ));
                 continue;
             }
@@ -1839,18 +1932,18 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
 
             let brief = forge_store::contract_brief(&cwd, &task.contract_id, Some(task.revision))?;
             let prompt = assemble_prompt(&brief.brief);
-            let agent_exit = run_agent(&args.agent_cmd, scratch.path(), &prompt)?;
+            let agent = run_agent(&args.agent_cmd, scratch.path(), &prompt)?;
 
             // Halt-on-unknown (R8): fail-closed ingest into a signed stop, halt, exit 2.
             if scratch.path().join(UNKNOWN_FILE).exists() {
                 let raw =
                     std::fs::read_to_string(scratch.path().join(UNKNOWN_FILE)).unwrap_or_default();
                 let (what, why, kind, evidence, malformed) = parse_unknown_fields(&raw);
-                task_states.push((
+                task_states.push(TaskState::from_agent(
                     task.task_id(),
-                    "stopped".to_string(),
+                    "stopped",
                     None,
-                    Some(i64::from(agent_exit)),
+                    &agent,
                 ));
                 fill_skipped(&mut task_states, &plan, index);
                 let run = forge_store::record_contract_run(
@@ -1863,7 +1956,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         &ack,
                         "stopped",
                         2,
-                        Some(i64::from(agent_exit)),
+                        Some(i64::from(agent.exit_code)),
                         None,
                         &task_states,
                     ),
@@ -1900,12 +1993,12 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             }
 
             // Crashed/unauthenticated agent (R11/AE5): nonzero exit, no UNKNOWN.md.
-            if agent_exit != 0 {
-                task_states.push((
+            if agent.exit_code != 0 {
+                task_states.push(TaskState::from_agent(
                     task.task_id(),
-                    "failed".to_string(),
+                    "failed",
                     None,
-                    Some(i64::from(agent_exit)),
+                    &agent,
                 ));
                 fill_skipped(&mut task_states, &plan, index);
                 let run = forge_store::record_contract_run(
@@ -1918,7 +2011,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         &ack,
                         "failed",
                         1,
-                        Some(i64::from(agent_exit)),
+                        Some(i64::from(agent.exit_code)),
                         None,
                         &task_states,
                     ),
@@ -1928,7 +2021,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                     "exit_code": 1,
                     "run_id": run.run_id,
                     "reason": "agent exited nonzero without filing UNKNOWN.md",
-                    "agent_exit_code": agent_exit,
+                    "agent_exit_code": agent.exit_code,
                 });
                 return Ok((Some(run.run_id), data, Vec::new()));
             }
@@ -1940,7 +2033,12 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             let diff = diff_native_content_refs(&store, &baseline, &post, &DiffOptions::default())?;
             if diff.files.is_empty() {
                 // Empty patch never passes as success (R11/AE8): failed, exit 1.
-                task_states.push((task.task_id(), "failed".to_string(), None, Some(0)));
+                task_states.push(TaskState::from_agent(
+                    task.task_id(),
+                    "failed",
+                    None,
+                    &agent,
+                ));
                 fill_skipped(&mut task_states, &plan, index);
                 let run = forge_store::record_contract_run(
                     &cwd,
@@ -1952,7 +2050,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         &ack,
                         "failed",
                         1,
-                        Some(0),
+                        Some(i64::from(agent.exit_code)),
                         None,
                         &task_states,
                     ),
@@ -1975,7 +2073,12 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
 
             completed_outputs.insert(task.contract_id.clone(), post.clone());
             final_baseline = Some(baseline);
-            task_states.push((task.task_id(), "completed".to_string(), Some(post), Some(0)));
+            task_states.push(TaskState::from_agent(
+                task.task_id(),
+                "completed",
+                Some(post),
+                &agent,
+            ));
         }
 
         // Every task completed (exit 0). The run's patch is the target task's produced

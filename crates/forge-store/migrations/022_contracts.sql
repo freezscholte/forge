@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS contract_run_tasks (
     ),
     patch_content_ref TEXT,
     agent_exit_code INTEGER,
+    -- Redacted excerpts of the agent subprocess stdout/stderr (R7 exit metadata,
+    -- R16 defense-in-depth). Captured through the forge-evidence redact pass and
+    -- EXCERPT_LIMIT cap before storage, then folded into the run content hash and
+    -- signature. NULL when no agent ran for this task (a resumed or skipped task).
+    agent_stdout_excerpt TEXT,
+    agent_stderr_excerpt TEXT,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     UNIQUE (run_id, task_id)

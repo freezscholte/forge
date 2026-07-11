@@ -509,10 +509,16 @@ pub(crate) struct ContractRunArgs {
     /// Each out-of-chain `depends_on` id must be named exactly once (R20).
     #[arg(long = "dep")]
     pub(crate) dep: Vec<String>,
-    /// Resume a halted run from its halted task instead of starting fresh (KTD9).
+    /// Resume a prior halted run (by run id or a completed task id) from its halted
+    /// task, replaying the recorded completed-task outputs instead of re-executing
+    /// their agents (KTD9). Resume is always explicit: WITHOUT this flag every run
+    /// is a fresh full-chain run, even when a resumable halted run exists
+    /// (least-surprise default). Refuses with CONTRACT_NOT_INTEGRABLE when the
+    /// recorded state no longer applies (base moved, patch object gone).
     #[arg(long)]
     pub(crate) resume: Option<String>,
-    /// Force a fresh full-chain run even when a halted run could be resumed.
+    /// Force a fresh full-chain run, ignoring `--resume` if both are given.
+    /// Redundant on its own (fresh is already the default without `--resume`).
     #[arg(long)]
     pub(crate) fresh: bool,
 }

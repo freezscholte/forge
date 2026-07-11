@@ -1008,6 +1008,308 @@ fn contract_integrate_before_deps_accepted_is_refused() {
 }
 
 #[test]
+fn contract_run_resume_replays_completed_tasks_without_reexecuting() {
+    // KTD9: after a halted chain (task 1 completed, task 2 failed), a rerun with
+    // --resume restarts at the halted task against the recorded completed-task
+    // output — task 1's agent is NOT re-executed (canary), and the chain completes.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    // Phase 1: an agent that succeeds for ccx-a but crashes for ccx-b. The prompt
+    // arrives on stdin; grep discriminates the task by its contract id.
+    write(
+        &repo,
+        "fail-b.sh",
+        "#!/bin/sh\nif grep -q 'id: ccx-b' >/dev/null 2>&1; then exit 3; fi\necho change >> out.txt\n",
+    );
+    let fail_b = format!("sh {}", repo.path().join("fail-b.sh").display());
+    let halted = contract_run(&repo, &["ccx-a", "ccx-b"], &fail_b, 1);
+    assert_eq!(halted["data"]["outcome"], "failed");
+    let halted_run_id = halted["data"]["run_id"].as_str().unwrap().to_string();
+
+    // Phase 2: resume. The agent touches a canary if it ever sees ccx-a's brief.
+    let canary = repo.path().join("resume-canary");
+    write(
+        &repo,
+        "resume-agent.sh",
+        &format!(
+            "#!/bin/sh\nprompt=$(cat)\ncase \"$prompt\" in *'id: ccx-a'*) touch {} ;; esac\necho more >> out.txt\n",
+            canary.display()
+        ),
+    );
+    let resume_agent = format!("sh {}", repo.path().join("resume-agent.sh").display());
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                &resume_agent,
+                "--resume",
+                &halted_run_id,
+            ])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["outcome"], "completed");
+    assert!(
+        !canary.exists(),
+        "resume must not re-execute the completed task's agent"
+    );
+
+    // The resumed run's per-task rows: ccx-a replayed as completed, ccx-b completed.
+    let run_id = env["data"]["run_id"].as_str().unwrap();
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT task_id, outcome FROM contract_run_tasks WHERE run_id = ?1 ORDER BY task_index",
+        )
+        .unwrap();
+    let tasks: Vec<(String, String)> = stmt
+        .query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        tasks,
+        vec![
+            ("ccx-a".to_string(), "completed".to_string()),
+            ("ccx-b".to_string(), "completed".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn contract_run_resume_after_triage_resumes_from_stopped_task() {
+    // KTD9 (resume-after-triage): a chain halted by a STOP on task 2 resumes from
+    // that task once the stop is resolved — task 1 is replayed from its recorded
+    // output (canary proves its agent is NOT re-executed) and the chain completes.
+    // Leg 3 stays intact: before the stop is resolved, --resume is still refused.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    // Phase 1: ccx-a completes; ccx-b files a well-formed stop.
+    write(
+        &repo,
+        "stop-b.sh",
+        "#!/bin/sh\nprompt=$(cat)\ncase \"$prompt\" in *'id: ccx-b'*)\nprintf 'What: need the shape\\nWhy: brief omits it\\nKind: blocking\\nEvidence: src/lib.rs:1\\n' > UNKNOWN.md\nexit 0 ;;\nesac\necho change >> out.txt\n",
+    );
+    let stop_b = format!("sh {}", repo.path().join("stop-b.sh").display());
+    let halted = contract_run(&repo, &["ccx-a", "ccx-b"], &stop_b, 2);
+    assert_eq!(halted["data"]["outcome"], "stopped");
+    let halted_run_id = halted["data"]["run_id"].as_str().unwrap().to_string();
+    let stop_id = halted["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // Leg 3 unchanged: resuming while the stop is open is refused, no agent runs.
+    let refused = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                EDIT_AGENT,
+                "--resume",
+                &halted_run_id,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&refused), "CONTRACT_OPEN_STOP");
+
+    // Triage: resolve the stop. U8 ships the resolve subcommand; until then this
+    // direct state flip is the test's stand-in for a recorded triage resolution.
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    conn.execute(
+        "UPDATE contract_stops SET state = 'resolved', resolution_kind = 'rejection',
+                resolution_rationale = 'test triage stand-in' WHERE id = ?1",
+        [&stop_id],
+    )
+    .expect("resolve stop (U8 stand-in)");
+
+    // Phase 2: resume. ccx-a is replayed (canary must stay silent); ccx-b runs.
+    let canary = repo.path().join("triage-resume-canary");
+    write(
+        &repo,
+        "resume-b.sh",
+        &format!(
+            "#!/bin/sh\nprompt=$(cat)\ncase \"$prompt\" in *'id: ccx-a'*) touch {} ;; esac\necho more >> out.txt\n",
+            canary.display()
+        ),
+    );
+    let resume_agent = format!("sh {}", repo.path().join("resume-b.sh").display());
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                &resume_agent,
+                "--resume",
+                &halted_run_id,
+            ])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["outcome"], "completed");
+    assert!(
+        !canary.exists(),
+        "resume-after-triage must not re-execute the completed task's agent"
+    );
+}
+
+#[test]
+fn contract_run_fresh_forces_full_reexecution() {
+    // KTD9: `--fresh` forces a full re-run even when `--resume` names a resumable
+    // halted run — the completed task's agent DOES execute again (canary fires).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    // Phase 1: halt the chain at ccx-b (agent crashes on ccx-b's brief).
+    write(
+        &repo,
+        "fail-b.sh",
+        "#!/bin/sh\nif grep -q 'id: ccx-b' >/dev/null 2>&1; then exit 3; fi\necho change >> out.txt\n",
+    );
+    let fail_b = format!("sh {}", repo.path().join("fail-b.sh").display());
+    let halted = contract_run(&repo, &["ccx-a", "ccx-b"], &fail_b, 1);
+    let halted_run_id = halted["data"]["run_id"].as_str().unwrap().to_string();
+
+    // Phase 2: --fresh + --resume. The canary proves ccx-a's agent re-executed.
+    let canary = repo.path().join("fresh-canary");
+    write(
+        &repo,
+        "fresh-agent.sh",
+        &format!(
+            "#!/bin/sh\nprompt=$(cat)\ncase \"$prompt\" in *'id: ccx-a'*) touch {} ;; esac\necho more >> out.txt\n",
+            canary.display()
+        ),
+    );
+    let fresh_agent = format!("sh {}", repo.path().join("fresh-agent.sh").display());
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                &fresh_agent,
+                "--resume",
+                &halted_run_id,
+                "--fresh",
+            ])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["outcome"], "completed");
+    assert!(
+        canary.exists(),
+        "--fresh must re-execute the previously completed task's agent"
+    );
+}
+
+#[test]
+fn contract_run_resume_with_unavailable_recorded_output_is_refused() {
+    // KTD9: when a recorded completed-task output no longer applies onto the
+    // rebuilt baseline (here: the patch content object is gone — a stand-in for a
+    // GC'd or corrupted object), resume refuses with the typed
+    // CONTRACT_NOT_INTEGRABLE and the message names the fresh-run guidance.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    write(
+        &repo,
+        "fail-b.sh",
+        "#!/bin/sh\nif grep -q 'id: ccx-b' >/dev/null 2>&1; then exit 3; fi\necho change >> out.txt\n",
+    );
+    let fail_b = format!("sh {}", repo.path().join("fail-b.sh").display());
+    let halted = contract_run(&repo, &["ccx-a", "ccx-b"], &fail_b, 1);
+    let halted_run_id = halted["data"]["run_id"].as_str().unwrap().to_string();
+
+    // Point the completed task's recorded patch at a well-formed ref whose object
+    // does not exist in the store.
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let missing_ref = format!("forge-tree:{}", "0".repeat(64));
+    conn.execute(
+        "UPDATE contract_run_tasks SET patch_content_ref = ?1
+         WHERE run_id = ?2 AND task_id = 'ccx-a'",
+        rusqlite::params![missing_ref, halted_run_id],
+    )
+    .expect("tamper recorded patch ref");
+
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                EDIT_AGENT,
+                "--resume",
+                &halted_run_id,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+    let reason = env["errors"][0]["details"]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("no longer applies") && reason.contains("--fresh"),
+        "refusal must carry fresh-run guidance: {reason}"
+    );
+}
+
+#[test]
+fn contract_run_resume_of_unknown_run_is_refused() {
+    // KTD9: resuming a run that does not exist is a refusal, not a silent fresh run.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "--agent-cmd",
+                EDIT_AGENT,
+                "--resume",
+                "contract_run_nonexistent",
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(env["status"], "error");
+    let message = env["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no recorded run to resume"),
+        "unexpected: {message}"
+    );
+}
+
+#[test]
 fn contract_integrate_incomplete_run_is_refused() {
     // A stopped (not completed) run cannot be integrated (typed refusal, KTD8).
     let repo = run_repo();
@@ -1021,4 +1323,37 @@ fn contract_integrate_incomplete_run_is_refused() {
             .failure(),
     );
     assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+}
+
+#[test]
+fn contract_run_agent_stderr_excerpt_is_stored_redacted() {
+    // R7/R16: the agent subprocess stderr is captured on the per-task run row as a
+    // redacted excerpt — a secret-looking token the agent prints to stderr never
+    // enters the signed ledger row in the clear (redact-before-sign, KTD3).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+
+    // The agent produces a real patch (so the task completes) and leaks a
+    // secret-looking assignment to stderr.
+    let agent = "echo change >> out.txt; echo 'password=hunter2SECRETvalue' 1>&2";
+    let env = contract_run(&repo, &["ccx-a"], agent, 0);
+    assert_eq!(env["data"]["outcome"], "completed");
+    let run_id = env["data"]["run_id"].as_str().unwrap();
+
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let stderr_excerpt: String = conn
+        .query_row(
+            "SELECT agent_stderr_excerpt FROM contract_run_tasks WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .expect("stderr excerpt stored on the task row");
+    assert!(
+        stderr_excerpt.contains("[REDACTED]"),
+        "stderr must be redacted before storage: {stderr_excerpt:?}"
+    );
+    assert!(
+        !stderr_excerpt.contains("hunter2SECRETvalue"),
+        "the raw secret must never be persisted: {stderr_excerpt:?}"
+    );
 }
