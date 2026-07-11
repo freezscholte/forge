@@ -32,11 +32,27 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    command_result, ContractArgs, ContractCommand, ContractFreezeArgs, ContractLintArgs, ForgeError,
+    command_result, ContractArgs, ContractBriefArgs, ContractCommand, ContractFreezeArgs,
+    ContractLintArgs, ForgeError,
 };
 
-/// Reserved ledger contract id for the repo-level global policy file.
-const GLOBAL_POLICY_ID: &str = "_global-policy";
+/// Reserved ledger contract id for the repo-level global policy file. Shared with
+/// the store (`forge_store::GLOBAL_POLICY_CONTRACT_ID`) so freeze and brief agree.
+const GLOBAL_POLICY_ID: &str = forge_store::GLOBAL_POLICY_CONTRACT_ID;
+
+/// The task-instruction stop-rule wording (R6), verbatim from the single harness
+/// source `tools/ccx/prompts/task-instruction.txt`. `ccx-brief.py` does NOT emit
+/// this — `run-task.sh` `cat`s the file onto the brief at RUN time — so
+/// `forge contract brief` keeps byte-parity with the Python emitter by NOT
+/// appending it, and U5's prompt assembly appends this constant verbatim instead.
+/// `include_str!` guarantees the wording can never drift from the harness file;
+/// when the R21 retirement criterion is met and `tools/ccx` is removed, inline the
+/// literal here. Exposed for U5, which is the first non-test consumer — until that
+/// slice lands the constant is referenced only by its parity unit test, so the
+/// dead-code allow is scoped and documented rather than silencing a real warning.
+#[allow(dead_code)]
+pub(crate) const CONTRACT_TASK_INSTRUCTION: &str =
+    include_str!("../../../../tools/ccx/prompts/task-instruction.txt");
 
 /// Required top-level keys for a task contract (R1 shape). Mirrors
 /// `ccx-lint.py`'s `REQUIRED_KEYS`.
@@ -130,7 +146,48 @@ pub(crate) fn contract_response(
     match args.command {
         ContractCommand::Lint(args) => lint_response(request_id, args),
         ContractCommand::Freeze(args) => freeze_response(request_id, args),
+        ContractCommand::Brief(args) => brief_response(request_id, args),
     }
+}
+
+/// `forge contract brief <contract-id>` — read-only (no repo lock). Emits the
+/// byte-stable brief for a frozen revision (R5): global policy, task contract, and
+/// declared neighbors in order, byte-for-byte identical to `tools/ccx/ccx-brief.py`
+/// (R5). The `--json` envelope carries the brief text in `data.brief`; `--out`
+/// writes it to a file; plain mode prints it verbatim to stdout. The R6
+/// task-instruction wording is intentionally NOT appended here (see
+/// `CONTRACT_TASK_INSTRUCTION`), preserving Python parity.
+fn brief_response(request_id: Option<String>, args: ContractBriefArgs) -> ResponseEnvelope {
+    command_result("contract brief", request_id, move |cwd, _| {
+        let record = forge_store::contract_brief(&cwd, &args.contract_id, args.revision)?;
+        let out_written = match &args.out {
+            Some(raw) => {
+                // Canonicalize the write target at the boundary (R19). The file may
+                // not exist yet, so resolve relative paths against cwd rather than
+                // requiring existence.
+                let path = if raw.is_absolute() {
+                    raw.clone()
+                } else {
+                    cwd.join(raw)
+                };
+                std::fs::write(&path, record.brief.as_bytes())
+                    .with_context(|| format!("cannot write brief to {}", path.display()))?;
+                Some(path.display().to_string())
+            }
+            None => None,
+        };
+        let mut data = json!({
+            "contract_id": record.contract_id,
+            "revision": record.revision,
+            "global_policy_revision": record.global_policy_revision,
+            "neighbors": serde_json::to_value(&record.neighbors)?,
+            "brief": record.brief,
+        });
+        if let Some(out) = out_written {
+            data["out"] = json!(out);
+        }
+        Ok((None, data, Vec::new()))
+    })
 }
 
 /// `forge contract lint <path>` — read-only. Surfaces findings machine-readably
@@ -855,6 +912,10 @@ impl Linter<'_> {
     }
 
     fn rule4_command(&mut self, cmd: &str, allow_globs: &[String]) {
+        // Whitespace split, not shlex like ccx-lint.py: quoting is unreachable here
+        // because rule 6's metacharacter rejection forbids quotes outright. If the
+        // grammar is ever relaxed to admit quoted arguments, this must become a
+        // shell-aware tokenizer or the divergence reactivates.
         let toks: Vec<&str> = cmd.split_whitespace().collect();
         if toks.len() < 2 || toks[0] != "cargo" {
             return;
@@ -1347,6 +1408,23 @@ mod tests {
         assert_eq!(module_base(Path::new("src/foo/bar.rs")), vec!["foo", "bar"]);
         assert!(module_base(Path::new("src/lib.rs")).is_empty());
         assert!(module_base(Path::new("tests/it.rs")).is_empty());
+    }
+
+    #[test]
+    fn task_instruction_wording_is_the_verbatim_harness_text() {
+        // R6: the stop-rule wording must travel verbatim. The constant IS the
+        // single harness source (`include_str!`), so it can never drift; assert the
+        // load-bearing stop wording is present so a future inline copy stays honest.
+        let text = CONTRACT_TASK_INSTRUCTION;
+        assert!(
+            text.starts_with("\n--- TASK INSTRUCTION ---\n"),
+            "unexpected leading framing: {text:?}"
+        );
+        assert!(text.contains("STOP: write"), "missing STOP directive");
+        assert!(text.contains("UNKNOWN.md at the repo root"));
+        assert!(text.contains("blocking/assumption/observation"));
+        assert!(text.contains("acceptance.fix"));
+        assert!(text.contains("acceptance.guard"));
     }
 
     #[test]

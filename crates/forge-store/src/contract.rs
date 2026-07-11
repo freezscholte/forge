@@ -1281,6 +1281,214 @@ pub fn contract_run_verdicts(cwd: &Path, run_id: &str) -> Result<Vec<ContractRun
 }
 
 // ---------------------------------------------------------------------------
+// Brief emission (U4) — a byte-stable pure function of frozen revisions
+// ---------------------------------------------------------------------------
+//
+// `forge contract brief` reproduces `tools/ccx/ccx-brief.py` output BYTE-FOR-BYTE
+// for the same inputs (R5). The brief is a pure function of: the frozen global
+// policy (reserved id `_global-policy`), the frozen task revision's verbatim
+// source bytes, and its declared neighbors' frozen revisions — in declared order.
+//
+// Parity notes vs. ccx-brief.py:
+// - Section framing is `--- {header} ---\n` + verbatim source bytes + `\n`,
+//   char-for-char identical to the Python `section()` (which the pilot brief.sh
+//   `emit()` established). Because `freeze` stores the exact authored bytes (R1),
+//   `source_yaml` equals the file bytes the Python emitter would read.
+// - Neighbor resolution: the Python resolves `ccx-<name>` to `<name>.yaml` on
+//   disk; here the neighbor's ledger `contract_id` IS the full declared id (freeze
+//   keys the row on the YAML `id`), so a declared neighbor id resolves directly to
+//   its latest frozen revision. Emission is in the contract's declared order.
+// - Missing neighbor: the Python emits a MISSING marker and still exits 0 when the
+//   neighbor FILE is absent; the native analogue is a declared neighbor with NO
+//   frozen revision in the ledger (the plan's residual-risk case). Both emit the
+//   identical marker bytes `--- NEIGHBOR CONTRACT MISSING: {id} (surface as
+//   unknown, do not guess) ---\n\n` and the brief still succeeds.
+// - Global policy / task fail-closed: the Python fails closed (nonzero exit, no
+//   stdout) when the contract or global policy cannot be read. The native analogue
+//   is the typed `CONTRACT_NOT_FROZEN` refusal when either has no lint-clean frozen
+//   revision (R2/R5 gate the task; the policy is required just as in the harness).
+//
+// R6 (task-instruction wording) is NOT emitted here, matching ccx-brief.py, which
+// does not append it — `run-task.sh` `cat`s `prompts/task-instruction.txt` onto the
+// brief at RUN time. The verbatim wording is exposed as a single CLI-side constant
+// (`CONTRACT_TASK_INSTRUCTION`, U4) so U5's prompt assembly appends it and R6's
+// verbatim-travel guarantee is satisfied there without breaking brief byte-parity.
+
+/// Reserved ledger contract id for the repo-level global policy revision. The
+/// single source of truth shared by U3's freeze (which frozen the policy under
+/// this id) and U4's brief (which retrieves it). Mirrors ccx-brief.py's
+/// `_global-policy.yaml` default.
+pub const GLOBAL_POLICY_CONTRACT_ID: &str = "_global-policy";
+
+/// One declared neighbor's resolution status in an emitted brief (R23-friendly).
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractBriefNeighbor {
+    pub id: String,
+    /// The frozen revision emitted, or `None` when the neighbor has no frozen
+    /// revision (a MISSING marker was emitted instead).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    pub present: bool,
+}
+
+/// The result of emitting a brief: the byte-stable text plus the resolved inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractBriefRecord {
+    pub contract_id: String,
+    pub revision: i64,
+    pub global_policy_revision: i64,
+    pub neighbors: Vec<ContractBriefNeighbor>,
+    /// The byte-stable brief text (R5). Emitting the same frozen inputs twice
+    /// yields identical bytes.
+    pub brief: String,
+}
+
+/// One framed section, char-for-char identical to ccx-brief.py's `section()`:
+/// `--- {header} ---\n` + verbatim body + one trailing `\n`.
+fn brief_section(header: &str, body: &str) -> String {
+    format!("--- {header} ---\n{body}\n")
+}
+
+/// The missing-neighbor marker, byte-identical to ccx-brief.py: the header line
+/// plus a trailing blank line (`\n\n`), no body.
+fn brief_missing_neighbor(nid: &str) -> String {
+    format!("--- NEIGHBOR CONTRACT MISSING: {nid} (surface as unknown, do not guess) ---\n\n")
+}
+
+/// Parse the declared `neighbors:` id list from a frozen revision's verbatim YAML,
+/// mirroring ccx-brief.py: `neighbors: null`/absent is empty; a list of strings is
+/// accepted in declared order; anything else is an error.
+fn parse_brief_neighbors(source_yaml: &str) -> Result<Vec<String>> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(source_yaml)
+        .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
+    let mapping = parsed
+        .as_mapping()
+        .ok_or_else(|| anyhow!("frozen contract is not a YAML mapping"))?;
+    match mapping.get(serde_yaml::Value::from("neighbors")) {
+        None | Some(serde_yaml::Value::Null) => Ok(Vec::new()),
+        Some(serde_yaml::Value::Sequence(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(id) => ids.push(id.to_string()),
+                    None => bail!("neighbors: must be a list of ids"),
+                }
+            }
+            Ok(ids)
+        }
+        Some(_) => bail!("neighbors: must be a list of ids"),
+    }
+}
+
+/// The latest frozen revision of a contract on an already-open connection, or
+/// `None` when it has no frozen revision. Connection-scoped sibling of
+/// [`latest_contract_revision`] so brief emission resolves policy, task, and every
+/// neighbor over one connection.
+fn latest_contract_revision_on(
+    conn: &Connection,
+    repo_id: &str,
+    contract_id: &str,
+) -> Result<Option<ContractRevisionRecord>> {
+    let latest: Option<i64> = conn
+        .query_row(
+            "SELECT latest_revision FROM contracts WHERE repo_id = ?1 AND contract_id = ?2",
+            params![repo_id, contract_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match latest.filter(|value| *value > 0) {
+        Some(revision) => contract_revision_on(conn, repo_id, contract_id, revision),
+        None => Ok(None),
+    }
+}
+
+/// Emit a byte-stable brief for a frozen contract revision (R5/R6). `revision`
+/// selects a specific frozen revision; `None` uses the contract's latest. The task
+/// revision must be lint-clean and frozen (R2/R5) and the global policy must be
+/// frozen, or a typed `CONTRACT_NOT_FROZEN` refusal is returned (fail-closed,
+/// mirroring the Python emitter's fail-closed exit on an unreadable contract or
+/// policy). Read-only: no lock, no signing.
+pub fn contract_brief(
+    cwd: &Path,
+    contract_id: &str,
+    revision: Option<i64>,
+) -> Result<ContractBriefRecord> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+
+    // Global policy is required and prepended, exactly as in the harness.
+    let policy =
+        latest_contract_revision_on(&connection, &context.repo_id, GLOBAL_POLICY_CONTRACT_ID)?
+            .ok_or_else(|| ForgeError::ContractNotFrozen {
+                contract_id: GLOBAL_POLICY_CONTRACT_ID.to_string(),
+                revision: 0,
+            })?;
+
+    // Task revision: a specific one if pinned, else the latest. Must be a
+    // lint-clean frozen revision to produce a brief (R2/R5).
+    let contract = match revision {
+        Some(rev) => contract_revision_on(&connection, &context.repo_id, contract_id, rev)?,
+        None => latest_contract_revision_on(&connection, &context.repo_id, contract_id)?,
+    }
+    .ok_or_else(|| ForgeError::ContractNotFrozen {
+        contract_id: contract_id.to_string(),
+        revision: revision.unwrap_or(0),
+    })?;
+    if contract.state != "frozen" || !contract.lint_clean {
+        return Err(ForgeError::ContractNotFrozen {
+            contract_id: contract_id.to_string(),
+            revision: contract.revision,
+        }
+        .into());
+    }
+
+    let neighbor_ids = parse_brief_neighbors(&contract.source_yaml)?;
+
+    let mut brief = String::new();
+    brief.push_str(&brief_section(
+        "GLOBAL POLICY (normative)",
+        &policy.source_yaml,
+    ));
+    brief.push_str(&brief_section(
+        "TASK CONTRACT (normative)",
+        &contract.source_yaml,
+    ));
+
+    let mut neighbors = Vec::with_capacity(neighbor_ids.len());
+    for nid in &neighbor_ids {
+        match latest_contract_revision_on(&connection, &context.repo_id, nid)? {
+            Some(neighbor) => {
+                brief.push_str(&brief_section(
+                    &format!("NEIGHBOR CONTRACT (normative): {nid}"),
+                    &neighbor.source_yaml,
+                ));
+                neighbors.push(ContractBriefNeighbor {
+                    id: nid.clone(),
+                    revision: Some(neighbor.revision),
+                    present: true,
+                });
+            }
+            None => {
+                brief.push_str(&brief_missing_neighbor(nid));
+                neighbors.push(ContractBriefNeighbor {
+                    id: nid.clone(),
+                    revision: None,
+                    present: false,
+                });
+            }
+        }
+    }
+
+    Ok(ContractBriefRecord {
+        contract_id: contract.contract_id,
+        revision: contract.revision,
+        global_policy_revision: policy.revision,
+        neighbors,
+        brief,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Acceptance command grammar (R15) — the single source of truth
 // ---------------------------------------------------------------------------
 //
@@ -1880,5 +2088,88 @@ mod tests {
         assert!(contract_run(temp.path(), &first.run_id)
             .expect("read run")
             .is_some());
+    }
+
+    #[test]
+    fn brief_is_byte_stable_and_emits_neighbors_in_declared_order() {
+        let temp = init_native_repo();
+        freeze_contract_revision(
+            temp.path(),
+            None,
+            frozen_input("_global-policy", "policy\n"),
+        )
+        .expect("freeze policy");
+        freeze_contract_revision(temp.path(), None, frozen_input("ccx-a", "id: ccx-a\n"))
+            .expect("freeze a");
+        freeze_contract_revision(temp.path(), None, frozen_input("ccx-b", "id: ccx-b\n"))
+            .expect("freeze b");
+        let task = "id: ccx-task\nneighbors:\n  - ccx-a\n  - ccx-b\n";
+        freeze_contract_revision(temp.path(), None, frozen_input("ccx-task", task))
+            .expect("freeze task");
+
+        let first = contract_brief(temp.path(), "ccx-task", None).expect("brief");
+        let second = contract_brief(temp.path(), "ccx-task", None).expect("brief again");
+        assert_eq!(first.brief, second.brief, "same inputs must be byte-stable");
+
+        // The exact bytes: policy, task, then neighbors in declared order (a, b).
+        let expected = "--- GLOBAL POLICY (normative) ---\npolicy\n\
+\n--- TASK CONTRACT (normative) ---\nid: ccx-task\nneighbors:\n  - ccx-a\n  - ccx-b\n\
+\n--- NEIGHBOR CONTRACT (normative): ccx-a ---\nid: ccx-a\n\
+\n--- NEIGHBOR CONTRACT (normative): ccx-b ---\nid: ccx-b\n\n";
+        assert_eq!(first.brief, expected);
+        assert_eq!(first.neighbors.len(), 2);
+        assert_eq!(first.neighbors[0].id, "ccx-a");
+        assert_eq!(first.neighbors[1].id, "ccx-b");
+        assert!(first.neighbors.iter().all(|n| n.present));
+    }
+
+    #[test]
+    fn brief_missing_neighbor_emits_marker_and_still_succeeds() {
+        let temp = init_native_repo();
+        freeze_contract_revision(
+            temp.path(),
+            None,
+            frozen_input("_global-policy", "policy\n"),
+        )
+        .expect("freeze policy");
+        freeze_contract_revision(temp.path(), None, frozen_input("ccx-a", "id: ccx-a\n"))
+            .expect("freeze a");
+        // ccx-ghost is declared but never frozen — the native missing case.
+        let task = "id: ccx-task\nneighbors:\n  - ccx-a\n  - ccx-ghost\n";
+        freeze_contract_revision(temp.path(), None, frozen_input("ccx-task", task))
+            .expect("freeze task");
+
+        let brief = contract_brief(temp.path(), "ccx-task", None).expect("brief");
+        assert!(
+            brief.brief.contains(
+                "--- NEIGHBOR CONTRACT MISSING: ccx-ghost (surface as unknown, do not guess) ---\n\n"
+            ),
+            "missing marker must be byte-exact: {:?}",
+            brief.brief
+        );
+        assert!(brief
+            .brief
+            .contains("--- NEIGHBOR CONTRACT (normative): ccx-a ---\n"));
+        assert!(brief.neighbors[0].present);
+        assert!(!brief.neighbors[1].present);
+        assert_eq!(brief.neighbors[1].revision, None);
+    }
+
+    #[test]
+    fn brief_without_global_policy_is_a_not_frozen_refusal() {
+        let temp = init_native_repo();
+        freeze_contract_revision(
+            temp.path(),
+            None,
+            frozen_input("ccx-task", "id: ccx-task\n"),
+        )
+        .expect("freeze task");
+        // Fail-closed: no frozen global policy → typed CONTRACT_NOT_FROZEN (the
+        // native analogue of ccx-brief.py's fail-closed exit on a missing policy).
+        let error = contract_brief(temp.path(), "ccx-task", None).expect_err("must refuse");
+        let typed = error
+            .downcast_ref::<ForgeError>()
+            .expect("refusal downcasts to a typed ForgeError");
+        assert_eq!(typed.code(), "CONTRACT_NOT_FROZEN");
     }
 }

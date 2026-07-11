@@ -482,6 +482,8 @@ pub(crate) enum ContractCommand {
     Lint(ContractLintArgs),
     /// Lint then record a signed, immutable frozen revision of a contract YAML file.
     Freeze(ContractFreezeArgs),
+    /// Emit the byte-stable brief for a frozen contract revision (read-only).
+    Brief(ContractBriefArgs),
 }
 
 #[derive(Debug, Args)]
@@ -494,6 +496,18 @@ pub(crate) struct ContractLintArgs {
 pub(crate) struct ContractFreezeArgs {
     /// Path to the contract YAML file (or a `_global-policy.yaml`). Canonicalized at the boundary.
     pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractBriefArgs {
+    /// The frozen contract id to brief (for example `ccx-demo`).
+    pub(crate) contract_id: String,
+    /// Emit a specific frozen revision instead of the latest.
+    #[arg(long)]
+    pub(crate) revision: Option<i64>,
+    /// Write the brief to this path instead of stdout. Canonicalized at the boundary.
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

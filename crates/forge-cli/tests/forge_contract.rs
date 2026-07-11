@@ -1,10 +1,20 @@
-//! NER U3: `forge contract lint | freeze` end-to-end through the CLI.
+//! NER U3/U4: `forge contract lint | freeze | brief` end-to-end through the CLI.
 //!
-//! Covers the U3 acceptance slice: AE4 (unknown top-level key errors, no frozen
-//! revision) and AE6 (metacharacter / non-cargo acceptance refused at lint with
+//! U3 slice: AE4 (unknown top-level key errors, no frozen revision) and AE6
+//! (metacharacter / non-cargo acceptance refused at lint with
 //! CONTRACT_GRAMMAR_VIOLATION), plus lint-clean freeze reading back as revision
 //! 1, wrong-visibility primitive rejection, relative-path canonicalization
 //! (R19), and global-policy freeze under the reserved id.
+//!
+//! U4 slice (R5/R6): `contract brief` byte-parity with `tools/ccx/ccx-brief.py`.
+//! The primary assertion compares native stdout to checked-in EXPECTED byte
+//! fixtures under `tests/fixtures/contract-briefs/`. Those EXPECTED files
+//! (`expected-brief-full.txt`, `expected-brief-missing-b.txt`) were generated once
+//! by running `python3 tools/ccx/ccx-brief.py --contracts-dir <fixtures>
+//! brief-task.yaml` over the same YAML inputs (the full case with all four files
+//! present; the missing case with `brief-neighbor-b.yaml` absent). An additional
+//! `#[ignore]`d test re-runs the live Python emitter for a defense-in-depth cross
+//! check where `python3` + PyYAML are available.
 
 mod common;
 
@@ -328,5 +338,235 @@ fn freeze_replay_is_idempotent() {
         revision_count(&repo),
         1,
         "replay must not create a second revision"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// U4: `forge contract brief` — byte-parity with tools/ccx/ccx-brief.py
+// ---------------------------------------------------------------------------
+
+/// Directory of the checked-in brief fixtures (contract YAML + Python-generated
+/// EXPECTED bytes). The EXPECTED files were generated once from
+/// `tools/ccx/ccx-brief.py` over the same YAML inputs (see the file header note in
+/// the module docstring above); the native emitter must reproduce them exactly.
+fn brief_fixtures_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contract-briefs")
+}
+
+fn brief_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(brief_fixtures_dir().join(name)).expect("read brief fixture")
+}
+
+/// Copy a checked-in fixture YAML verbatim into the repo's `contracts/` dir so its
+/// bytes flow into the frozen revision unchanged (R1) — the same bytes the Python
+/// emitter read when the EXPECTED fixtures were generated.
+fn install_brief_fixture(repo: &TestRepo, name: &str) {
+    let bytes = brief_fixture(name);
+    let path = repo.path().join("contracts").join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create contracts dir");
+    std::fs::write(path, bytes).expect("install fixture");
+}
+
+fn freeze_fixture(repo: &TestRepo, name: &str) {
+    repo.forge()
+        .args(["--json", "contract", "freeze", &format!("contracts/{name}")])
+        .assert()
+        .success();
+}
+
+/// The four fixture YAML files a full brief needs on disk (so the task lints), in
+/// the order the task declares its neighbors.
+const BRIEF_YAML_FILES: [&str; 4] = [
+    "_global-policy.yaml",
+    "brief-neighbor-a.yaml",
+    "brief-neighbor-b.yaml",
+    "brief-task.yaml",
+];
+
+#[test]
+fn brief_matches_ccx_brief_py_expected_bytes() {
+    // Primary U4 contract (R5): the native brief is byte-for-byte identical to the
+    // Python emitter's output for the same frozen inputs. All four files are on
+    // disk so the task lints; all four are frozen so every neighbor resolves.
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    freeze_fixture(&repo, "_global-policy.yaml");
+    freeze_fixture(&repo, "brief-neighbor-a.yaml");
+    freeze_fixture(&repo, "brief-neighbor-b.yaml");
+    freeze_fixture(&repo, "brief-task.yaml");
+
+    let output = repo
+        .forge()
+        .args(["contract", "brief", "ccx-brief-task"])
+        .assert()
+        .success();
+    let stdout = &output.get_output().stdout;
+    assert_eq!(
+        stdout,
+        &brief_fixture("expected-brief-full.txt"),
+        "native brief must be byte-identical to ccx-brief.py output"
+    );
+}
+
+#[test]
+fn brief_missing_neighbor_reproduces_marker_bytes() {
+    // A declared neighbor with NO frozen revision reproduces the Python MISSING
+    // marker bytes and the brief still succeeds (exit 0), matching ccx-brief.py's
+    // file-absent behavior. All four YAML are on disk so the task still lints;
+    // neighbor-b is deliberately NOT frozen.
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    freeze_fixture(&repo, "_global-policy.yaml");
+    freeze_fixture(&repo, "brief-neighbor-a.yaml");
+    freeze_fixture(&repo, "brief-task.yaml");
+
+    let output = repo
+        .forge()
+        .args(["contract", "brief", "ccx-brief-task"])
+        .assert()
+        .success();
+    assert_eq!(
+        &output.get_output().stdout,
+        &brief_fixture("expected-brief-missing-b.txt"),
+        "a declared-but-unfrozen neighbor must reproduce the Python MISSING marker bytes"
+    );
+}
+
+#[test]
+fn brief_is_byte_stable_across_invocations() {
+    // R5: emitting the same frozen inputs twice yields identical bytes.
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    for name in BRIEF_YAML_FILES {
+        freeze_fixture(&repo, name);
+    }
+    let first = repo
+        .forge()
+        .args(["contract", "brief", "ccx-brief-task"])
+        .assert()
+        .success();
+    let second = repo
+        .forge()
+        .args(["contract", "brief", "ccx-brief-task"])
+        .assert()
+        .success();
+    assert_eq!(
+        first.get_output().stdout,
+        second.get_output().stdout,
+        "the same frozen inputs must emit byte-identical briefs"
+    );
+}
+
+#[test]
+fn brief_json_carries_text_and_out_writes_file() {
+    // R23/operator surface: the --json envelope carries the brief text and neighbor
+    // resolution; --out writes the same bytes to a file.
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    for name in BRIEF_YAML_FILES {
+        freeze_fixture(&repo, name);
+    }
+    let expected = brief_fixture("expected-brief-full.txt");
+
+    let envelope = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "brief",
+                "ccx-brief-task",
+                "--out",
+                "brief.txt",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["data"]["contract_id"], "ccx-brief-task");
+    assert_eq!(
+        envelope["data"]["brief"].as_str().unwrap().as_bytes(),
+        expected.as_slice()
+    );
+    let neighbors = envelope["data"]["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 2);
+    assert_eq!(neighbors[0]["id"], "ccx-brief-neighbor-a");
+    assert_eq!(neighbors[0]["present"], true);
+    assert_eq!(neighbors[1]["id"], "ccx-brief-neighbor-b");
+
+    // --out wrote the identical bytes to the file.
+    let written = std::fs::read(repo.path().join("brief.txt")).expect("read out file");
+    assert_eq!(written, expected);
+}
+
+#[test]
+fn brief_refuses_when_contract_not_frozen() {
+    // Fail-closed: no frozen revision for the requested id → typed
+    // CONTRACT_NOT_FROZEN, no stdout brief.
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    freeze_fixture(&repo, "_global-policy.yaml");
+    // brief-task is never frozen.
+    let envelope = json_output(
+        repo.forge()
+            .args(["--json", "contract", "brief", "ccx-brief-task"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&envelope), "CONTRACT_NOT_FROZEN");
+}
+
+/// Live parity check against the Python emitter itself (not the checked-in EXPECTED
+/// bytes). Ignored by default because `python3` + PyYAML are not guaranteed on
+/// every machine; the checked-in `expected-brief-full.txt` is the primary
+/// assertion. Run explicitly with `cargo test -- --ignored`.
+#[test]
+#[ignore]
+fn brief_matches_live_python_emitter() {
+    let repo = init_repo();
+    for name in BRIEF_YAML_FILES {
+        install_brief_fixture(&repo, name);
+    }
+    for name in BRIEF_YAML_FILES {
+        freeze_fixture(&repo, name);
+    }
+    let native = repo
+        .forge()
+        .args(["contract", "brief", "ccx-brief-task"])
+        .assert()
+        .success();
+
+    // The repo root holds tools/ccx/ccx-brief.py; drive it over the fixture dir.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root");
+    let brief_py = repo_root.join("tools/ccx/ccx-brief.py");
+    let fixtures = brief_fixtures_dir();
+    let python = std::process::Command::new("python3")
+        .arg(&brief_py)
+        .arg("--contracts-dir")
+        .arg(&fixtures)
+        .arg(fixtures.join("brief-task.yaml"))
+        .output()
+        .expect("run ccx-brief.py");
+    assert!(
+        python.status.success(),
+        "ccx-brief.py failed: {}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    assert_eq!(
+        native.get_output().stdout,
+        python.stdout,
+        "native brief must match the live ccx-brief.py emitter byte-for-byte"
     );
 }
