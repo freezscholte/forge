@@ -181,7 +181,7 @@ fn at_head_database_reports_healthy_schema_on_normal_command() {
         .clone();
     let json: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(json["data"]["ok"], true);
-    assert_eq!(json["data"]["schema_version"], 21);
+    assert_eq!(json["data"]["schema_version"], 22);
 }
 
 /// FIX K (U3): structural drift on an at-HEAD (version=2) DB is NOT auto-repaired
@@ -214,7 +214,7 @@ fn at_head_structural_drift_is_surfaced_not_auto_repaired() {
                 row.get(0)
             })
             .expect("read version");
-        assert_eq!(version, 21, "DB must still be stamped at HEAD");
+        assert_eq!(version, 22, "DB must still be stamped at HEAD");
     }
 
     // Run a normal command: the migration runner skips at HEAD and must NOT
@@ -240,7 +240,7 @@ fn at_head_structural_drift_is_surfaced_not_auto_repaired() {
                 row.get(0)
             })
             .expect("read version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
     }
 
     // `forge doctor` surfaces the structural drift rather than reporting a healthy

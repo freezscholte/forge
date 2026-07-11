@@ -70,6 +70,8 @@ const ENCRYPTED_PRIVATE_CONTENT_020: &str =
 /// The 021 embargo workflow migration.
 const EMBARGO_WORKFLOW_021: &str = include_str!("../migrations/021_embargo_workflow.sql");
 
+const CONTRACTS_022: &str = include_str!("../migrations/022_contracts.sql");
+
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
 fn git_repo() -> tempfile::TempDir {
@@ -200,6 +202,116 @@ fn apply_through_021(conn: &Connection) {
     apply_through_020(conn);
     conn.execute_batch(EMBARGO_WORKFLOW_021)
         .expect("apply 021 embargo workflow");
+}
+
+#[test]
+fn contracts_signature_rebuild_preserves_existing_signature_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_021(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+    let seeded = [
+        (
+            "sig_evidence",
+            "evidence",
+            "evidence_existing",
+            "digest_evidence",
+            40_i64,
+        ),
+        (
+            "sig_decision",
+            "decision",
+            "decision_existing",
+            "digest_decision",
+            41,
+        ),
+        (
+            "sig_commit",
+            "commit",
+            "commit_existing",
+            "digest_commit",
+            42,
+        ),
+        (
+            "sig_sync_merge",
+            "sync_merge_commit",
+            "sync_merge_existing",
+            "digest_sync_merge",
+            43,
+        ),
+    ];
+    for (id, subject_kind, subject_id, signed_digest, created_at_ms) in seeded {
+        conn.execute(
+            "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (?1, 'repo_test', ?2, ?3, ?4, 'ed25519', 'public_key_existing',
+                   'fingerprint_existing', 'signature_existing', 'locally_signed', ?5)",
+            rusqlite::params![id, subject_kind, subject_id, signed_digest, created_at_ms],
+        )
+        .expect("insert pre-existing signature");
+    }
+
+    conn.execute_batch(CONTRACTS_022)
+        .expect("apply 022 contracts");
+
+    let preserved: Vec<(String, String, String, String, i64)> = conn
+        .prepare(
+            "SELECT id, subject_kind, subject_id, signed_digest, created_at_ms
+             FROM ledger_signatures ORDER BY created_at_ms",
+        )
+        .expect("prepare preserved signatures")
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query preserved signatures")
+        .collect::<Result<_, _>>()
+        .expect("collect preserved signatures");
+    let expected: Vec<(String, String, String, String, i64)> = seeded
+        .iter()
+        .map(|(id, kind, subject, digest, ts)| {
+            (
+                (*id).to_string(),
+                (*kind).to_string(),
+                (*subject).to_string(),
+                (*digest).to_string(),
+                *ts,
+            )
+        })
+        .collect();
+    assert_eq!(
+        preserved, expected,
+        "pre-022 signature rows must survive the ledger_signatures rebuild byte-for-byte"
+    );
+
+    for kind in [
+        "contract",
+        "contract_run",
+        "contract_stop",
+        "contract_run_verdict",
+    ] {
+        conn.execute(
+            "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (?1, 'repo_test', ?2, ?3, 'digest_new', 'ed25519', 'pk',
+                   'fp', 'sig', 'locally_signed', 50)",
+            rusqlite::params![format!("sig_{kind}"), kind, format!("{kind}_subject")],
+        )
+        .unwrap_or_else(|_| panic!("widened CHECK must admit subject_kind {kind}"));
+    }
 }
 
 fn max_version(conn: &Connection) -> i64 {
@@ -787,7 +899,27 @@ fn behind_db_upgrades_to_head() {
         ),
         "021 created embargo_release_authorizations"
     );
-    assert_eq!(max_version(&conn), 21, "reached HEAD=21");
+    assert!(
+        has_column(&conn, "contracts", "contract_id"),
+        "022 created contracts"
+    );
+    assert!(
+        has_column(&conn, "contract_revisions", "source_yaml"),
+        "022 created contract_revisions"
+    );
+    assert!(
+        has_column(&conn, "contract_runs", "outcome"),
+        "022 created contract_runs"
+    );
+    assert!(
+        has_column(&conn, "contract_stops", "malformed"),
+        "022 created contract_stops"
+    );
+    assert!(
+        has_column(&conn, "contract_run_verdicts", "verdict_kind"),
+        "022 created contract_run_verdicts"
+    );
+    assert_eq!(max_version(&conn), 22, "reached HEAD=22");
 }
 
 #[test]
@@ -866,15 +998,16 @@ fn at_head_db_is_a_noop() {
                 (19, "019_org_identity_governance"),
                 (20, "020_encrypted_private_content"),
                 (21, "021_embargo_workflow"),
+                (22, "022_contracts"),
             ],
         );
-        assert_eq!(max_version(&conn), 21);
+        assert_eq!(max_version(&conn), 22);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 21, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 22, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -884,7 +1017,7 @@ fn head_plus_one_is_refused() {
     {
         let conn = open(&db);
         apply_through_021(&conn);
-        // HEAD is now 21, so the genuinely-ahead stamp is 22.
+        // HEAD is now 22, so the genuinely-ahead stamp is 23.
         stamp_versions(
             &conn,
             &[
@@ -909,10 +1042,11 @@ fn head_plus_one_is_refused() {
                 (19, "019_org_identity_governance"),
                 (20, "020_encrypted_private_content"),
                 (21, "021_embargo_workflow"),
-                (22, "future"),
+                (22, "022_contracts"),
+                (23, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 22);
+        assert_eq!(max_version(&conn), 23);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -921,8 +1055,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 22);
-            assert_eq!(*supported_head, 21);
+            assert_eq!(*db_version, 23);
+            assert_eq!(*supported_head, 22);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

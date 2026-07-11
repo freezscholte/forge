@@ -516,7 +516,7 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
             |row| row.get(0),
         )
         .expect("max version");
-    assert_eq!(head, 21, "schema reached HEAD after the concurrent upgrade");
+    assert_eq!(head, 22, "schema reached HEAD after the concurrent upgrade");
     // The upgrade actually applied: 002's columns are present.
     let has_backend: i64 = connection
         .query_row(
