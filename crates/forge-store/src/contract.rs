@@ -620,7 +620,10 @@ pub fn record_contract_run(
             Some(&context.current_operation_id),
             OperationViewInput {
                 request_id: request_id.clone(),
-                command: "contract".to_string(),
+                // Must equal the CLI command string so `command_result`'s pre-flight
+                // replay folds a same-request-id retry to the recorded run WITHOUT
+                // re-executing the agent subprocess (KTD6).
+                command: "contract run".to_string(),
                 kind: "contract_run_recorded".to_string(),
                 view_kind: ViewKind::Initialized,
                 state: json!({

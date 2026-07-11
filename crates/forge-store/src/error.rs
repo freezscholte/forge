@@ -372,6 +372,14 @@ pub enum ForgeError {
     /// Deterministic. `command` is the offending user-authored command, secret-token
     /// redacted in BOTH `details` and `Display` (mirroring `UnsupportedStructuredGate`).
     ContractGrammarViolation { command: String },
+    /// `contract integrate` refused to re-apply a completed run's patch (R27/KTD8):
+    /// the run did not complete with a patch, a dependency is not yet accepted into
+    /// HEAD, or the patch no longer applies (a 3-way merge conflict at the current
+    /// HEAD). Deterministic — accept the named dependency first, or re-run the task
+    /// fresh against the current base. `reason` is a fixed classifier string plus
+    /// opaque ids (run/contract/dependency ids), never a path or agent free text, so
+    /// `details` emits it un-redacted.
+    ContractNotIntegrable { reason: String },
 }
 
 impl ForgeError {
@@ -435,6 +443,7 @@ impl ForgeError {
             ForgeError::ContractGuardRegressed { .. } => "CONTRACT_GUARD_REGRESSED",
             ForgeError::ContractFixFailed { .. } => "CONTRACT_FIX_FAILED",
             ForgeError::ContractGrammarViolation { .. } => "CONTRACT_GRAMMAR_VIOLATION",
+            ForgeError::ContractNotIntegrable { .. } => "CONTRACT_NOT_INTEGRABLE",
         }
     }
 
@@ -698,6 +707,7 @@ impl ForgeError {
             ForgeError::ContractGrammarViolation { command } => {
                 json!({ "command": redact_command_line(command) })
             }
+            ForgeError::ContractNotIntegrable { reason } => json!({ "reason": reason }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -1028,6 +1038,9 @@ impl std::fmt::Display for ForgeError {
                     f,
                     "command `{command}` is outside the reviewed cargo-only acceptance grammar (or carries a shell metacharacter)"
                 )
+            }
+            ForgeError::ContractNotIntegrable { reason } => {
+                write!(f, "contract run is not integrable: {reason}")
             }
         }
     }
@@ -1401,6 +1414,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["command"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_NOT_INTEGRABLE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["reason"],
         },
     ]
 }
@@ -2128,6 +2147,12 @@ mod tests {
                 },
                 "CONTRACT_GRAMMAR_VIOLATION",
             ),
+            (
+                ForgeError::ContractNotIntegrable {
+                    reason: "dependency ccx-a is not accepted into HEAD".into(),
+                },
+                "CONTRACT_NOT_INTEGRABLE",
+            ),
         ];
         for (error, code) in &all {
             assert_eq!(error.code(), *code);
@@ -2367,6 +2392,9 @@ mod tests {
             ForgeError::ContractGrammarViolation {
                 command: "rm -rf".into(),
             },
+            ForgeError::ContractNotIntegrable {
+                reason: "dependency not accepted".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -2426,7 +2454,8 @@ mod tests {
                 | ForgeError::ContractBlastViolation { .. }
                 | ForgeError::ContractGuardRegressed { .. }
                 | ForgeError::ContractFixFailed { .. }
-                | ForgeError::ContractGrammarViolation { .. } => {}
+                | ForgeError::ContractGrammarViolation { .. }
+                | ForgeError::ContractNotIntegrable { .. } => {}
             }
         }
 

@@ -16,6 +16,7 @@ mod attempts;
 mod compare;
 mod conflict;
 mod contract;
+mod contract_run;
 mod doctor;
 mod embargo;
 mod error;
@@ -81,6 +82,11 @@ pub use contract::{
     FreezeContractRevisionInput, OpenContractStopInput, RecordContractRunInput,
     GLOBAL_POLICY_CONTRACT_ID, SUBJECT_KIND_CONTRACT, SUBJECT_KIND_CONTRACT_RUN,
     SUBJECT_KIND_CONTRACT_STOP, SUBJECT_KIND_CONTRACT_VERDICT,
+};
+pub use contract_run::{
+    contract_integration_accepted, contract_integration_intent_text, contract_run_by_ref,
+    open_stops_for_contracts, record_contract_integration, ContractIntegrationRecord,
+    CONTRACT_INTENT_PREFIX,
 };
 pub use doctor::{
     doctor, DoctorReport, LedgerViewFinding, LedgerViewFindingKind, NativeHistoryFinding,

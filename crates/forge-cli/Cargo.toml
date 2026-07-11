@@ -22,6 +22,7 @@ forge-sync = { path = "../forge-sync" }
 regex.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tempfile.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

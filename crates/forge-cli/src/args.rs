@@ -484,6 +484,43 @@ pub(crate) enum ContractCommand {
     Freeze(ContractFreezeArgs),
     /// Emit the byte-stable brief for a frozen contract revision (read-only).
     Brief(ContractBriefArgs),
+    /// Run the agent against a frozen contract (or dependency-ordered chain) in a
+    /// native scratch workspace, recording the run and halting on `UNKNOWN.md`.
+    Run(ContractRunArgs),
+    /// Re-apply a completed run's patch onto the current HEAD as a linked attempt.
+    Integrate(ContractIntegrateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractRunArgs {
+    /// The frozen contract id(s) to run. Multiple ids require `--chain`; they are
+    /// topologically ordered by `depends_on` before execution.
+    #[arg(required = true)]
+    pub(crate) contract_ids: Vec<String>,
+    /// Permit multiple contract ids (a dependency-ordered chain).
+    #[arg(long)]
+    pub(crate) chain: bool,
+    /// The opaque agent command executed once per task via `sh -c` in the scratch
+    /// workspace. Explicit-flag-only in v1: there is NO repo-config fallback (a
+    /// repo-shipped command source is a supply-chain surface).
+    #[arg(long)]
+    pub(crate) agent_cmd: String,
+    /// Per-id acknowledgement of an out-of-chain dependency: `--dep <id>=<run-or-task-id>`.
+    /// Each out-of-chain `depends_on` id must be named exactly once (R20).
+    #[arg(long = "dep")]
+    pub(crate) dep: Vec<String>,
+    /// Resume a halted run from its halted task instead of starting fresh (KTD9).
+    #[arg(long)]
+    pub(crate) resume: Option<String>,
+    /// Force a fresh full-chain run even when a halted run could be resumed.
+    #[arg(long)]
+    pub(crate) fresh: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractIntegrateArgs {
+    /// A completed run id or a completed task id to integrate onto HEAD.
+    pub(crate) target: String,
 }
 
 #[derive(Debug, Args)]

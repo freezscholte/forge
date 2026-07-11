@@ -300,7 +300,7 @@ Dependencies: U3.
 
 Files: crates/forge-cli/src/commands/contract.rs, crates/forge-store/src/contract.rs.
 
-Approach: Implement brief emission as a pure function of the frozen revision, its declared neighbors, and the global policy, prepending global policy and appending the verbatim task-instruction stop wording. Compare byte-for-byte against tools/ccx/ccx-brief.py output for shared fixture inputs.
+Approach: Implement brief emission as a pure function of the frozen revision, its declared neighbors, and the global policy, prepending global policy. The verbatim task-instruction stop wording is not part of the brief bytes (matching ccx-brief.py, which leaves it to run-time prompt assembly) — it ships as a single drift-proof constant that U5's run prompt appends, satisfying R6 at emission-into-the-agent-prompt time. Compare byte-for-byte against tools/ccx/ccx-brief.py output for shared fixture inputs.
 
 Patterns to follow: tools/ccx/ccx-brief.py (ordering and byte-stability).
 

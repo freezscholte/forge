@@ -26,14 +26,24 @@
 //! the native surface is repo-scoped.
 
 use anyhow::{anyhow, Context, Result};
+use forge_content_native::{
+    diff_native_content_refs, materialize_content_ref, merge_native_content_refs,
+    snapshot_worktree_into_store_excluding, DiffOptions, NativeObjectStore,
+};
 use forge_protocol::ResponseEnvelope;
+use forge_store::{
+    ContractIntegrationRecord, ContractRunTaskInput, OpenContractStopInput, RecordContractRunInput,
+};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::{
-    command_result, ContractArgs, ContractBriefArgs, ContractCommand, ContractFreezeArgs,
-    ContractLintArgs, ForgeError,
+    command_result, current_base, owner_base_content_ref, ContractArgs, ContractBriefArgs,
+    ContractCommand, ContractFreezeArgs, ContractIntegrateArgs, ContractLintArgs, ContractRunArgs,
+    ForgeError,
 };
 
 /// Reserved ledger contract id for the repo-level global policy file. Shared with
@@ -47,10 +57,9 @@ const GLOBAL_POLICY_ID: &str = forge_store::GLOBAL_POLICY_CONTRACT_ID;
 /// appending it, and U5's prompt assembly appends this constant verbatim instead.
 /// `include_str!` guarantees the wording can never drift from the harness file;
 /// when the R21 retirement criterion is met and `tools/ccx` is removed, inline the
-/// literal here. Exposed for U5, which is the first non-test consumer — until that
-/// slice lands the constant is referenced only by its parity unit test, so the
-/// dead-code allow is scoped and documented rather than silencing a real warning.
-#[allow(dead_code)]
+/// literal here. U5's prompt assembly (`assemble_prompt`) appends it verbatim after
+/// the store-emitted brief — the first non-test consumer, so the previous
+/// `dead_code` allow is removed.
 pub(crate) const CONTRACT_TASK_INSTRUCTION: &str =
     include_str!("../../../../tools/ccx/prompts/task-instruction.txt");
 
@@ -147,6 +156,8 @@ pub(crate) fn contract_response(
         ContractCommand::Lint(args) => lint_response(request_id, args),
         ContractCommand::Freeze(args) => freeze_response(request_id, args),
         ContractCommand::Brief(args) => brief_response(request_id, args),
+        ContractCommand::Run(args) => run_response(request_id, args),
+        ContractCommand::Integrate(args) => integrate_response(request_id, args),
     }
 }
 
@@ -162,13 +173,21 @@ fn brief_response(request_id: Option<String>, args: ContractBriefArgs) -> Respon
         let record = forge_store::contract_brief(&cwd, &args.contract_id, args.revision)?;
         let out_written = match &args.out {
             Some(raw) => {
-                // Canonicalize the write target at the boundary (R19). The file may
-                // not exist yet, so resolve relative paths against cwd rather than
-                // requiring existence.
-                let path = if raw.is_absolute() {
+                // Resolve (not canonicalize) the write target: the file may not
+                // exist yet, so canonicalize the parent directory when it exists
+                // and rejoin the filename; otherwise fall back to cwd-joining.
+                // Full R19 canonicalization applies to read operands elsewhere.
+                let joined = if raw.is_absolute() {
                     raw.clone()
                 } else {
                     cwd.join(raw)
+                };
+                let path = match (joined.parent(), joined.file_name()) {
+                    (Some(parent), Some(name)) if parent.exists() => parent
+                        .canonicalize()
+                        .map(|p| p.join(name))
+                        .unwrap_or(joined.clone()),
+                    _ => joined.clone(),
                 };
                 std::fs::write(&path, record.brief.as_bytes())
                     .with_context(|| format!("cannot write brief to {}", path.display()))?;
@@ -1384,6 +1403,743 @@ fn inside_allowed(rel_path: &str, allow_globs: &[String]) -> bool {
     allow_globs
         .iter()
         .any(|g| rel_path == g || glob_match(rel_path, g))
+}
+
+// ===========================================================================
+// U5: `forge contract run` and `forge contract integrate`
+// ===========================================================================
+//
+// The runner ports `tools/ccx/run-task.sh` onto native primitives (KTD7): a
+// per-run scratch workspace materialized from the base tree (never the user
+// worktree, so `DIRTY_WORKTREE` cannot apply to it), the acknowledged dependency
+// stack applied on top per-id (R20), a fresh opaque agent subprocess per task, and
+// halt-on-`UNKNOWN.md` (R8). The agent's patch is a native tree diff of the
+// post-run workspace against the post-dependency-application baseline (KTD7's
+// misattribution guard), never against the raw base.
+//
+// The agent command is taken ONLY from the explicit `--agent-cmd` flag — there is
+// no repo-config fallback in v1 (a repo-shipped command source is a supply-chain
+// surface, Scope Boundaries). It is executed via `sh -c "<cmd>"`: the flag is
+// explicit operator input (not repo-derived), and `sh -c` preserves the harness's
+// `AGENT_CMD` shell semantics (run-task.sh L105, `bash -c "$AGENT_CMD"`) so a
+// ported command string behaves identically. No retries, auth, or supervision.
+
+/// The agent-facing stop file, at the scratch workspace root (R8/R26).
+const UNKNOWN_FILE: &str = "UNKNOWN.md";
+
+/// One task in a resolved, topologically-ordered run plan (KTD-run ordering).
+#[derive(Debug, Clone)]
+struct PlannedTask {
+    contract_id: String,
+    revision: i64,
+    depends_on: Vec<String>,
+}
+
+impl PlannedTask {
+    /// The per-run task id: the contract id itself, unique within a chain (so the
+    /// `contract_run_tasks` UNIQUE(run_id, task_id) holds) and stable for KTD9 resume.
+    fn task_id(&self) -> String {
+        self.contract_id.clone()
+    }
+}
+
+/// Parse a frozen revision's `depends_on:` id list, mirroring the neighbor parser.
+fn parse_depends_on(source_yaml: &str) -> Result<Vec<String>> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(source_yaml)
+        .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
+    let Some(map) = parsed.as_mapping() else {
+        return Ok(Vec::new());
+    };
+    match map.get(serde_yaml::Value::from("depends_on")) {
+        None | Some(serde_yaml::Value::Null) => Ok(Vec::new()),
+        Some(serde_yaml::Value::Sequence(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(id) => ids.push(id.to_string()),
+                    None => return Err(anyhow!("depends_on: must be a list of ids")),
+                }
+            }
+            Ok(ids)
+        }
+        Some(_) => Err(anyhow!("depends_on: must be a list of ids")),
+    }
+}
+
+/// Resolve the requested contract ids to frozen revisions, enforce per-id
+/// out-of-chain dependency acknowledgement (R20 — no silent count guard), and
+/// return the Kahn topological order plus the `dep_id -> run/task ref` ack map.
+fn resolve_run_plan(
+    cwd: &Path,
+    args: &ContractRunArgs,
+) -> Result<(Vec<PlannedTask>, BTreeMap<String, String>)> {
+    let mut ack: BTreeMap<String, String> = BTreeMap::new();
+    for spec in &args.dep {
+        let (id, reference) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--dep must be <id>=<run-or-task-id>: {spec:?}"))?;
+        ack.insert(id.to_string(), reference.to_string());
+    }
+
+    let mut info: BTreeMap<String, (i64, Vec<String>)> = BTreeMap::new();
+    let mut order_in: Vec<String> = Vec::new();
+    for id in &args.contract_ids {
+        let revision = forge_store::latest_contract_revision(cwd, id)?
+            .filter(|record| record.state == "frozen" && record.lint_clean)
+            .ok_or_else(|| ForgeError::ContractNotFrozen {
+                contract_id: id.clone(),
+                revision: 0,
+            })?;
+        let deps = parse_depends_on(&revision.source_yaml)?;
+        if info.insert(id.clone(), (revision.revision, deps)).is_some() {
+            return Err(anyhow!("duplicate contract id in chain: {id}"));
+        }
+        order_in.push(id.clone());
+    }
+    if order_in.len() > 1 && !args.chain {
+        return Err(anyhow!("multiple contracts require --chain"));
+    }
+
+    let in_set: BTreeSet<String> = info.keys().cloned().collect();
+
+    // Every out-of-chain dependency must be acknowledged by its own --dep (R20).
+    let mut missing_ack: Vec<String> = Vec::new();
+    for (_rev, deps) in info.values() {
+        for dep in deps {
+            if !in_set.contains(dep) && !ack.contains_key(dep) && !missing_ack.contains(dep) {
+                missing_ack.push(dep.clone());
+            }
+        }
+    }
+    if !missing_ack.is_empty() {
+        missing_ack.sort();
+        return Err(anyhow!(
+            "chain refusal: out-of-chain dependencies not acknowledged by --dep: {}. Supply one --dep <id>=<run-or-task-id> per missing dependency",
+            missing_ack.join(", ")
+        ));
+    }
+
+    // An --dep that names something that is not an out-of-chain dependency is a
+    // mismatch (R20: name exactly which dependency each patch satisfies).
+    let all_deps: BTreeSet<String> = info
+        .values()
+        .flat_map(|(_rev, deps)| deps.iter().cloned())
+        .collect();
+    let mut stray: Vec<String> = ack
+        .keys()
+        .filter(|id| !all_deps.contains(*id) || in_set.contains(*id))
+        .cloned()
+        .collect();
+    if !stray.is_empty() {
+        stray.sort();
+        return Err(anyhow!(
+            "chain refusal: --dep names id(s) that are not out-of-chain dependencies: {}",
+            stray.join(", ")
+        ));
+    }
+
+    // Kahn topological order, stable on the given contract order.
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    let mut topo: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = order_in;
+    while !pending.is_empty() {
+        let mut rest = Vec::new();
+        for id in &pending {
+            let ready = info[id]
+                .1
+                .iter()
+                .filter(|dep| in_set.contains(*dep))
+                .all(|dep| placed.contains(dep));
+            if ready {
+                placed.insert(id.clone());
+                topo.push(id.clone());
+            } else {
+                rest.push(id.clone());
+            }
+        }
+        if rest.len() == pending.len() {
+            return Err(anyhow!(
+                "depends_on cycle among chain contracts: {}",
+                rest.join(", ")
+            ));
+        }
+        pending = rest;
+    }
+
+    let plan = topo
+        .into_iter()
+        .map(|id| {
+            let (revision, depends_on) = info[&id].clone();
+            PlannedTask {
+                contract_id: id,
+                revision,
+                depends_on,
+            }
+        })
+        .collect();
+    Ok((plan, ack))
+}
+
+/// Append the verbatim task-instruction stop wording to the store-emitted brief
+/// (R6). `ccx-brief.py` does not emit it; `run-task.sh` `cat`s it on at run time —
+/// so appending here reproduces the harness prompt exactly.
+fn assemble_prompt(brief: &str) -> String {
+    format!("{brief}{CONTRACT_TASK_INSTRUCTION}")
+}
+
+/// Execute the opaque agent command once via `sh -c` in `workspace`, feeding the
+/// prompt on stdin and capturing only the exit status (R7). No retries or
+/// supervision. Agent stdout/stderr is discarded in v1 (the run's captured
+/// artifact is the produced patch, not the agent's chatter).
+fn run_agent(agent_cmd: &str, workspace: &Path, prompt: &str) -> Result<i32> {
+    let mut child = ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(agent_cmd)
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot spawn agent command via sh -c: {agent_cmd:?}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Best-effort: a command that ignores stdin may close the pipe early.
+        let _ = stdin.write_all(prompt.as_bytes());
+        // `stdin` drops here, closing the pipe so a reader sees EOF before wait().
+    }
+    let status = child.wait().context("agent subprocess wait failed")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// The four required stop fields (R8). A best-effort labelled parse: `What:`,
+/// `Why:`, `Kind:`, `Evidence:` (case-insensitive, split on the first colon). A
+/// stop is `malformed` when any field is missing or `kind` is out of the
+/// blocking/assumption/observation vocabulary — but it still opens (fail-closed).
+/// A wholly unlabelled file keeps its raw text as `what_needed` for triage context.
+#[allow(clippy::type_complexity)]
+fn parse_unknown_fields(
+    text: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+) {
+    let (mut what, mut why, mut kind, mut evidence) = (None, None, None, None);
+    for line in text.lines() {
+        let Some((label, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let value = rest.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match label.trim().to_lowercase().as_str() {
+            "what" | "what is needed" | "what needed" | "need" => what = Some(value),
+            "why" => why = Some(value),
+            "kind" => kind = Some(value),
+            "evidence" | "file" => evidence = Some(value),
+            _ => {}
+        }
+    }
+    let kind_ok = kind
+        .as_deref()
+        .map(|k| matches!(k, "blocking" | "assumption" | "observation"))
+        .unwrap_or(false);
+    let malformed =
+        what.is_none() || why.is_none() || kind.is_none() || evidence.is_none() || !kind_ok;
+    if what.is_none() && why.is_none() && kind.is_none() && evidence.is_none() {
+        // Wholly unlabelled: preserve the raw text so a triager can reconstruct.
+        let raw = text.trim();
+        if !raw.is_empty() {
+            what = Some(raw.to_string());
+        }
+    }
+    (what, why, kind, evidence, malformed)
+}
+
+/// Build the run-record input, folding the per-task completion states plus the
+/// integrate-time reconstruction context (baseline ref, base commit, ack map) into
+/// `dependency_stack_json` (R7/KTD8/KTD9).
+#[allow(clippy::too_many_arguments)]
+fn build_run_input(
+    target: &PlannedTask,
+    base_commit: &str,
+    baseline_ref: &Option<String>,
+    ack: &BTreeMap<String, String>,
+    outcome: &str,
+    exit_code: i64,
+    agent_exit: Option<i64>,
+    patch_ref: Option<String>,
+    task_states: &[(String, String, Option<String>, Option<i64>)],
+) -> RecordContractRunInput {
+    let dependency_stack_json = json!({
+        "baseline_ref": baseline_ref,
+        "base_commit": base_commit,
+        "acknowledged": ack,
+    })
+    .to_string();
+    RecordContractRunInput {
+        contract_id: target.contract_id.clone(),
+        revision: target.revision,
+        base_head: Some(base_commit.to_string()),
+        dependency_stack_json: Some(dependency_stack_json),
+        outcome: outcome.to_string(),
+        exit_code,
+        agent_exit_code: agent_exit,
+        patch_content_ref: patch_ref,
+        tasks: task_states
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (task_id, outcome, patch, agent))| ContractRunTaskInput {
+                    task_id: task_id.clone(),
+                    task_index: index as i64,
+                    outcome: outcome.clone(),
+                    patch_content_ref: patch.clone(),
+                    agent_exit_code: *agent,
+                },
+            )
+            .collect(),
+    }
+}
+
+/// Append `skipped` task rows for every plan task after `stopped_index` (dependents
+/// do not execute past a halt or failure, R8/R11).
+fn fill_skipped(
+    task_states: &mut Vec<(String, String, Option<String>, Option<i64>)>,
+    plan: &[PlannedTask],
+    stopped_index: usize,
+) {
+    for task in &plan[stopped_index + 1..] {
+        task_states.push((task.task_id(), "skipped".to_string(), None, None));
+    }
+}
+
+/// `forge contract run` — materialize a scratch base, run the agent per task in
+/// dependency order, and record the run fail-closed. Envelope status is always
+/// SUCCESS (the run recorded its outcome); the outcome discriminator and the
+/// harness exit code (0/1/2/3) travel in `data` (R14/R25), mapped to the process
+/// exit by `main`. Preflight refusals (open stop, stale UNKNOWN, not-frozen,
+/// unacknowledged dep) are typed errors — no agent session started.
+fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEnvelope {
+    command_result("contract run", request_id, move |cwd, request_id| {
+        let repo_root = forge_store::repository_root_path(&cwd)?;
+        let (plan, ack) = resolve_run_plan(&cwd, &args)?;
+
+        // Leg 3 (R10/AE2/AE9): refuse if any chain contract OR acknowledged
+        // dependency has an open stop, naming the blocking stop ids. No agent runs.
+        let mut closure_ids: Vec<String> =
+            plan.iter().map(|task| task.contract_id.clone()).collect();
+        closure_ids.extend(ack.keys().cloned());
+        let open = forge_store::open_stops_for_contracts(&cwd, &closure_ids)?;
+        if !open.is_empty() {
+            let stop_ids = open.into_iter().map(|stop| stop.stop_id).collect();
+            return Err(ForgeError::ContractOpenStop { stop_ids }.into());
+        }
+
+        // R26/AE10: a stale UNKNOWN.md at the operator-visible workspace root refuses
+        // before any agent session or stop record, so it cannot be attributed to the
+        // wrong run.
+        if cwd.join(UNKNOWN_FILE).exists() || repo_root.join(UNKNOWN_FILE).exists() {
+            return Err(ForgeError::StaleUnknownFile.into());
+        }
+
+        let target = plan
+            .last()
+            .expect("resolve_run_plan yields a non-empty plan")
+            .clone();
+        let base_commit = current_base(&cwd)?;
+        let base_tree_ref = owner_base_content_ref(&cwd, &base_commit)?;
+        let store = NativeObjectStore::new(&repo_root);
+        let excluded = [UNKNOWN_FILE.to_string()];
+
+        // KTD9: a rerun of a halted chain resumes from the halted task, replaying the
+        // prior run's recorded per-task completed outputs instead of re-executing
+        // their agents. `--fresh` forces a full re-run. Resume refuses when the
+        // recorded state no longer applies (base moved, or a recorded patch object is
+        // gone) — fresh-run guidance travels in the refusal message.
+        let mut resume_outputs: BTreeMap<String, String> = BTreeMap::new();
+        if let (Some(resume_id), false) = (&args.resume, args.fresh) {
+            let prior = forge_store::contract_run_by_ref(&cwd, resume_id)?
+                .ok_or_else(|| anyhow!("no recorded run to resume for {resume_id:?}"))?;
+            if prior.base_head.as_deref() != Some(base_commit.as_str()) {
+                return Err(ForgeError::ContractNotIntegrable {
+                    reason: format!(
+                        "resume refused: run {} was recorded against base {}, but the current base is {}. Run fresh (omit --resume or pass --fresh)",
+                        prior.run_id,
+                        prior.base_head.as_deref().unwrap_or("<none>"),
+                        base_commit
+                    ),
+                }
+                .into());
+            }
+            for prior_task in &prior.tasks {
+                if prior_task.outcome != "completed" {
+                    continue;
+                }
+                let Some(patch_ref) = prior_task.patch_content_ref.as_deref() else {
+                    continue;
+                };
+                if store.verify_content_ref(patch_ref).is_err() {
+                    return Err(ForgeError::ContractNotIntegrable {
+                        reason: format!(
+                            "resume refused: recorded patch for completed task {} no longer applies (content object unavailable). Run fresh (omit --resume or pass --fresh)",
+                            prior_task.task_id
+                        ),
+                    }
+                    .into());
+                }
+                resume_outputs.insert(prior_task.task_id.clone(), patch_ref.to_string());
+            }
+        }
+
+        let mut completed_outputs: BTreeMap<String, String> = BTreeMap::new();
+        let mut task_states: Vec<(String, String, Option<String>, Option<i64>)> = Vec::new();
+        let mut final_baseline: Option<String> = None;
+
+        for (index, task) in plan.iter().enumerate() {
+            // KTD9 resume: a task the prior run completed is replayed from its
+            // recorded output — no agent session.
+            if let Some(prev) = resume_outputs.get(&task.task_id()) {
+                completed_outputs.insert(task.contract_id.clone(), prev.clone());
+                task_states.push((
+                    task.task_id(),
+                    "completed".to_string(),
+                    Some(prev.clone()),
+                    None,
+                ));
+                continue;
+            }
+            // KTD7: materialize the base into a fresh scratch workspace, then overlay
+            // each dependency's produced tree on top per-id (never the user worktree).
+            let scratch = tempfile::tempdir().context("create scratch workspace")?;
+            materialize_content_ref(&repo_root, scratch.path(), &base_tree_ref)?;
+            for dep in &task.depends_on {
+                let dep_ref = if let Some(reference) = completed_outputs.get(dep) {
+                    reference.clone()
+                } else {
+                    let ack_ref = ack
+                        .get(dep)
+                        .ok_or_else(|| anyhow!("internal: dependency {dep} not acknowledged"))?;
+                    forge_store::contract_run_by_ref(&cwd, ack_ref)?
+                        .and_then(|run| run.patch_content_ref)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "acknowledged dependency {dep} ({ack_ref}) has no completed patch"
+                            )
+                        })?
+                };
+                materialize_content_ref(&repo_root, scratch.path(), &dep_ref)?;
+            }
+            // The diff baseline is (base + dep patches), NOT the raw base (KTD7).
+            let baseline =
+                snapshot_worktree_into_store_excluding(&repo_root, scratch.path(), &excluded)?
+                    .content_ref;
+
+            let brief = forge_store::contract_brief(&cwd, &task.contract_id, Some(task.revision))?;
+            let prompt = assemble_prompt(&brief.brief);
+            let agent_exit = run_agent(&args.agent_cmd, scratch.path(), &prompt)?;
+
+            // Halt-on-unknown (R8): fail-closed ingest into a signed stop, halt, exit 2.
+            if scratch.path().join(UNKNOWN_FILE).exists() {
+                let raw =
+                    std::fs::read_to_string(scratch.path().join(UNKNOWN_FILE)).unwrap_or_default();
+                let (what, why, kind, evidence, malformed) = parse_unknown_fields(&raw);
+                task_states.push((
+                    task.task_id(),
+                    "stopped".to_string(),
+                    None,
+                    Some(i64::from(agent_exit)),
+                ));
+                fill_skipped(&mut task_states, &plan, index);
+                let run = forge_store::record_contract_run(
+                    &cwd,
+                    request_id.clone(),
+                    build_run_input(
+                        &target,
+                        &base_commit,
+                        &final_baseline,
+                        &ack,
+                        "stopped",
+                        2,
+                        Some(i64::from(agent_exit)),
+                        None,
+                        &task_states,
+                    ),
+                )?;
+                let stop = forge_store::open_contract_stop(
+                    &cwd,
+                    None,
+                    OpenContractStopInput {
+                        contract_id: task.contract_id.clone(),
+                        revision: task.revision,
+                        run_id: Some(run.run_id.clone()),
+                        task_id: Some(task.task_id()),
+                        what_needed: what,
+                        why_unanswered: why,
+                        kind,
+                        evidence,
+                        malformed,
+                    },
+                )?;
+                let mut data = json!({
+                    "outcome": "stopped",
+                    "exit_code": 2,
+                    "run_id": run.run_id,
+                    "stop_id": stop.stop_id,
+                    "malformed": stop.malformed,
+                    "contract_id": task.contract_id,
+                    "revision": task.revision,
+                });
+                if stop.malformed {
+                    // R25: a malformed ingest surfaces a distinct typed code.
+                    data["code"] = json!("CONTRACT_STOP_MALFORMED");
+                }
+                return Ok((Some(run.run_id), data, Vec::new()));
+            }
+
+            // Crashed/unauthenticated agent (R11/AE5): nonzero exit, no UNKNOWN.md.
+            if agent_exit != 0 {
+                task_states.push((
+                    task.task_id(),
+                    "failed".to_string(),
+                    None,
+                    Some(i64::from(agent_exit)),
+                ));
+                fill_skipped(&mut task_states, &plan, index);
+                let run = forge_store::record_contract_run(
+                    &cwd,
+                    request_id,
+                    build_run_input(
+                        &target,
+                        &base_commit,
+                        &final_baseline,
+                        &ack,
+                        "failed",
+                        1,
+                        Some(i64::from(agent_exit)),
+                        None,
+                        &task_states,
+                    ),
+                )?;
+                let data = json!({
+                    "outcome": "failed",
+                    "exit_code": 1,
+                    "run_id": run.run_id,
+                    "reason": "agent exited nonzero without filing UNKNOWN.md",
+                    "agent_exit_code": agent_exit,
+                });
+                return Ok((Some(run.run_id), data, Vec::new()));
+            }
+
+            // The agent patch is the tree diff of post-run vs the baseline (KTD7).
+            let post =
+                snapshot_worktree_into_store_excluding(&repo_root, scratch.path(), &excluded)?
+                    .content_ref;
+            let diff = diff_native_content_refs(&store, &baseline, &post, &DiffOptions::default())?;
+            if diff.files.is_empty() {
+                // Empty patch never passes as success (R11/AE8): failed, exit 1.
+                task_states.push((task.task_id(), "failed".to_string(), None, Some(0)));
+                fill_skipped(&mut task_states, &plan, index);
+                let run = forge_store::record_contract_run(
+                    &cwd,
+                    request_id,
+                    build_run_input(
+                        &target,
+                        &base_commit,
+                        &final_baseline,
+                        &ack,
+                        "failed",
+                        1,
+                        Some(0),
+                        None,
+                        &task_states,
+                    ),
+                )?;
+                let data = json!({
+                    "outcome": "failed",
+                    "exit_code": 1,
+                    "run_id": run.run_id,
+                    "reason": "agent produced an empty patch (zero-delta diff)",
+                });
+                return Ok((Some(run.run_id), data, Vec::new()));
+            }
+
+            // U6 BLAST POSTFLIGHT SEAM: the blast-radius check of `diff`/`post` against
+            // the contract's exclusion_contract and the non-weakenable default-forbid
+            // list (`.forge/**`, env files, key/credential paths) lands in U6 — it
+            // records a blast verdict against the run and exits 3 on violation
+            // (R12/AE7). NOT implemented in U5: a completed patch is accepted here
+            // without blast enforcement. Do not remove this seam without U6.
+
+            completed_outputs.insert(task.contract_id.clone(), post.clone());
+            final_baseline = Some(baseline);
+            task_states.push((task.task_id(), "completed".to_string(), Some(post), Some(0)));
+        }
+
+        // Every task completed (exit 0). The run's patch is the target task's produced
+        // tree, GC-rooted via the contract_runs patch_content_ref walk (gc.rs, KTD3).
+        let final_post = completed_outputs.get(&target.contract_id).cloned();
+        let run = forge_store::record_contract_run(
+            &cwd,
+            request_id,
+            build_run_input(
+                &target,
+                &base_commit,
+                &final_baseline,
+                &ack,
+                "completed",
+                0,
+                Some(0),
+                final_post.clone(),
+                &task_states,
+            ),
+        )?;
+        let data = json!({
+            "outcome": "completed",
+            "exit_code": 0,
+            "run_id": run.run_id,
+            "contract_id": target.contract_id,
+            "revision": target.revision,
+            "patch_content_ref": final_post,
+        });
+        Ok((Some(run.run_id), data, Vec::new()))
+    })
+}
+
+/// `forge contract integrate <run-or-task-id>` — re-apply a completed run's patch
+/// onto the current HEAD as a linked attempt (R27/KTD8). Only when the task's
+/// dependencies are accepted into HEAD; a patch that no longer applies (3-way merge
+/// conflict) or an incomplete run is a typed `CONTRACT_NOT_INTEGRABLE` refusal.
+fn integrate_response(request_id: Option<String>, args: ContractIntegrateArgs) -> ResponseEnvelope {
+    command_result("contract integrate", request_id, move |cwd, request_id| {
+        let repo_root = forge_store::repository_root_path(&cwd)?;
+        let run = forge_store::contract_run_by_ref(&cwd, &args.target)?.ok_or_else(|| {
+            ForgeError::ContractNotIntegrable {
+                reason: format!("no run found for {:?}", args.target),
+            }
+        })?;
+        if run.outcome != "completed" {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "run {} did not complete (outcome {})",
+                    run.run_id, run.outcome
+                ),
+            }
+            .into());
+        }
+        let post_ref =
+            run.patch_content_ref
+                .clone()
+                .ok_or_else(|| ForgeError::ContractNotIntegrable {
+                    reason: format!("run {} has no produced patch", run.run_id),
+                })?;
+
+        // Deps gate (KTD8): every declared dependency must be accepted into HEAD.
+        let revision = forge_store::contract_revision(&cwd, &run.contract_id, run.revision)?
+            .ok_or_else(|| ForgeError::ContractNotFrozen {
+                contract_id: run.contract_id.clone(),
+                revision: run.revision,
+            })?;
+        for dep in parse_depends_on(&revision.source_yaml)? {
+            if !forge_store::contract_integration_accepted(&cwd, &dep)? {
+                return Err(ForgeError::ContractNotIntegrable {
+                    reason: format!("dependency {dep} is not accepted into HEAD"),
+                }
+                .into());
+            }
+        }
+
+        // The 3-way merge base is the recorded post-dependency baseline (KTD7/KTD8),
+        // so dependency changes are never re-attributed to the agent's patch.
+        let baseline_ref: String =
+            serde_json::from_str::<Value>(run.dependency_stack_json.as_deref().unwrap_or("{}"))
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("baseline_ref")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| ForgeError::ContractNotIntegrable {
+                    reason: format!(
+                        "run {} has no recorded baseline for reconstruction",
+                        run.run_id
+                    ),
+                })?;
+
+        // Integrate materializes into an ISOLATED new attempt workspace (like
+        // `attempt start`), never the user's main worktree — so the DIRTY_WORKTREE
+        // guard (which snapshots the effective worktree and requires an active
+        // attempt) does not apply here (KTD7's scratch-workspace rationale). accept's
+        // HEAD == base_head STALE_BASE invariant remains the HEAD guard (KTD8): the
+        // attempt is created on the actual current HEAD below.
+        let head_commit = current_base(&cwd)?;
+        let head_tree = owner_base_content_ref(&cwd, &head_commit)?;
+
+        // Re-apply as a 3-way merge (base=baseline, ours=patch, theirs=HEAD). A
+        // conflict is a typed refusal — never a silent merge (KTD8).
+        let store = NativeObjectStore::new(&repo_root);
+        let merge = merge_native_content_refs(&store, &baseline_ref, &post_ref, &head_tree)?;
+        if !merge.is_clean() {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "patch no longer applies onto HEAD: {} conflicting path(s). Re-run the task fresh against the current base",
+                    merge.conflicts.len()
+                ),
+            }
+            .into());
+        }
+        let merged_ref =
+            merge
+                .merged_content_ref
+                .ok_or_else(|| ForgeError::ContractNotIntegrable {
+                    reason: "clean merge produced no content ref".to_string(),
+                })?;
+
+        // Create the attempt on the actual HEAD via the existing lifecycle. The
+        // synthesized intent encodes contract id@rev + task so a later deps-gate can
+        // recognize an accepted integration (KTD8). request_id anchors the integrate
+        // op (below), so start_attempt runs unkeyed.
+        let task_id = run
+            .tasks
+            .last()
+            .map(|task| task.task_id.clone())
+            .unwrap_or_else(|| run.contract_id.clone());
+        let intent_text =
+            forge_store::contract_integration_intent_text(&run.contract_id, run.revision, &task_id);
+        let started =
+            forge_store::start_attempt(&cwd, None, intent_text, head_commit.clone(), None)?;
+        // Materialize the merged tree into the attempt's workspace and record it.
+        materialize_content_ref(&repo_root, Path::new(&started.workspace_path), &merged_ref)?;
+        forge_store::record_attempt_workspace_materialized(&cwd, &started.attempt_id, &merged_ref)?;
+
+        let link = forge_store::record_contract_integration(
+            &cwd,
+            request_id,
+            ContractIntegrationRecord {
+                run_id: run.run_id.clone(),
+                contract_id: run.contract_id.clone(),
+                revision: run.revision,
+                task_id,
+                attempt_id: started.attempt_id.clone(),
+                intent_id: started.intent_id.clone(),
+            },
+        )?;
+
+        let data = json!({
+            "run_id": link.run_id,
+            "contract_id": link.contract_id,
+            "revision": link.revision,
+            "task_id": link.task_id,
+            "attempt_id": link.attempt_id,
+            "intent_id": link.intent_id,
+            "base_head": head_commit,
+            "content_ref": merged_ref,
+        });
+        Ok((Some(started.operation_id), data, Vec::new()))
+    })
 }
 
 #[cfg(test)]

@@ -570,3 +570,455 @@ fn brief_matches_live_python_emitter() {
         "native brief must match the live ccx-brief.py emitter byte-for-byte"
     );
 }
+
+// ===========================================================================
+// U5: `forge contract run` + `forge contract integrate`
+// ===========================================================================
+
+/// The `<name>.yaml` file name a `ccx-<name>` id requires (lint R1 correspondence).
+fn contract_file_name(id: &str) -> String {
+    format!("{}.yaml", id.strip_prefix("ccx-").unwrap_or(id))
+}
+
+/// A lint-clean v1 task contract for `id`, optionally declaring `depends_on`.
+fn contract_yaml(id: &str, depends_on: &[&str]) -> String {
+    let mut yaml = format!(
+        "schema: ccx.contract.v1\n\
+id: {id}\n\
+revision: 1\n\
+ticket: NER-999\n\
+task: Do a small thing\n\
+interface: Build the thing in the module.\n\
+acceptance:\n  fix:\n    - cargo test -p forge-core\n\
+allowed_changes:\n  paths: [crates/forge-core/src/lib.rs]\n\
+authority: {{source: human, confidence: high, reviewer: test}}\n"
+    );
+    if !depends_on.is_empty() {
+        yaml.push_str("depends_on:\n");
+        for dep in depends_on {
+            yaml.push_str(&format!("  - {dep}\n"));
+        }
+    }
+    yaml
+}
+
+/// Install `id`'s YAML on disk (so lint can resolve it as a neighbor/dependency).
+fn install_contract(repo: &TestRepo, id: &str, depends_on: &[&str]) {
+    write(
+        repo,
+        &format!("contracts/{}", contract_file_name(id)),
+        &contract_yaml(id, depends_on),
+    );
+}
+
+/// Install then freeze `id` (dependencies must already be installed on disk).
+fn freeze_contract(repo: &TestRepo, id: &str, depends_on: &[&str]) {
+    install_contract(repo, id, depends_on);
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "freeze",
+            &format!("contracts/{}", contract_file_name(id)),
+        ])
+        .assert()
+        .success();
+}
+
+/// Freeze the reserved global policy so `contract run`'s brief emission succeeds.
+fn freeze_global_policy(repo: &TestRepo) {
+    let policy = "schema: ccx.contract.v1\nkind: global_policy\nrules:\n  - anyhow throughout.\n";
+    write(repo, "contracts/_global-policy.yaml", policy);
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "freeze",
+            "contracts/_global-policy.yaml",
+        ])
+        .assert()
+        .success();
+}
+
+/// A native repo with a frozen global policy — the run precondition.
+fn run_repo() -> TestRepo {
+    let repo = init_repo();
+    freeze_global_policy(&repo);
+    repo
+}
+
+/// Run `contract run` over `ids`, asserting the process exit code, and return the
+/// `--json` envelope. A stop pairs exit 2 with envelope status success (R25).
+fn contract_run(repo: &TestRepo, ids: &[&str], agent_cmd: &str, expect_exit: i32) -> Value {
+    let mut args: Vec<String> = vec!["--json".into(), "contract".into(), "run".into()];
+    for id in ids {
+        args.push((*id).to_string());
+    }
+    if ids.len() > 1 {
+        args.push("--chain".into());
+    }
+    args.push("--agent-cmd".into());
+    args.push(agent_cmd.to_string());
+    json_output(repo.forge().args(&args).assert().code(expect_exit))
+}
+
+/// A fake agent (executed via `sh -c` in the scratch workspace) that files a
+/// well-formed four-field UNKNOWN.md stop.
+const STOP_AGENT: &str =
+    "printf 'What: need the shape\\nWhy: brief omits it\\nKind: blocking\\nEvidence: src/lib.rs:1\\n' > UNKNOWN.md";
+
+/// A fake agent that produces a real (non-empty) patch by APPENDING to a file, so
+/// each task in a chain adds a distinct delta over its (base + deps) baseline.
+const EDIT_AGENT: &str = "echo change >> out.txt";
+
+fn stop_count(repo: &TestRepo) -> i64 {
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    conn.query_row("SELECT COUNT(*) FROM contract_stops", [], |row| row.get(0))
+        .expect("count stops")
+}
+
+#[test]
+fn contract_run_two_task_chain_stop_halts_exit_2() {
+    // Covers AE1 (R8/R9/R14/R25): task 1 files UNKNOWN.md → exit 2, open stop with
+    // four fields, task 2 never runs, tally reports a successful stop.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    let env = contract_run(&repo, &["ccx-a", "ccx-b"], STOP_AGENT, 2);
+    assert_eq!(env["status"], "success"); // a stop is never an envelope error (R25)
+    assert_eq!(env["data"]["outcome"], "stopped");
+    assert_eq!(env["data"]["exit_code"], 2);
+    assert_eq!(env["data"]["malformed"], false);
+    let stop_id = env["data"]["stop_id"].as_str().expect("stop id");
+    let run_id = env["data"]["run_id"].as_str().expect("run id");
+
+    // The stop carries all four redacted fields, un-malformed.
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let (what, why, kind, evidence, malformed): (String, String, String, String, i64) = conn
+        .query_row(
+            "SELECT what_needed, why_unanswered, kind, evidence, malformed FROM contract_stops WHERE id = ?1",
+            [stop_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("stop row");
+    assert!(what.contains("need the shape"));
+    assert!(why.contains("brief omits"));
+    assert_eq!(kind, "blocking");
+    assert!(evidence.contains("src/lib.rs:1"));
+    assert_eq!(malformed, 0);
+
+    // Task 1 (ccx-a) is a successful stop; task 2 (ccx-b) never executed (skipped).
+    let mut stmt = conn
+        .prepare(
+            "SELECT task_id, outcome FROM contract_run_tasks WHERE run_id = ?1 ORDER BY task_index",
+        )
+        .unwrap();
+    let tasks: Vec<(String, String)> = stmt
+        .query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        tasks,
+        vec![
+            ("ccx-a".to_string(), "stopped".to_string()),
+            ("ccx-b".to_string(), "skipped".to_string()),
+        ]
+    );
+    // The run is recorded as a stop, not a failure.
+    let run_outcome: String = conn
+        .query_row(
+            "SELECT outcome FROM contract_runs WHERE id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_outcome, "stopped");
+}
+
+#[test]
+fn contract_run_refuses_when_contract_has_open_stop() {
+    // Covers AE2 (R10): a contract with an open stop refuses a new run with a typed
+    // error naming the stop id — and no agent session starts.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    // First run files a stop.
+    let first = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = first["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // A second run is refused; the canary proves the agent never ran.
+    let canary = repo.path().join("open-stop-canary");
+    let agent = format!("touch {} && echo x > out.txt", canary.display());
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "run", "ccx-a", "--agent-cmd", &agent])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_OPEN_STOP");
+    let ids = env["errors"][0]["details"]["stop_ids"].to_string();
+    assert!(
+        ids.contains(&stop_id),
+        "refusal names the blocking stop: {ids}"
+    );
+    assert!(
+        !canary.exists(),
+        "no agent session may start on an open-stop refusal"
+    );
+}
+
+#[test]
+fn contract_run_dependent_refusal_names_blocking_stop() {
+    // Covers AE9 (refusal half, R10): a dependent's run refusal names the dependency's
+    // blocking stop id.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    // Open a stop on the dependency ccx-a.
+    let stop = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = stop["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // Running the chain (whose closure includes the blocked dependency ccx-a) is
+    // refused, naming ccx-a's stop — a dependent cannot execute against an
+    // unanswered unknown.
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "ccx-b",
+                "--chain",
+                "--agent-cmd",
+                EDIT_AGENT,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_OPEN_STOP");
+    assert!(env["errors"][0]["details"]["stop_ids"]
+        .to_string()
+        .contains(&stop_id));
+}
+
+#[test]
+fn contract_run_nonzero_exit_without_unknown_fails_exit_1() {
+    // Covers AE5 (R11/R14): a crashed agent (nonzero exit, no UNKNOWN.md) records a
+    // failed run with exit 1.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], "exit 3", 1);
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["outcome"], "failed");
+    assert_eq!(env["data"]["exit_code"], 1);
+    assert_eq!(stop_count(&repo), 0, "a crash is not a stop");
+}
+
+#[test]
+fn contract_run_empty_patch_fails_exit_1() {
+    // Covers AE8 (R11/R14): a zero exit with an empty patch records a failed run,
+    // exit 1 — an empty patch never passes as success.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], "true", 1);
+    assert_eq!(env["data"]["outcome"], "failed");
+    assert_eq!(env["data"]["exit_code"], 1);
+    assert!(env["data"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("empty patch"));
+}
+
+#[test]
+fn contract_run_stale_unknown_refuses_no_session_no_stop() {
+    // Covers AE10 (R26): a stale UNKNOWN.md at the workspace root refuses with a typed
+    // error before any agent session, and no stop record is created.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    write(&repo, "UNKNOWN.md", "leftover from a prior run\n");
+    let canary = repo.path().join("stale-canary");
+    let agent = format!("touch {} && echo x > out.txt", canary.display());
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "run", "ccx-a", "--agent-cmd", &agent])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "STALE_UNKNOWN_FILE");
+    assert!(!canary.exists(), "no agent session may start");
+    assert_eq!(stop_count(&repo), 0, "no stop record is created");
+}
+
+#[test]
+fn contract_run_malformed_unknown_opens_and_blocks() {
+    // Malformed ingest (R8/R25): an UNKNOWN.md missing the four fields still opens a
+    // stop, flagged malformed, and still blocks a rerun.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], "echo 'help I am stuck' > UNKNOWN.md", 2);
+    assert_eq!(env["data"]["outcome"], "stopped");
+    assert_eq!(env["data"]["malformed"], true);
+    assert_eq!(env["data"]["code"], "CONTRACT_STOP_MALFORMED");
+
+    // A malformed stop still blocks the next run (Leg 3).
+    let rerun = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "--agent-cmd",
+                EDIT_AGENT,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&rerun), "CONTRACT_OPEN_STOP");
+}
+
+#[test]
+fn contract_run_replay_returns_recorded_without_reexecuting_agent() {
+    // KTD6: replaying a `contract run` request-id returns the recorded result and
+    // NEVER re-executes the agent — proven by a canary the agent would recreate.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let canary = repo.path().join("replay-canary");
+    let agent = format!("touch {} && echo change > out.txt", canary.display());
+    let args = [
+        "--json",
+        "--request-id",
+        "run-1",
+        "contract",
+        "run",
+        "ccx-a",
+        "--agent-cmd",
+        &agent,
+    ];
+    let first = json_output(repo.forge().args(args).assert().code(0));
+    assert_eq!(first["data"]["outcome"], "completed");
+    let run_id = first["data"]["run_id"].as_str().unwrap().to_string();
+    assert!(canary.exists(), "the first run executes the agent");
+    std::fs::remove_file(&canary).expect("clear canary");
+
+    // Replay: same request-id returns the recorded result; the agent does NOT run.
+    let replay = json_output(repo.forge().args(args).assert().code(0));
+    assert_eq!(replay["status"], "success");
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert!(!canary.exists(), "replay must not re-execute the agent");
+    let runs: i64 = {
+        let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM contract_runs", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(runs, 1, "replay must not record a second run");
+    assert!(!run_id.is_empty());
+}
+
+#[test]
+fn contract_run_per_id_dep_mismatch_refused_naming_missing() {
+    // R20: an out-of-chain dependency with no acknowledging --dep is refused, naming
+    // exactly the missing id — no silent count guard.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    // Run ccx-b alone (ccx-a is out-of-chain, unacknowledged).
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-b",
+                "--agent-cmd",
+                EDIT_AGENT,
+            ])
+            .assert()
+            .failure(),
+    );
+    let message = env["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ccx-a") && message.contains("not acknowledged"),
+        "refusal must name the missing dependency: {message}"
+    );
+}
+
+#[test]
+fn contract_integrate_single_contract_creates_linked_attempt() {
+    // Covers R27/KTD8: a completed run with no dependencies integrates onto HEAD as an
+    // attempt linked to the run and to contract@revision.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let run = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let run_id = run["data"]["run_id"].as_str().unwrap().to_string();
+
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "integrate", &run_id])
+            .assert()
+            .success(),
+    );
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["run_id"], run_id);
+    let attempt_id = env["data"]["attempt_id"].as_str().expect("attempt id");
+    let intent_id = env["data"]["intent_id"].as_str().expect("intent id");
+
+    // The attempt exists and its synthesized intent encodes the contract marker.
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let (exists, intent_text): (i64, String) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM attempts WHERE id = ?1), (SELECT text FROM intents WHERE id = ?2)",
+            [attempt_id, intent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("attempt + intent rows");
+    assert_eq!(exists, 1);
+    assert!(
+        intent_text.starts_with("contract ccx-a@rev1"),
+        "intent: {intent_text}"
+    );
+}
+
+#[test]
+fn contract_integrate_before_deps_accepted_is_refused() {
+    // KTD8: integrating a dependent before its dependency is accepted into HEAD is a
+    // typed refusal naming the dependency.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    // Complete the whole chain (both tasks edit a file).
+    let run = contract_run(&repo, &["ccx-a", "ccx-b"], EDIT_AGENT, 0);
+    let run_id = run["data"]["run_id"].as_str().unwrap().to_string();
+
+    // ccx-b's dependency ccx-a is not yet accepted → refusal.
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "integrate", &run_id])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+    assert!(env["errors"][0]["details"]["reason"]
+        .to_string()
+        .contains("ccx-a"));
+}
+
+#[test]
+fn contract_integrate_incomplete_run_is_refused() {
+    // A stopped (not completed) run cannot be integrated (typed refusal, KTD8).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let run = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let run_id = run["data"]["run_id"].as_str().unwrap().to_string();
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "integrate", &run_id])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+}
