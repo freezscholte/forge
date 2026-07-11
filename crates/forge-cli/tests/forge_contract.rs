@@ -806,6 +806,78 @@ fn contract_run_dependent_refusal_names_blocking_stop() {
 }
 
 #[test]
+fn contract_run_transitive_open_stop_through_acked_dep_refuses() {
+    // B1 (R10 Leg-3): the refusal must walk the FULL transitive dependency closure,
+    // not just the chain contracts plus directly-acknowledged deps. Chain: c → b → a
+    // (c depends on b, b on a). Acknowledge b for a run of c; b's FROZEN depends_on
+    // names a, and a has an open stop reached only THROUGH b. The run must refuse
+    // naming a's stop, and no agent session may start.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    freeze_contract(&repo, "ccx-c", &["ccx-b"]);
+
+    // A completed run of a, then of b (acknowledging a), so a real b-run ref exists
+    // to acknowledge when running c — all BEFORE any stop is opened.
+    let a_run = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let a_run_id = a_run["data"]["run_id"].as_str().unwrap().to_string();
+    let dep_a = format!("ccx-a={a_run_id}");
+    let b_run = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-b",
+                "--dep",
+                dep_a.as_str(),
+                "--agent-cmd",
+                EDIT_AGENT,
+            ])
+            .assert()
+            .code(0),
+    );
+    let b_run_id = b_run["data"]["run_id"].as_str().unwrap().to_string();
+
+    // Now open a stop on the DEEP dependency a (a fresh run of a that stops).
+    let a_stop = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let a_stop_id = a_stop["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // Run c, acknowledging b. a is neither in the chain nor directly acknowledged —
+    // it is reached only by expanding b's frozen depends_on. The transitive closure
+    // must still find a's open stop and refuse; the canary proves no agent ran.
+    let canary = repo.path().join("transitive-closure-canary");
+    let agent = format!("touch {} && echo x >> out.txt", canary.display());
+    let dep_b = format!("ccx-b={b_run_id}");
+    let env = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-c",
+                "--dep",
+                dep_b.as_str(),
+                "--agent-cmd",
+                agent.as_str(),
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_OPEN_STOP");
+    assert!(
+        env["errors"][0]["details"]["stop_ids"]
+            .to_string()
+            .contains(&a_stop_id),
+        "refusal must name the transitively-reached blocking stop on ccx-a"
+    );
+    assert!(
+        !canary.exists(),
+        "no agent session may start on a transitive open-stop refusal"
+    );
+}
+
+#[test]
 fn contract_run_nonzero_exit_without_unknown_fails_exit_1() {
     // Covers AE5 (R11/R14): a crashed agent (nonzero exit, no UNKNOWN.md) records a
     // failed run with exit 1.
@@ -1005,6 +1077,54 @@ fn contract_integrate_before_deps_accepted_is_refused() {
     assert!(env["errors"][0]["details"]["reason"]
         .to_string()
         .contains("ccx-a"));
+}
+
+#[test]
+fn contract_integrate_deps_gate_rejects_spoofed_intent_accept() {
+    // B3/KTD8 (anti-spoof): the deps-accepted gate must bind to a genuine recorded
+    // contract integration, NOT to intent text. An ordinary
+    // `forge start "contract ccx-a@rev1 ..."` → save → propose → accept produces an
+    // accepted decision whose intent text would satisfy the old `LIKE 'contract
+    // ccx-a@%'` predicate WITHOUT any real integration. Integrating the dependent
+    // ccx-b must still be refused because ccx-a was never truly integrated.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    let run = contract_run(&repo, &["ccx-a", "ccx-b"], EDIT_AGENT, 0);
+    let run_id = run["data"]["run_id"].as_str().unwrap().to_string();
+
+    // Spoof: a genuine accepted decision whose intent text mimics an integration
+    // marker for ccx-a, produced through the ordinary lifecycle (never
+    // `forge contract integrate`).
+    repo.forge()
+        .args(["--json", "start", "contract ccx-a@rev1 task ccx-a"])
+        .assert()
+        .success();
+    write(&repo, "spoof.txt", "not a real integration\n");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // The dependent's integration must STILL be refused: ccx-a's dependency was
+    // spoofed, not integrated, so the genuine integration-link gate finds nothing.
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "integrate", &run_id])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+    assert!(
+        env["errors"][0]["details"]["reason"]
+            .to_string()
+            .contains("ccx-a"),
+        "refusal must name the un-integrated dependency"
+    );
 }
 
 #[test]

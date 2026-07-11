@@ -35,7 +35,7 @@ use forge_store::{
     ContractIntegrationRecord, ContractRunTaskInput, OpenContractStopInput, RecordContractRunInput,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1816,16 +1816,54 @@ fn fill_skipped(task_states: &mut Vec<TaskState>, plan: &[PlannedTask], stopped_
 /// harness exit code (0/1/2/3) travel in `data` (R14/R25), mapped to the process
 /// exit by `main`. Preflight refusals (open stop, stale UNKNOWN, not-frozen,
 /// unacknowledged dep) are typed errors — no agent session started.
+///
+/// Lock decision (DELIBERATE): `"contract run"` is a mutating command
+/// (`is_mutating_command` / `locks_repo_for_command` in `commands/core.rs`), so it
+/// holds the repo advisory lock for the WHOLE command — INCLUDING the agent
+/// subprocess execution below. This is unlike plain `forge run`, which has an
+/// explicit lock carve-out around its child process. The plan (2026-07-10 CCX
+/// native contracts, Scope Boundaries) assumes single-run-at-a-time per repo and
+/// defers concurrent chain runs; holding the lock across the agent enforces that
+/// assumption (one chain mutating the ledger at a time) rather than interleaving
+/// two chains' run/stop/verdict writes. Do not add a carve-out without lifting that
+/// single-run assumption.
 fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEnvelope {
     command_result("contract run", request_id, move |cwd, request_id| {
         let repo_root = forge_store::repository_root_path(&cwd)?;
         let (plan, ack) = resolve_run_plan(&cwd, &args)?;
 
-        // Leg 3 (R10/AE2/AE9): refuse if any chain contract OR acknowledged
-        // dependency has an open stop, naming the blocking stop ids. No agent runs.
-        let mut closure_ids: Vec<String> =
-            plan.iter().map(|task| task.contract_id.clone()).collect();
-        closure_ids.extend(ack.keys().cloned());
+        // Leg 3 (R10/AE2/AE9): refuse if ANY contract in the FULL transitive
+        // dependency closure has an open stop, naming the blocking stop ids — no
+        // agent runs. The seeds are the chain's contracts plus every acknowledged
+        // out-of-chain dependency; from there we expand each contract's frozen
+        // `depends_on` to fixpoint, so an open stop on a DEEP dependency (reached only
+        // through an acknowledged dep, e.g. an ack'd `b` whose frozen `depends_on`
+        // names a stopped `a`) still blocks the run. Walking only the direct seeds
+        // (the prior behavior) let such a transitive stop slip the gate. Cycle-safe
+        // via the visited set; a contract with no frozen revision contributes no
+        // edges (and can carry no open stop of its own either).
+        let mut closure_ids: Vec<String> = Vec::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: VecDeque<String> = plan
+            .iter()
+            .map(|task| task.contract_id.clone())
+            .chain(ack.keys().cloned())
+            .collect();
+        while let Some(id) = frontier.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            closure_ids.push(id.clone());
+            if let Some(revision) = forge_store::latest_contract_revision(&cwd, &id)?
+                .filter(|record| record.state == "frozen")
+            {
+                for dep in parse_depends_on(&revision.source_yaml)? {
+                    if !visited.contains(&dep) {
+                        frontier.push_back(dep);
+                    }
+                }
+            }
+        }
         let open = forge_store::open_stops_for_contracts(&cwd, &closure_ids)?;
         if !open.is_empty() {
             let stop_ids = open.into_iter().map(|stop| stop.stop_id).collect();
@@ -1946,7 +1984,11 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                     &agent,
                 ));
                 fill_skipped(&mut task_states, &plan, index);
-                let run = forge_store::record_contract_run(
+                // F1: record the stopped run AND open its stop in ONE transaction, so
+                // a stop-insert failure can never leave an `outcome = "stopped"` run
+                // with no stop row to triage. The store sets the stop's `run_id` to
+                // the freshly-created run id atomically.
+                let (run, stop) = forge_store::record_contract_run_with_stop(
                     &cwd,
                     request_id.clone(),
                     build_run_input(
@@ -1960,14 +2002,10 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         None,
                         &task_states,
                     ),
-                )?;
-                let stop = forge_store::open_contract_stop(
-                    &cwd,
-                    None,
                     OpenContractStopInput {
                         contract_id: task.contract_id.clone(),
                         revision: task.revision,
-                        run_id: Some(run.run_id.clone()),
+                        run_id: None,
                         task_id: Some(task.task_id()),
                         what_needed: what,
                         why_unanswered: why,
@@ -2079,6 +2117,23 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                 Some(post),
                 &agent,
             ));
+        }
+
+        // Resume baseline guard: if every task was replayed from a prior run's
+        // recorded output and no fresh task executed, `final_baseline` was never set,
+        // so the run would be recorded with `baseline_ref: null` and fail integrate
+        // opaquely later (the reconstruction base is missing). Refuse now with an
+        // actionable message. In practice a resume always re-runs at least the halted
+        // task (only prior-completed tasks are replayed), so this is a degenerate
+        // guard, not an expected path.
+        if final_baseline.is_none() {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "resume of {} replayed every task without running a fresh one, so no integration baseline was captured. Integrate the original run, or re-run with --fresh",
+                    args.resume.as_deref().unwrap_or("<run>")
+                ),
+            }
+            .into());
         }
 
         // Every task completed (exit 0). The run's patch is the target task's produced

@@ -531,14 +531,9 @@ fn contract_run_digest(input: &RecordContractRunInput, created_at_ms: i64) -> St
     digest.finish()
 }
 
-/// Record a run plus its per-task completion rows, signed under `"contract_run"`
-/// and chained (R7/R17). Enforces R2 at the store boundary: a run may only be
-/// recorded against a lint-clean frozen revision. `--request-id` replay-safe.
-pub fn record_contract_run(
-    cwd: &Path,
-    request_id: Option<String>,
-    input: RecordContractRunInput,
-) -> Result<ContractRunRecord> {
+/// Validate a run input's outcome vocabulary before any write (shared by
+/// [`record_contract_run`] and [`record_contract_run_with_stop`]).
+fn validate_run_input(input: &RecordContractRunInput) -> Result<()> {
     if ContractRunOutcome::parse(&input.outcome).is_none() {
         bail!("unsupported contract run outcome `{}`", input.outcome);
     }
@@ -547,125 +542,213 @@ pub fn record_contract_run(
             bail!("unsupported contract run task outcome `{}`", task.outcome);
         }
     }
+    Ok(())
+}
+
+/// Insert a run plus its per-task rows, sign under `"contract_run"`, and chain the
+/// op onto `parent_operation_id` — WITHIN an existing IMMEDIATE txn. Returns the
+/// run record and the operation id the spine advanced to, so a caller composing a
+/// second chained write in the SAME txn (the atomic stopped-run path, F1) threads
+/// it as the next parent. Enforces R2 at the store boundary: a run may only be
+/// recorded against a lint-clean frozen revision.
+#[allow(clippy::too_many_arguments)]
+fn insert_contract_run_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    parent_operation_id: &str,
+    signer: &signing::LocalSigner,
+    request_id: Option<String>,
+    input: &RecordContractRunInput,
+    now: i64,
+) -> Result<(ContractRunRecord, String)> {
+    // R2: only a lint-clean frozen revision can produce runs. An absent, draft,
+    // or frozen-but-not-lint-clean revision all collapse to the typed
+    // CONTRACT_NOT_FROZEN refusal (U2/KTD10) — carried in anyhow, recovered at the
+    // CLI by downcast (the KTD6 typed-error pattern).
+    let not_frozen = || ForgeError::ContractNotFrozen {
+        contract_id: input.contract_id.clone(),
+        revision: input.revision,
+    };
+    let frozen = contract_revision_on(tx, repo_id, &input.contract_id, input.revision)?
+        .ok_or_else(not_frozen)?;
+    if frozen.state != "frozen" || !frozen.lint_clean {
+        return Err(not_frozen().into());
+    }
+    let run_id = new_id("contract_run");
+    let content_hash = contract_run_digest(input, now);
+    tx.execute(
+        "INSERT INTO contract_runs (
+            id, repo_id, contract_id, revision, base_head, dependency_stack_json,
+            outcome, exit_code, agent_exit_code, patch_content_ref, request_id, content_hash,
+            created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+        params![
+            run_id,
+            repo_id,
+            input.contract_id,
+            input.revision,
+            input.base_head,
+            input.dependency_stack_json,
+            input.outcome,
+            input.exit_code,
+            input.agent_exit_code,
+            input.patch_content_ref,
+            request_id,
+            content_hash,
+            now,
+        ],
+    )?;
+    let mut tasks = Vec::with_capacity(input.tasks.len());
+    for task in &input.tasks {
+        let task_row_id = new_id("contract_run_task");
+        tx.execute(
+            "INSERT INTO contract_run_tasks (
+                id, repo_id, run_id, task_id, task_index, outcome, patch_content_ref,
+                agent_exit_code, agent_stdout_excerpt, agent_stderr_excerpt,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            params![
+                task_row_id,
+                repo_id,
+                run_id,
+                task.task_id,
+                task.task_index,
+                task.outcome,
+                task.patch_content_ref,
+                task.agent_exit_code,
+                task.agent_stdout_excerpt,
+                task.agent_stderr_excerpt,
+                now,
+            ],
+        )?;
+        tasks.push(ContractRunTaskRecord {
+            task_id: task.task_id.clone(),
+            task_index: task.task_index,
+            outcome: task.outcome.clone(),
+            patch_content_ref: task.patch_content_ref.clone(),
+            agent_exit_code: task.agent_exit_code,
+            agent_stdout_excerpt: task.agent_stdout_excerpt.clone(),
+            agent_stderr_excerpt: task.agent_stderr_excerpt.clone(),
+        });
+    }
+    signer.sign_subject(
+        tx,
+        repo_id,
+        SUBJECT_KIND_CONTRACT_RUN,
+        &run_id,
+        &content_hash,
+        now,
+    )?;
+    let op = insert_operation_view_chained(
+        tx,
+        repo_id,
+        Some(parent_operation_id),
+        OperationViewInput {
+            request_id: request_id.clone(),
+            // Must equal the CLI command string so `command_result`'s pre-flight
+            // replay folds a same-request-id retry to the recorded run WITHOUT
+            // re-executing the agent subprocess (KTD6).
+            command: "contract run".to_string(),
+            kind: "contract_run_recorded".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: json!({
+                "lifecycle": "contract_run_recorded",
+                "run_id": run_id,
+                "outcome": input.outcome,
+            }),
+        },
+        Some(&content_hash),
+    )?;
+    let record = ContractRunRecord {
+        run_id,
+        contract_id: input.contract_id.clone(),
+        revision: input.revision,
+        base_head: input.base_head.clone(),
+        dependency_stack_json: input.dependency_stack_json.clone(),
+        outcome: input.outcome.clone(),
+        exit_code: input.exit_code,
+        agent_exit_code: input.agent_exit_code,
+        patch_content_ref: input.patch_content_ref.clone(),
+        content_hash,
+        created_at_ms: now,
+        tasks,
+    };
+    Ok((record, op.operation_id))
+}
+
+/// Record a run plus its per-task completion rows, signed under `"contract_run"`
+/// and chained (R7/R17). Enforces R2 at the store boundary: a run may only be
+/// recorded against a lint-clean frozen revision. `--request-id` replay-safe.
+pub fn record_contract_run(
+    cwd: &Path,
+    request_id: Option<String>,
+    input: RecordContractRunInput,
+) -> Result<ContractRunRecord> {
+    validate_run_input(&input)?;
     let context = open_repository(cwd)?;
     let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        // R2: only a lint-clean frozen revision can produce runs. An absent, draft,
-        // or frozen-but-not-lint-clean revision all collapse to the typed
-        // CONTRACT_NOT_FROZEN refusal (U2/KTD10) — carried in anyhow, recovered at the
-        // CLI by downcast (the KTD6 typed-error pattern).
-        let not_frozen = || ForgeError::ContractNotFrozen {
-            contract_id: input.contract_id.clone(),
-            revision: input.revision,
-        };
-        let frozen =
-            contract_revision_on(tx, &context.repo_id, &input.contract_id, input.revision)?
-                .ok_or_else(not_frozen)?;
-        if frozen.state != "frozen" || !frozen.lint_clean {
-            return Err(not_frozen().into());
-        }
         let now = now_ms();
-        let run_id = new_id("contract_run");
-        let content_hash = contract_run_digest(&input, now);
-        tx.execute(
-            "INSERT INTO contract_runs (
-                id, repo_id, contract_id, revision, base_head, dependency_stack_json,
-                outcome, exit_code, agent_exit_code, patch_content_ref, request_id, content_hash,
-                created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
-            params![
-                run_id,
-                context.repo_id,
-                input.contract_id,
-                input.revision,
-                input.base_head,
-                input.dependency_stack_json,
-                input.outcome,
-                input.exit_code,
-                input.agent_exit_code,
-                input.patch_content_ref,
-                request_id,
-                content_hash,
-                now,
-            ],
-        )?;
-        let mut tasks = Vec::with_capacity(input.tasks.len());
-        for task in &input.tasks {
-            let task_row_id = new_id("contract_run_task");
-            tx.execute(
-                "INSERT INTO contract_run_tasks (
-                    id, repo_id, run_id, task_id, task_index, outcome, patch_content_ref,
-                    agent_exit_code, agent_stdout_excerpt, agent_stderr_excerpt,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-                params![
-                    task_row_id,
-                    context.repo_id,
-                    run_id,
-                    task.task_id,
-                    task.task_index,
-                    task.outcome,
-                    task.patch_content_ref,
-                    task.agent_exit_code,
-                    task.agent_stdout_excerpt,
-                    task.agent_stderr_excerpt,
-                    now,
-                ],
-            )?;
-            tasks.push(ContractRunTaskRecord {
-                task_id: task.task_id.clone(),
-                task_index: task.task_index,
-                outcome: task.outcome.clone(),
-                patch_content_ref: task.patch_content_ref.clone(),
-                agent_exit_code: task.agent_exit_code,
-                agent_stdout_excerpt: task.agent_stdout_excerpt.clone(),
-                agent_stderr_excerpt: task.agent_stderr_excerpt.clone(),
-            });
-        }
-        signer.sign_subject(
+        let (record, _op) = insert_contract_run_in_tx(
             tx,
             &context.repo_id,
-            SUBJECT_KIND_CONTRACT_RUN,
-            &run_id,
-            &content_hash,
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            &input,
             now,
         )?;
-        insert_operation_view_chained(
+        Ok(record)
+    })
+}
+
+/// Record a STOPPED run AND open its stop record in ONE immediate transaction
+/// (F1). The two writes previously ran in separate transactions, so a stop-insert
+/// failure after the run row committed left an `outcome = "stopped"` run with no
+/// stop row (a Leg-1/Leg-2 integrity hole: a halt with nothing to triage). Here the
+/// run's op is the stop's chain parent, and both rows commit or roll back together.
+/// The stop's `run_id` is set to the freshly-created run id regardless of the
+/// caller-supplied value. The run carries `request_id` for replay; the stop's op is
+/// unkeyed (it is part of the same replay-anchored `contract run` command).
+pub fn record_contract_run_with_stop(
+    cwd: &Path,
+    request_id: Option<String>,
+    run_input: RecordContractRunInput,
+    stop_input: OpenContractStopInput,
+) -> Result<(ContractRunRecord, ContractStopRecord)> {
+    validate_run_input(&run_input)?;
+    let context = open_repository(cwd)?;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let now = now_ms();
+        let (run, run_op) = insert_contract_run_in_tx(
             tx,
             &context.repo_id,
-            Some(&context.current_operation_id),
-            OperationViewInput {
-                request_id: request_id.clone(),
-                // Must equal the CLI command string so `command_result`'s pre-flight
-                // replay folds a same-request-id retry to the recorded run WITHOUT
-                // re-executing the agent subprocess (KTD6).
-                command: "contract run".to_string(),
-                kind: "contract_run_recorded".to_string(),
-                view_kind: ViewKind::Initialized,
-                state: json!({
-                    "lifecycle": "contract_run_recorded",
-                    "run_id": run_id,
-                    "outcome": input.outcome,
-                }),
-            },
-            Some(&content_hash),
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            &run_input,
+            now,
         )?;
-        Ok(ContractRunRecord {
-            run_id,
-            contract_id: input.contract_id.clone(),
-            revision: input.revision,
-            base_head: input.base_head.clone(),
-            dependency_stack_json: input.dependency_stack_json.clone(),
-            outcome: input.outcome.clone(),
-            exit_code: input.exit_code,
-            agent_exit_code: input.agent_exit_code,
-            patch_content_ref: input.patch_content_ref.clone(),
-            content_hash,
-            created_at_ms: now,
-            tasks,
-        })
+        // The stop references the freshly-created run and chains onto the run's op in
+        // the SAME txn — atomic stopped-run + stop (F1). Clone (not move) because
+        // `with_immediate_retry` may re-invoke this closure (FnMut).
+        let mut stop_with_run = stop_input.clone();
+        stop_with_run.run_id = Some(run.run_id.clone());
+        let (stop, _stop_op) = insert_contract_stop_in_tx(
+            tx,
+            &context.repo_id,
+            &run_op,
+            &signer,
+            None,
+            &stop_with_run,
+            now,
+        )?;
+        Ok((run, stop))
     })
 }
 
@@ -829,6 +912,117 @@ fn contract_stop_digest(
 }
 
 /// Ingest and open a stop record, redacting the four free-text fields BEFORE
+/// hashing and signing, sign under `"contract_stop"`, and chain the op onto
+/// `parent_operation_id` — WITHIN an existing IMMEDIATE txn. Returns the stop record
+/// and the operation id the spine advanced to. Factored out so the atomic
+/// stopped-run + stop path ([`record_contract_run_with_stop`], F1) can compose it in
+/// the same txn as the run write.
+#[allow(clippy::too_many_arguments)]
+fn insert_contract_stop_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    parent_operation_id: &str,
+    signer: &signing::LocalSigner,
+    request_id: Option<String>,
+    input: &OpenContractStopInput,
+    now: i64,
+) -> Result<(ContractStopRecord, String)> {
+    let stop_id = new_id("contract_stop");
+    // Redact-before-sign: agent free text is hardened before it is hashed or
+    // written to the append-only, signed record.
+    let what_needed = redact_field(input.what_needed.as_deref());
+    let why_unanswered = redact_field(input.why_unanswered.as_deref());
+    let kind = redact_field(input.kind.as_deref());
+    let evidence = redact_field(input.evidence.as_deref());
+    let state = "open";
+    let content_hash = contract_stop_digest(
+        &input.contract_id,
+        input.revision,
+        input.run_id.as_deref(),
+        input.task_id.as_deref(),
+        what_needed.as_deref(),
+        why_unanswered.as_deref(),
+        kind.as_deref(),
+        evidence.as_deref(),
+        input.malformed,
+        state,
+        None,
+        None,
+        None,
+        now,
+    );
+    tx.execute(
+        "INSERT INTO contract_stops (
+            id, repo_id, contract_id, revision, run_id, task_id, what_needed, why_unanswered,
+            kind, evidence, malformed, state, resolution_kind, resolution_rationale,
+            resolving_revision, content_hash, request_id, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, NULL, ?13, ?14, ?15, ?15)",
+        params![
+            stop_id,
+            repo_id,
+            input.contract_id,
+            input.revision,
+            input.run_id,
+            input.task_id,
+            what_needed,
+            why_unanswered,
+            kind,
+            evidence,
+            input.malformed as i64,
+            state,
+            content_hash,
+            request_id,
+            now,
+        ],
+    )?;
+    signer.sign_subject(
+        tx,
+        repo_id,
+        SUBJECT_KIND_CONTRACT_STOP,
+        &stop_id,
+        &content_hash,
+        now,
+    )?;
+    let op = insert_operation_view_chained(
+        tx,
+        repo_id,
+        Some(parent_operation_id),
+        OperationViewInput {
+            request_id: request_id.clone(),
+            command: "contract".to_string(),
+            kind: "contract_stop_opened".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: json!({
+                "lifecycle": "contract_stop_opened",
+                "stop_id": stop_id,
+                "malformed": input.malformed,
+            }),
+        },
+        Some(&content_hash),
+    )?;
+    let record = ContractStopRecord {
+        stop_id,
+        contract_id: input.contract_id.clone(),
+        revision: input.revision,
+        run_id: input.run_id.clone(),
+        task_id: input.task_id.clone(),
+        what_needed,
+        why_unanswered,
+        kind,
+        evidence,
+        malformed: input.malformed,
+        state: state.to_string(),
+        resolution_kind: None,
+        resolution_rationale: None,
+        resolving_revision: None,
+        content_hash,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    Ok((record, op.operation_id))
+}
+
+/// Ingest and open a stop record, redacting the four free-text fields BEFORE
 /// hashing and signing (R8/R16/KTD3), signed under `"contract_stop"` and
 /// chained (R17). `--request-id` replay-safe (R18).
 pub fn open_contract_stop(
@@ -842,98 +1036,16 @@ pub fn open_contract_stop(
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
         let now = now_ms();
-        let stop_id = new_id("contract_stop");
-        // Redact-before-sign: agent free text is hardened before it is hashed or
-        // written to the append-only, signed record.
-        let what_needed = redact_field(input.what_needed.as_deref());
-        let why_unanswered = redact_field(input.why_unanswered.as_deref());
-        let kind = redact_field(input.kind.as_deref());
-        let evidence = redact_field(input.evidence.as_deref());
-        let state = "open";
-        let content_hash = contract_stop_digest(
-            &input.contract_id,
-            input.revision,
-            input.run_id.as_deref(),
-            input.task_id.as_deref(),
-            what_needed.as_deref(),
-            why_unanswered.as_deref(),
-            kind.as_deref(),
-            evidence.as_deref(),
-            input.malformed,
-            state,
-            None,
-            None,
-            None,
-            now,
-        );
-        tx.execute(
-            "INSERT INTO contract_stops (
-                id, repo_id, contract_id, revision, run_id, task_id, what_needed, why_unanswered,
-                kind, evidence, malformed, state, resolution_kind, resolution_rationale,
-                resolving_revision, content_hash, request_id, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, NULL, ?13, ?14, ?15, ?15)",
-            params![
-                stop_id,
-                context.repo_id,
-                input.contract_id,
-                input.revision,
-                input.run_id,
-                input.task_id,
-                what_needed,
-                why_unanswered,
-                kind,
-                evidence,
-                input.malformed as i64,
-                state,
-                content_hash,
-                request_id,
-                now,
-            ],
-        )?;
-        signer.sign_subject(
+        let (record, _op) = insert_contract_stop_in_tx(
             tx,
             &context.repo_id,
-            SUBJECT_KIND_CONTRACT_STOP,
-            &stop_id,
-            &content_hash,
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            &input,
             now,
         )?;
-        insert_operation_view_chained(
-            tx,
-            &context.repo_id,
-            Some(&context.current_operation_id),
-            OperationViewInput {
-                request_id: request_id.clone(),
-                command: "contract".to_string(),
-                kind: "contract_stop_opened".to_string(),
-                view_kind: ViewKind::Initialized,
-                state: json!({
-                    "lifecycle": "contract_stop_opened",
-                    "stop_id": stop_id,
-                    "malformed": input.malformed,
-                }),
-            },
-            Some(&content_hash),
-        )?;
-        Ok(ContractStopRecord {
-            stop_id,
-            contract_id: input.contract_id.clone(),
-            revision: input.revision,
-            run_id: input.run_id.clone(),
-            task_id: input.task_id.clone(),
-            what_needed,
-            why_unanswered,
-            kind,
-            evidence,
-            malformed: input.malformed,
-            state: state.to_string(),
-            resolution_kind: None,
-            resolution_rationale: None,
-            resolving_revision: None,
-            content_hash,
-            created_at_ms: now,
-            updated_at_ms: now,
-        })
+        Ok(record)
     })
 }
 
@@ -2209,5 +2321,78 @@ mod tests {
             .downcast_ref::<ForgeError>()
             .expect("refusal downcasts to a typed ForgeError");
         assert_eq!(typed.code(), "CONTRACT_NOT_FROZEN");
+    }
+
+    #[test]
+    fn run_with_stop_records_both_atomically_and_signed() {
+        // F1: the stopped run and its stop are written in ONE transaction, so a stop
+        // failure can never orphan a `stopped` run. Both rows are present, each
+        // individually signed, and the stop's run_id is set atomically to the new run.
+        let temp = init_native_repo();
+        freeze_contract_revision(temp.path(), None, frozen_input("c1", "id: c1\n"))
+            .expect("freeze revision");
+        let run_input = RecordContractRunInput {
+            contract_id: "c1".to_string(),
+            revision: 1,
+            base_head: Some("HEAD0".to_string()),
+            dependency_stack_json: None,
+            outcome: "stopped".to_string(),
+            exit_code: 2,
+            agent_exit_code: Some(0),
+            patch_content_ref: None,
+            tasks: vec![ContractRunTaskInput {
+                task_id: "c1".to_string(),
+                task_index: 0,
+                outcome: "stopped".to_string(),
+                patch_content_ref: None,
+                agent_exit_code: Some(0),
+                agent_stdout_excerpt: None,
+                agent_stderr_excerpt: None,
+            }],
+        };
+        // Caller passes run_id: None; the combined writer sets it to the new run id.
+        let stop_input = OpenContractStopInput {
+            contract_id: "c1".to_string(),
+            revision: 1,
+            run_id: None,
+            task_id: Some("c1".to_string()),
+            what_needed: Some("need the shape".to_string()),
+            why_unanswered: Some("brief omits it".to_string()),
+            kind: Some("blocking".to_string()),
+            evidence: Some("src/lib.rs:1".to_string()),
+            malformed: false,
+        };
+        let (run, stop) = record_contract_run_with_stop(temp.path(), None, run_input, stop_input)
+            .expect("atomic run + stop");
+        assert_eq!(run.outcome, "stopped");
+        assert_eq!(
+            stop.run_id.as_deref(),
+            Some(run.run_id.as_str()),
+            "the stop links to the freshly-created run id atomically"
+        );
+
+        // Both rows exist; the stop is discoverable as open and references the run.
+        let open = contract_stops(temp.path(), Some("c1"), true).expect("list open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].run_id.as_deref(), Some(run.run_id.as_str()));
+        assert!(contract_run(temp.path(), &run.run_id)
+            .expect("read run")
+            .is_some());
+
+        // Each row carries its own verifiable local signature (both chained in one txn).
+        let database_path = temp.path().join(".forge/forge.db");
+        let connection = crate::open_connection(&database_path).expect("open db");
+        assert_ledger_signature_verifies(
+            &connection,
+            SUBJECT_KIND_CONTRACT_RUN,
+            &run.run_id,
+            &run.content_hash,
+        );
+        assert_ledger_signature_verifies(
+            &connection,
+            SUBJECT_KIND_CONTRACT_STOP,
+            &stop.stop_id,
+            &stop.content_hash,
+        );
     }
 }

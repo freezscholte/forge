@@ -68,23 +68,36 @@ pub fn open_stops_for_contracts(
     Ok(blocking)
 }
 
-/// Whether contract `dep_contract_id` is already accepted into HEAD (KTD8): an
-/// `integrate` attempt for it exists and its proposal carries an `accept` decision.
-/// Matched via the synthesized intent marker (`contract <dep_id>@...`).
+/// Whether contract `dep_contract_id` is already accepted into HEAD (KTD8).
+///
+/// Anti-spoof (B3/KTD8): a dependency counts as accepted iff its task's completed
+/// run was integrated by `forge contract integrate` AND that integration's proposal
+/// carries an `accept` decision. The gate joins through the RECORDED integration
+/// link — the `contract_integrated` op-log view whose `state_json.attempt_id`
+/// [`record_contract_integration`] wrote — not through free intent text. Matching
+/// `intents.text LIKE 'contract <dep>@%'` (the prior predicate) was spoofable: an
+/// ordinary `forge start "contract <dep>@rev1 ..."` → save → propose → accept
+/// produces an accepted decision whose intent text satisfies the LIKE without any
+/// genuine contract run ever having been integrated. Binding to the integration
+/// link closes that: an attacker cannot forge a `contract_integrated` op that links
+/// to a real, signed contract run they did not produce.
 pub fn contract_integration_accepted(cwd: &Path, dep_contract_id: &str) -> Result<bool> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
-    let like = format!("{CONTRACT_INTENT_PREFIX}{dep_contract_id}@%");
     let accepted: bool = connection
         .query_row(
             "SELECT 1
-             FROM decisions d
-             JOIN proposals p ON p.id = d.proposal_id
-             JOIN attempts a ON a.id = p.attempt_id
-             JOIN intents i ON i.id = a.intent_id
-             WHERE d.repo_id = ?1 AND d.decision = 'accept' AND i.text LIKE ?2
+             FROM operations o
+             JOIN views v ON v.id = o.resulting_view_id
+             JOIN attempts a ON a.id = json_extract(v.state_json, '$.attempt_id')
+             JOIN proposals p ON p.attempt_id = a.id
+             JOIN decisions d ON d.proposal_id = p.id
+             WHERE o.repo_id = ?1
+               AND o.kind = 'contract_integrated'
+               AND json_extract(v.state_json, '$.contract_id') = ?2
+               AND d.decision = 'accept'
              LIMIT 1",
-            params![context.repo_id, like],
+            params![context.repo_id, dep_contract_id],
             |_| Ok(()),
         )
         .optional()?
