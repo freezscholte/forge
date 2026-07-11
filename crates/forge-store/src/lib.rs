@@ -71,14 +71,14 @@ pub use conflict::{
     StaleBaseConflictInput,
 };
 pub use contract::{
-    contract_revision, contract_run, contract_run_verdicts, contract_stops,
-    freeze_contract_revision, latest_contract_revision, open_contract_stop, record_contract_run,
-    record_contract_run_verdicts, resolve_contract_stop, ContractRevisionRecord,
-    ContractRunOutcome, ContractRunRecord, ContractRunTaskInput, ContractRunTaskRecord,
-    ContractRunVerdictInput, ContractRunVerdictRecord, ContractStopRecord, ContractVerifyOutcome,
-    FreezeContractRevisionInput, OpenContractStopInput, RecordContractRunInput,
-    SUBJECT_KIND_CONTRACT, SUBJECT_KIND_CONTRACT_RUN, SUBJECT_KIND_CONTRACT_STOP,
-    SUBJECT_KIND_CONTRACT_VERDICT,
+    acceptance_command_is_safe, check_acceptance_command, contract_revision, contract_run,
+    contract_run_verdicts, contract_stops, freeze_contract_revision, latest_contract_revision,
+    open_contract_stop, record_contract_run, record_contract_run_verdicts, resolve_contract_stop,
+    AcceptanceCommandCheck, ContractRevisionRecord, ContractRunOutcome, ContractRunRecord,
+    ContractRunTaskInput, ContractRunTaskRecord, ContractRunVerdictInput, ContractRunVerdictRecord,
+    ContractStopRecord, ContractVerifyOutcome, FreezeContractRevisionInput, OpenContractStopInput,
+    RecordContractRunInput, SUBJECT_KIND_CONTRACT, SUBJECT_KIND_CONTRACT_RUN,
+    SUBJECT_KIND_CONTRACT_STOP, SUBJECT_KIND_CONTRACT_VERDICT,
 };
 pub use doctor::{
     doctor, DoctorReport, LedgerViewFinding, LedgerViewFindingKind, NativeHistoryFinding,

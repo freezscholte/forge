@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         Command::Trust(args) => trust_response(request_id, args),
         Command::Visibility(args) => visibility_response(request_id, args),
         Command::Embargo(args) => embargo_response(request_id, args),
+        Command::Contract(args) => commands::contract::contract_response(request_id, args),
         Command::Key(args) => key_response(request_id, args),
         Command::Org(args) => org_response(request_id, args),
         Command::Doctor => doctor_response(request_id),

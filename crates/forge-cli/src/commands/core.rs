@@ -2428,6 +2428,7 @@ pub(crate) fn is_mutating_command(command: &str) -> bool {
             | "embargo reveal"
             | "embargo publish"
             | "embargo close"
+            | "contract freeze"
             | "key status"
             | "key rotate"
             | "org init"

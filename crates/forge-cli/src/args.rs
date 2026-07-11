@@ -55,6 +55,8 @@ pub(crate) enum Command {
     Visibility(VisibilityArgs),
     /// Manage embargoed security-fix workflow state and controlled release.
     Embargo(EmbargoArgs),
+    /// Lint and freeze `ccx.contract.v1` task contracts into signed ledger revisions.
+    Contract(ContractArgs),
     /// Inspect or rotate the local Ed25519 signing key.
     Key(KeyArgs),
     /// Inspect or initialize local org governance.
@@ -466,6 +468,32 @@ pub(crate) struct VisibilityArgs {
 pub(crate) struct EmbargoArgs {
     #[command(subcommand)]
     pub(crate) command: EmbargoCommand,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractArgs {
+    #[command(subcommand)]
+    pub(crate) command: ContractCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ContractCommand {
+    /// Lint a `ccx.contract.v1` YAML file against the six rule families (read-only).
+    Lint(ContractLintArgs),
+    /// Lint then record a signed, immutable frozen revision of a contract YAML file.
+    Freeze(ContractFreezeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractLintArgs {
+    /// Path to the contract YAML file (or a `_global-policy.yaml`). Canonicalized at the boundary.
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractFreezeArgs {
+    /// Path to the contract YAML file (or a `_global-policy.yaml`). Canonicalized at the boundary.
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Args)]

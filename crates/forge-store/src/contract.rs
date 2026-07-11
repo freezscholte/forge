@@ -261,7 +261,10 @@ pub fn freeze_contract_revision(
             Some(&context.current_operation_id),
             OperationViewInput {
                 request_id: request_id.clone(),
-                command: "contract".to_string(),
+                // Must equal the CLI command string so `command_result`'s pre-flight
+                // replay (`replay_response`) folds a same-request-id retry to the
+                // original result instead of raising REQUEST_ID_CONFLICT.
+                command: "contract freeze".to_string(),
                 kind: "contract_frozen".to_string(),
                 view_kind: ViewKind::Initialized,
                 state: json!({
@@ -1277,6 +1280,88 @@ pub fn contract_run_verdicts(cwd: &Path, run_id: &str) -> Result<Vec<ContractRun
     Ok(verdicts)
 }
 
+// ---------------------------------------------------------------------------
+// Acceptance command grammar (R15) — the single source of truth
+// ---------------------------------------------------------------------------
+//
+// This is deliberately the ONE place the acceptance-command grammar is decided,
+// so lint (U3) and the fix/guard verifier (U7) can never drift: a string that
+// lint accepts is exactly a string the verifier will run, and vice versa. It
+// ports `command_is_safe`/`COMMAND_GRAMMAR`/`SHELL_METACHARACTERS` from
+// `tools/ccx/ccx-lint.py` verbatim.
+//
+// The grammar is prefix-anchored (`^cargo (test|clippy|fmt|build|run)\b`) by
+// design — cargo takes arbitrary trailing args — so command SAFETY is a
+// separate, explicit metacharacter check: an acceptance entry must BOTH start
+// with an allowed cargo subcommand AND contain no shell control character that
+// would turn a lint-passing `cargo ...` prefix into an injection when the string
+// reaches the verifier's process spawn (the eval-sink hardening R15 preserves).
+
+/// The allowed leading cargo subcommands for an acceptance command (R15).
+const ACCEPTANCE_SUBCOMMANDS: [&str; 5] = ["test", "clippy", "fmt", "build", "run"];
+
+/// Shell control characters that must never appear in an acceptance command,
+/// character-for-character identical to `ccx-lint.py`'s `SHELL_METACHARACTERS`.
+const ACCEPTANCE_SHELL_METACHARACTERS: &str = ";&|`$(){}<>\n\r\\!*?[]#\"'";
+
+/// The classification of one acceptance command against the reviewed grammar.
+/// Distinguishing the two failure modes lets lint emit the same two messages
+/// `ccx-lint.py` rule 6 emits (metacharacter vs. grammar), and lets the verifier
+/// refuse with a precise reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptanceCommandCheck {
+    /// Grammar-valid and metacharacter-free — safe to execute.
+    Ok,
+    /// Starts with an allowed cargo subcommand but carries a shell metacharacter.
+    ShellMetacharacter,
+    /// Does not match `^cargo (test|clippy|fmt|build|run)\b` at all.
+    GrammarViolation,
+}
+
+/// Does `cmd` match `^cargo (test|clippy|fmt|build|run)\b`? Prefix-anchored, with
+/// a word boundary after the subcommand so `cargo testfoo` does NOT match.
+fn acceptance_matches_grammar(cmd: &str) -> bool {
+    let Some(rest) = cmd.strip_prefix("cargo ") else {
+        return false;
+    };
+    for sub in ACCEPTANCE_SUBCOMMANDS {
+        if let Some(after) = rest.strip_prefix(sub) {
+            // `\b`: the subcommand must be followed by end-of-string or a
+            // non-word character (word = [A-Za-z0-9_]).
+            let boundary = after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if boundary {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Classify an acceptance command against the reviewed grammar (R15). This is the
+/// single source of truth shared by lint (U3) and the verifier (U7).
+pub fn check_acceptance_command(cmd: &str) -> AcceptanceCommandCheck {
+    if !acceptance_matches_grammar(cmd) {
+        return AcceptanceCommandCheck::GrammarViolation;
+    }
+    if cmd
+        .chars()
+        .any(|c| ACCEPTANCE_SHELL_METACHARACTERS.contains(c))
+    {
+        return AcceptanceCommandCheck::ShellMetacharacter;
+    }
+    AcceptanceCommandCheck::Ok
+}
+
+/// A grammar-valid, metacharacter-free acceptance command (R15). The fail-closed
+/// gate both lint and the verifier consult before an acceptance string is ever
+/// stored or executed.
+pub fn acceptance_command_is_safe(cmd: &str) -> bool {
+    matches!(check_acceptance_command(cmd), AcceptanceCommandCheck::Ok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1724,6 +1809,41 @@ mod tests {
                 &verdict.content_hash,
             );
         }
+    }
+
+    #[test]
+    fn acceptance_grammar_is_fail_closed() {
+        use AcceptanceCommandCheck::*;
+        // Grammar-valid, metacharacter-free: the only accepted shape.
+        assert_eq!(check_acceptance_command("cargo test"), Ok);
+        assert_eq!(
+            check_acceptance_command("cargo test -p forge-cli --test forge_contract"),
+            Ok
+        );
+        assert_eq!(
+            check_acceptance_command("cargo clippy --workspace --all-targets -- -D warnings"),
+            Ok
+        );
+        assert!(acceptance_command_is_safe("cargo build"));
+        // Non-cargo / wrong subcommand -> grammar violation.
+        assert_eq!(check_acceptance_command("echo hi"), GrammarViolation);
+        assert_eq!(check_acceptance_command("cargo publish"), GrammarViolation);
+        // Word boundary: `cargo testfoo` is not `cargo test`.
+        assert_eq!(check_acceptance_command("cargo testfoo"), GrammarViolation);
+        // Grammar-valid prefix but a shell metacharacter reaches the eval sink.
+        assert_eq!(
+            check_acceptance_command("cargo test; rm -rf /"),
+            ShellMetacharacter
+        );
+        assert_eq!(
+            check_acceptance_command("cargo test && echo pwned"),
+            ShellMetacharacter
+        );
+        assert_eq!(
+            check_acceptance_command("cargo test $(whoami)"),
+            ShellMetacharacter
+        );
+        assert!(!acceptance_command_is_safe("cargo test `id`"));
     }
 
     #[test]
