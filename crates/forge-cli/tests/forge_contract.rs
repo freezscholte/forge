@@ -2291,6 +2291,58 @@ fn contract_resolve_reconstructs_malformed_stop_fields() {
 }
 
 #[test]
+fn contract_resolve_reconstruction_refused_on_well_formed_stop() {
+    // U8 review addendum: reconstruction backfills a BEST-EFFORT malformed ingest
+    // ONLY. Supplying the four field flags against a WELL-FORMED stop is refused so an
+    // agent-authored stop's fields can never be silently rewritten and re-signed.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    // STOP_AGENT files a complete four-field UNKNOWN.md → the stop is NOT malformed.
+    let env = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    assert_eq!(env["data"]["malformed"], false);
+    let stop_id = env["data"]["stop_id"].as_str().unwrap().to_string();
+
+    let refusal = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "resolve",
+                &stop_id,
+                "--reject",
+                "--rationale",
+                "triaged",
+                "--what-needed",
+                "trying to overwrite a well-formed field",
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(refusal["status"], "error");
+    assert!(
+        refusal["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("malformed"),
+        "refusal must explain reconstruction is malformed-only: {:?}",
+        refusal["errors"]
+    );
+    // The stop is untouched: still open (the refusal happened before any write).
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM contract_stops WHERE id = ?1",
+            [&stop_id],
+            |r| r.get(0),
+        )
+        .expect("stop row");
+    assert_eq!(
+        state, "open",
+        "a refused reconstruction must not mutate the stop"
+    );
+}
+
+#[test]
 fn contract_resolve_bad_kind_is_rejected() {
     // A reconstruction --kind outside the vocabulary is refused before any write.
     let repo = run_repo();
@@ -2430,4 +2482,212 @@ fn contract_verdicts_lists_recorded_run_verdicts() {
     );
     assert_eq!(verdicts[0]["verdict_kind"], "blast");
     assert_eq!(verdicts[0]["passed"], true);
+}
+
+// ---------------------------------------------------------------------------
+// U9: doctor two-sided coverage + GC reachability at the CLI level
+// ---------------------------------------------------------------------------
+
+/// Backdate EVERY loose native object past the GC protection window, so a gc run
+/// reclaims unreferenced objects deterministically regardless of the default
+/// window (mirrors forge_doctor_gc's `mark_object_old`, applied store-wide).
+fn backdate_all_native_objects(repo: &TestRepo) {
+    let objects = repo.path().join(".forge/objects/sha256");
+    let Ok(prefixes) = std::fs::read_dir(&objects) else {
+        return;
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(entries) = std::fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        for object in entries.flatten() {
+            let status = std::process::Command::new("touch")
+                .args(["-t", "202001010000"])
+                .arg(object.path())
+                .status()
+                .expect("touch");
+            assert!(status.success(), "backdate mtime failed");
+        }
+    }
+}
+
+/// Any object file whose bytes contain `needle` (proves a secret tree was or was
+/// not reclaimed). Returns true when at least one loose object still contains it.
+fn any_object_contains(repo: &TestRepo, needle: &str) -> bool {
+    let objects = repo.path().join(".forge/objects/sha256");
+    let Ok(prefixes) = std::fs::read_dir(&objects) else {
+        return false;
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(entries) = std::fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        for object in entries.flatten() {
+            if let Ok(bytes) = std::fs::read(object.path()) {
+                if String::from_utf8_lossy(&bytes).contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `gc --dry-run` envelope `data`.
+fn gc_dry_run(repo: &TestRepo) -> Value {
+    json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    )["data"]
+        .clone()
+}
+
+/// `gc --yes --plan-digest <d>` envelope `data` (real deletion).
+fn gc_delete(repo: &TestRepo, plan_digest: &str) -> Value {
+    json_output(
+        repo.forge()
+            .args(["--json", "gc", "--yes", "--plan-digest", plan_digest])
+            .assert()
+            .success(),
+    )["data"]
+        .clone()
+}
+
+fn array_contains_str(value: &Value, needle: &str) -> bool {
+    value
+        .as_array()
+        .map(|items| items.iter().any(|v| v.as_str() == Some(needle)))
+        .unwrap_or(false)
+}
+
+#[test]
+fn doctor_green_over_native_contract_chain() {
+    // U9 (R17/KTD2) at the CLI level: a real chain through the binary — freeze policy
+    // + contract, a completed run, then a stopped run whose stop is resolved (the
+    // mutable stop re-sign path) — leaves `forge doctor` green. Every contract, run,
+    // and stop row is signed and its op-log chain link re-verifies.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let stopped = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = stopped["data"]["stop_id"].as_str().expect("stop id");
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "resolve",
+            stop_id,
+            "--reject",
+            "--rationale",
+            "brief already covers it",
+        ])
+        .assert()
+        .success();
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(
+        report["data"]["ok"], true,
+        "doctor must be green over a native contract chain: {:?}",
+        report["data"]["issues"]
+    );
+    assert!(report["data"]["signature_issues"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(report["data"]["tampered_rows"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn gc_retains_referenced_run_patch_object() {
+    // KTD3/U9: a completed run's produced-patch tree object is a durable GC root
+    // (contract_runs.patch_content_ref), so it is NEVER reclaimed even after being
+    // backdated past the protection window. A new ObjectKind that is not a GC root
+    // is a data-loss bug; this proves the wiring holds through a real gc.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let completed = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let run_id = completed["data"]["run_id"].as_str().unwrap().to_string();
+
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let patch_ref: String = conn
+        .query_row(
+            "SELECT patch_content_ref FROM contract_runs WHERE id = ?1",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .expect("patch ref present on a completed run");
+    drop(conn);
+    let tree_id = patch_ref
+        .strip_prefix("forge-tree:")
+        .expect("forge-tree ref")
+        .to_string();
+
+    backdate_all_native_objects(&repo);
+    let dry = gc_dry_run(&repo);
+    // The core property: the referenced patch tree is a GC ROOT, so it is never in
+    // the unreachable set even when backdated past the protection window.
+    assert!(
+        !array_contains_str(&dry["unreachable_native_objects"], &tree_id),
+        "the referenced patch tree must be reachable (not in the unreachable set)"
+    );
+    let digest = dry["plan_digest"].as_str().unwrap();
+    gc_delete(&repo, digest);
+    // After a real gc it is STILL reachable (packing may relocate it loose→pack, but
+    // it is never reclaimed) and doctor stays green (no dangling content ref).
+    let post = gc_dry_run(&repo);
+    assert!(
+        !array_contains_str(&post["unreachable_native_objects"], &tree_id),
+        "the referenced patch tree must survive gc and stay reachable"
+    );
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], true);
+}
+
+#[test]
+fn gc_reclaims_secret_refused_unreferenced_post_tree() {
+    // U6 decision + U9 proof: a secret-content-refused run leaves its post-tree
+    // UNREFERENCED (the run carries no patch ref), so GC classifies it as unreachable
+    // and reclaims its loose plaintext object. The reciprocal of the retained-patch
+    // test — a refused tree must not linger as a reachable, secret-bearing root.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let secret = "AKIASEKRETGCMARKER98765";
+    let agent = format!("printf 'api_key = \"{secret}\"\\n' > out.txt");
+    let env = contract_run(&repo, &["ccx-a"], &agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    assert_eq!(env["data"]["secret_content_detected"], true);
+    // The snapshot step wrote the offending tree+blob loose before the refusal, so the
+    // plaintext secret is present in a loose object at this point (the run just never
+    // references it).
+    assert!(
+        any_object_contains(&repo, "AKIASEKRETGCMARKER"),
+        "the refused post-tree's loose object should exist pre-gc"
+    );
+
+    backdate_all_native_objects(&repo);
+    let dry = gc_dry_run(&repo);
+    // Unreferenced ⇒ classified unreachable (collectable). A GC-rooted object would
+    // never appear here; this is the U6 not-a-root property.
+    assert!(
+        !dry["unreachable_native_objects"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the refused post-tree must be unreferenced and collectable"
+    );
+    let digest = dry["plan_digest"].as_str().unwrap();
+    gc_delete(&repo, digest);
+    // gc reclaimed the loose plaintext object (packs are zlib-compressed, so a plaintext
+    // substring scan of the loose store is the meaningful scrub check).
+    assert!(
+        !any_object_contains(&repo, "AKIASEKRETGCMARKER"),
+        "gc must reclaim the loose plaintext secret object"
+    );
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], true);
 }

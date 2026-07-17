@@ -38,6 +38,7 @@ use forge_store::{AcceptanceCommandCheck, ContractRunVerdictInput, ContractVerif
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::contract::{parse_acceptance_shape, AcceptanceShape};
 use crate::{command_result, ContractVerifyArgs, ForgeError};
 
 /// Per-command capture timeout. A cargo command on the tiny rebuilt tree finishes in
@@ -275,44 +276,24 @@ fn run_set(
     Ok(any_failed)
 }
 
-/// Parse the `acceptance.fix` and `acceptance.guard` string lists from a frozen
-/// revision's verbatim YAML (R1 stored bytes). Mirrors the linter's
-/// `normalize_acceptance` shape: `acceptance` is a mapping with optional `fix`/`guard`
-/// sequences of strings; a non-string entry is an error (fail-closed). An absent
-/// `acceptance`, or absent set, is an empty set.
+/// Parse the `acceptance.fix` and `acceptance.guard` command lists from a frozen
+/// revision's verbatim YAML (R1 stored bytes), reusing the linter's single-source
+/// [`AcceptanceShape`] parser (U7-review consolidation nit) so the two surfaces can
+/// never drift. The YAML is parsed into a serde_json `Value` — the same type the
+/// linter feeds `parse_acceptance_shape` — then classified. A non-mapping,
+/// non-null `acceptance` fails closed (verify never trusts that the frozen contract
+/// was lint-clean); absent/null yields empty sets. Non-string entries inside
+/// `fix`/`guard` are dropped by the shared `string_list`, which does not weaken the
+/// eval-sink gate: every SURVIVING command is grammar-checked in step 3 before it
+/// can run, and a dropped non-string entry is not a command.
 fn parse_acceptance(source_yaml: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let value: serde_yaml::Value = serde_yaml::from_str(source_yaml)
+    let contract: Value = serde_yaml::from_str(source_yaml)
         .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
-    let Some(acceptance) = value.get("acceptance") else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    if acceptance.is_null() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let mapping = acceptance.as_mapping().ok_or_else(|| {
-        anyhow!("acceptance must be a mapping with fix/guard for ccx.contract.v1")
-    })?;
-    let fix = string_seq(mapping.get(serde_yaml::Value::from("fix")))?;
-    let guard = string_seq(mapping.get(serde_yaml::Value::from("guard")))?;
-    Ok((fix, guard))
-}
-
-/// Extract a YAML value as a list of strings, or an empty list when absent/null.
-fn string_seq(value: Option<&serde_yaml::Value>) -> Result<Vec<String>> {
-    match value {
-        None | Some(serde_yaml::Value::Null) => Ok(Vec::new()),
-        Some(serde_yaml::Value::Sequence(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(cmd) => out.push(cmd.to_string()),
-                    None => return Err(anyhow!("acceptance command must be a string")),
-                }
-            }
-            Ok(out)
-        }
-        Some(_) => Err(anyhow!(
-            "acceptance fix/guard must be a list of command strings"
+    match parse_acceptance_shape(&contract) {
+        AcceptanceShape::Sets { fix, guard } => Ok((fix, guard)),
+        AcceptanceShape::Empty => Ok((Vec::new(), Vec::new())),
+        AcceptanceShape::FlatList(_) | AcceptanceShape::Invalid => Err(anyhow!(
+            "acceptance must be a mapping with fix/guard for ccx.contract.v1"
         )),
     }
 }

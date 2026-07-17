@@ -219,6 +219,19 @@ pub(crate) fn resolve_response(
                 args.stop_id
             );
         }
+        // Reconstruction backfills a BEST-EFFORT malformed ingest ONLY (U8 review
+        // addendum): refuse the four field flags against a well-formed stop so an
+        // agent-authored stop's fields can never be silently rewritten and re-signed.
+        let has_reconstruction = args.what_needed.is_some()
+            || args.why_unanswered.is_some()
+            || args.kind.is_some()
+            || args.evidence.is_some();
+        if has_reconstruction && !stop.malformed {
+            bail!(
+                "reconstruction flags (--what-needed/--why-unanswered/--kind/--evidence) apply only to a malformed stop; stop {:?} is well-formed",
+                args.stop_id
+            );
+        }
 
         // Determine the bump revision's source bytes and resolution kind.
         let (resolution_kind, source_yaml) = if let Some(revised_path) = &args.revised {

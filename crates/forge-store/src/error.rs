@@ -362,10 +362,24 @@ pub enum ForgeError {
     /// verify exit 4) — mechanically distinguishing works-but-regressed from
     /// not-done. Deterministic. `regressed` names the guard commands, secret-token
     /// redacted defensively though the cargo grammar (R15) forbids metacharacters.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today: per R25, `contract verify`
+    /// records its verdicts and returns a SUCCESS envelope carrying the bare code
+    /// string `"CONTRACT_GUARD_REGRESSED"` in `data.code` with `exit_code = 4` (see
+    /// `contract_verify.rs`) — a guard regression is a recorded outcome, not a
+    /// command failure. The variant is retained so the code stays enumerable via
+    /// `forge schema` (KTD10) and so `error_to_object`/`code()` map it correctly
+    /// should a future path ever surface it as an error. Do not delete.
     ContractGuardRegressed { regressed: Vec<String> },
     /// Verification's fix set failed (R13/R14, verify exit 2) — the task is not
     /// done. Guards still ran so the record is complete. Deterministic. `failed`
     /// names the fix commands, secret-token redacted defensively.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today, for the same reason as
+    /// [`ForgeError::ContractGuardRegressed`]: `contract verify` emits the bare code
+    /// string `"CONTRACT_FIX_FAILED"` in a SUCCESS envelope's `data.code` with
+    /// `exit_code = 2` (R25). Retained for `forge schema` enumeration (KTD10) and
+    /// error-mapping completeness. Do not delete.
     ContractFixFailed { failed: Vec<String> },
     /// An acceptance command fell outside the reviewed cargo-only grammar or carried
     /// a shell metacharacter (R15/AE6), rejected identically at lint and execution.

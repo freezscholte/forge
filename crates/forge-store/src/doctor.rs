@@ -981,6 +981,15 @@ fn op_domain_digest(conn: &Connection, view_id: Option<&str>) -> Result<Option<S
             .map(Option::flatten)
             .map_err(Into::into);
     }
+    // Contract-family ops (U9/KTD2) record the EXACT domain digest they folded in
+    // their view `subject_digest`. Recovering it from here (rather than recomputing
+    // from the current row) is load-bearing for the mutable stop kind: a stop's row
+    // `content_hash` is rewritten on resolve, so the stop-opened op's chain link can
+    // only be re-verified against the digest it originally folded. Immutable kinds
+    // record it too, keeping recovery uniform.
+    if let Some(subject_digest) = state.get("subject_digest").and_then(Value::as_str) {
+        return Ok(Some(subject_digest.to_string()));
+    }
     Ok(None)
 }
 

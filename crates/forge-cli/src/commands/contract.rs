@@ -1142,13 +1142,9 @@ impl Linter<'_> {
     // ---- driver helpers ----------------------------------------------------
 
     fn normalize_acceptance(&mut self, contract: &Value) -> (Vec<String>, Vec<String>) {
-        match contract.get("acceptance") {
-            Some(Value::Object(acc)) => {
-                let fix = string_list(acc.get("fix"));
-                let guard = string_list(acc.get("guard"));
-                (fix, guard)
-            }
-            Some(Value::Array(items)) => {
+        match parse_acceptance_shape(contract) {
+            AcceptanceShape::Sets { fix, guard } => (fix, guard),
+            AcceptanceShape::FlatList(fix) => {
                 // A flat list is a legacy v0 shape; the native surface is v1-only,
                 // but treat it as a fix set so R6 still gates the eval sink.
                 self.add(
@@ -1156,14 +1152,10 @@ impl Linter<'_> {
                     Severity::Error,
                     "acceptance must be a mapping with fix/guard for ccx.contract.v1",
                 );
-                let fix = items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
                 (fix, Vec::new())
             }
-            Some(Value::Null) | None => (Vec::new(), Vec::new()),
-            Some(_) => {
+            AcceptanceShape::Empty => (Vec::new(), Vec::new()),
+            AcceptanceShape::Invalid => {
                 self.add("R1", Severity::Error, "acceptance must be a mapping");
                 (Vec::new(), Vec::new())
             }
@@ -1190,6 +1182,51 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The parsed `acceptance` shape of a `ccx.contract.v1` contract. The SINGLE
+/// source both the linter (U3, `LintDriver::normalize_acceptance`) and the
+/// standalone fix/guard verifier (U7, `contract_verify::parse_acceptance`) use, so
+/// their acceptance parsing can never drift (plan U3 single-source rule; U7-review
+/// consolidation nit). Both callers parse the contract YAML into a serde_json
+/// `Value` first, so this operates on the pre-parsed value.
+pub(crate) enum AcceptanceShape {
+    /// Absent or explicitly null: empty fix and guard sets.
+    Empty,
+    /// A `{fix: [...], guard: [...]}` mapping (the only valid v1 shape). Non-string
+    /// entries are dropped via `string_list`; the per-command grammar gate (R15,
+    /// `check_acceptance_command`) is the fail-closed check over each survivor, so a
+    /// dropped non-command entry can never reach an eval sink.
+    Sets {
+        fix: Vec<String>,
+        guard: Vec<String>,
+    },
+    /// A bare sequence — the legacy v0 flat-list shape (not valid v1). Carried as a
+    /// fix set so a caller that still gates it runs the grammar check over it.
+    FlatList(Vec<String>),
+    /// Present but neither a mapping nor a sequence.
+    Invalid,
+}
+
+/// Classify a contract's `acceptance` field into the shared [`AcceptanceShape`].
+/// Each caller decides how to SURFACE a non-`Sets` shape (the linter emits an R1
+/// diagnostic; the verifier fails closed), but the mapping detection and
+/// `fix`/`guard` string extraction are shared here.
+pub(crate) fn parse_acceptance_shape(contract: &Value) -> AcceptanceShape {
+    match contract.get("acceptance") {
+        Some(Value::Object(acc)) => AcceptanceShape::Sets {
+            fix: string_list(acc.get("fix")),
+            guard: string_list(acc.get("guard")),
+        },
+        Some(Value::Array(items)) => AcceptanceShape::FlatList(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        Some(Value::Null) | None => AcceptanceShape::Empty,
+        Some(_) => AcceptanceShape::Invalid,
     }
 }
 
