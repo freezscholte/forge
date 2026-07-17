@@ -590,7 +590,7 @@ ticket: NER-999\n\
 task: Do a small thing\n\
 interface: Build the thing in the module.\n\
 acceptance:\n  fix:\n    - cargo test -p forge-core\n\
-allowed_changes:\n  paths: [crates/forge-core/src/lib.rs]\n\
+allowed_changes:\n  paths: [crates/forge-core/src/lib.rs, out.txt]\n\
 authority: {{source: human, confidence: high, reviewer: test}}\n"
     );
     if !depends_on.is_empty() {
@@ -614,6 +614,37 @@ fn install_contract(repo: &TestRepo, id: &str, depends_on: &[&str]) {
 /// Install then freeze `id` (dependencies must already be installed on disk).
 fn freeze_contract(repo: &TestRepo, id: &str, depends_on: &[&str]) {
     install_contract(repo, id, depends_on);
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "freeze",
+            &format!("contracts/{}", contract_file_name(id)),
+        ])
+        .assert()
+        .success();
+}
+
+/// Install then freeze `id` with a custom `allowed_changes.paths` inline YAML list
+/// (U6 blast tests that need a specific allowlist — e.g. one that tries to weaken the
+/// default-forbid set).
+fn freeze_contract_with_paths(repo: &TestRepo, id: &str, paths_yaml: &str) {
+    let yaml = format!(
+        "schema: ccx.contract.v1\n\
+id: {id}\n\
+revision: 1\n\
+ticket: NER-999\n\
+task: Do a small thing\n\
+interface: Build the thing in the module.\n\
+acceptance:\n  fix:\n    - cargo test -p forge-core\n\
+allowed_changes:\n  paths: {paths_yaml}\n\
+authority: {{source: human, confidence: high, reviewer: test}}\n"
+    );
+    write(
+        repo,
+        &format!("contracts/{}", contract_file_name(id)),
+        &yaml,
+    );
     repo.forge()
         .args([
             "--json",
@@ -1475,5 +1506,241 @@ fn contract_run_agent_stderr_excerpt_is_stored_redacted() {
     assert!(
         !stderr_excerpt.contains("hunter2SECRETvalue"),
         "the raw secret must never be persisted: {stderr_excerpt:?}"
+    );
+}
+
+// ===========================================================================
+// U6: blast-radius postflight (R12/R16/AE7)
+// ===========================================================================
+
+/// Count `blast` verdict rows for a run, optionally filtered to failures.
+fn blast_verdict_details(repo: &TestRepo, run_id: &str, passed: bool) -> Vec<String> {
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(detail, '') FROM contract_run_verdicts
+             WHERE run_id = ?1 AND verdict_kind = 'blast' AND passed = ?2
+             ORDER BY id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![run_id, passed as i64], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+fn task_outcome(repo: &TestRepo, run_id: &str, task_id: &str) -> String {
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    conn.query_row(
+        "SELECT outcome FROM contract_run_tasks WHERE run_id = ?1 AND task_id = ?2",
+        rusqlite::params![run_id, task_id],
+        |r| r.get(0),
+    )
+    .expect("task row")
+}
+
+#[test]
+fn contract_run_blast_forge_path_violation_exit_3() {
+    // Covers AE7 (R12/R14/R25): a produced patch that touches `.forge/` yields exit 3,
+    // a blast verdict naming the forbidden path, envelope outcome blast_violation, and
+    // no dependent task executes. The agent also edits an allowed file so the patch is
+    // non-empty (the `.forge/` write alone is snapshot-excluded — the fs walk still
+    // catches it).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    let agent = "mkdir -p .forge && echo x > .forge/canary && echo change >> out.txt";
+    let env = contract_run(&repo, &["ccx-a", "ccx-b"], agent, 3);
+    assert_eq!(env["status"], "success"); // exit 3 pairs with a success envelope (R25)
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    assert_eq!(env["data"]["exit_code"], 3);
+    assert_eq!(env["data"]["code"], "CONTRACT_BLAST_VIOLATION");
+    assert_eq!(env["data"]["secret_content_detected"], false);
+    let run_id = env["data"]["run_id"].as_str().unwrap().to_string();
+
+    // The violation names the forbidden path (path only, never content).
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == ".forge/canary" && v["class"] == "forbidden_path"),
+        "violation must name .forge/canary: {violations:?}"
+    );
+
+    // A failing blast verdict names the path.
+    let details = blast_verdict_details(&repo, &run_id, false);
+    assert!(
+        details.iter().any(|d| d.contains(".forge/canary")),
+        "a failing blast verdict must name the path: {details:?}"
+    );
+
+    // The dependent ccx-b never ran (skipped).
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-a"), "failed");
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-b"), "skipped");
+}
+
+#[test]
+fn contract_run_blast_outside_allowlist_violation() {
+    // A change outside the contract's allowed_changes.paths globs (and not a facade)
+    // is a blast violation (R12) — exit 3.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    // out.txt is allowed; stray.txt is not.
+    let agent = "echo change >> out.txt && echo stray > stray.txt";
+    let env = contract_run(&repo, &["ccx-a"], agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == "stray.txt" && v["class"] == "forbidden_path"),
+        "stray.txt must be an outside-allowlist violation: {violations:?}"
+    );
+}
+
+#[test]
+fn contract_run_blast_facade_decl_only_change_passes() {
+    // A declaration-only edit to a default facade file (crates/forge-cli/src/main.rs)
+    // is permitted even though it is outside the allowlist (statement-aware facade
+    // allowance ported from ccx-blast.py) — the run completes exit 0.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let agent = "mkdir -p crates/forge-cli/src && printf 'pub mod alpha;\\npub mod beta;\\n' > crates/forge-cli/src/main.rs";
+    let env = contract_run(&repo, &["ccx-a"], agent, 0);
+    assert_eq!(env["data"]["outcome"], "completed");
+}
+
+#[test]
+fn contract_run_blast_facade_executable_change_violates() {
+    // A NON-declaration (executable) edit to a facade file is NOT covered by the
+    // facade allowance — it is a blast violation (exit 3).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let agent = "mkdir -p crates/forge-cli/src && printf 'fn main() { evil(); }\\n' > crates/forge-cli/src/main.rs";
+    let env = contract_run(&repo, &["ccx-a"], agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == "crates/forge-cli/src/main.rs"),
+        "the non-decl facade edit must violate: {violations:?}"
+    );
+}
+
+#[test]
+fn contract_run_blast_default_forbid_not_weakenable() {
+    // R12: a contract that EXPLICITLY allows `.forge/**` still cannot weaken the
+    // non-weakenable default-forbid list — a `.forge/` write is still a violation.
+    let repo = run_repo();
+    freeze_contract_with_paths(&repo, "ccx-a", "[.forge/**, out.txt]");
+    let agent = "mkdir -p .forge && echo x > .forge/loot && echo change >> out.txt";
+    let env = contract_run(&repo, &["ccx-a"], agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == ".forge/loot" && v["class"] == "forbidden_path"),
+        "default-forbid must win over an explicit allow: {violations:?}"
+    );
+}
+
+#[test]
+fn contract_run_blast_secret_content_refused_patch_not_persisted() {
+    // R16 detect-and-refuse: an allowed file whose post-state content carries a
+    // secret-looking assignment fails the run (exit 3, secret_content class), the run
+    // record carries NO patch ref, and the raw secret bytes are absent from the run
+    // record (asserted via direct DB query).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    // out.txt is an allowed path; its content trips the shared secret detector.
+    let secret = "AKIASEKRETTESTMARKER1234";
+    let agent = format!("printf 'api_key = \"{secret}\"\\n' > out.txt");
+    let env = contract_run(&repo, &["ccx-a"], &agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    assert_eq!(env["data"]["secret_content_detected"], true);
+    let run_id = env["data"]["run_id"].as_str().unwrap().to_string();
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == "out.txt" && v["class"] == "secret_content"),
+        "the secret file must be named (path only): {violations:?}"
+    );
+
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    // The run row carries no patch ref (the offending tree is left unreferenced for GC).
+    let run_patch: Option<String> = conn
+        .query_row(
+            "SELECT patch_content_ref FROM contract_runs WHERE id = ?1",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        run_patch.is_none(),
+        "run must carry no patch ref: {run_patch:?}"
+    );
+    let task_patch: Option<String> = conn
+        .query_row(
+            "SELECT patch_content_ref FROM contract_run_tasks WHERE run_id = ?1 AND task_id = 'ccx-a'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        task_patch.is_none(),
+        "task must carry no patch ref: {task_patch:?}"
+    );
+
+    // The raw secret bytes never enter the run record (DB) in any column.
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM contract_run_tasks
+             WHERE run_id = ?1 AND (
+                COALESCE(agent_stdout_excerpt, '') LIKE '%AKIASEKRETTESTMARKER%'
+                OR COALESCE(agent_stderr_excerpt, '') LIKE '%AKIASEKRETTESTMARKER%'
+                OR COALESCE(patch_content_ref, '') LIKE '%AKIASEKRETTESTMARKER%')",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        leaked, 0,
+        "the raw secret must never be persisted in the run record"
+    );
+    let verdict_leak: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM contract_run_verdicts
+             WHERE run_id = ?1 AND COALESCE(detail, '') LIKE '%AKIASEKRETTESTMARKER%'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        verdict_leak, 0,
+        "the verdict detail must name the path only, never the secret"
+    );
+}
+
+#[test]
+fn contract_run_clean_records_blast_pass_verdict() {
+    // Regression: a clean run still completes exit 0, AND records a per-task `blast`
+    // pass verdict so the ledger shows the check ran green.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    assert_eq!(env["data"]["outcome"], "completed");
+    let run_id = env["data"]["run_id"].as_str().unwrap().to_string();
+    let passes = blast_verdict_details(&repo, &run_id, true);
+    assert!(
+        !passes.is_empty(),
+        "a clean run must record at least one blast pass verdict"
     );
 }

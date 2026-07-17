@@ -1282,6 +1282,106 @@ fn contract_verdict_digest(
     digest.finish()
 }
 
+/// Validate a verdict batch's shape (non-empty, known kinds) before any write —
+/// shared by the standalone and combined recorders.
+fn validate_verdicts(verdicts: &[ContractRunVerdictInput]) -> Result<()> {
+    if verdicts.is_empty() {
+        bail!("at least one verdict is required");
+    }
+    for verdict in verdicts {
+        if !VERDICT_KINDS.contains(&verdict.verdict_kind.as_str()) {
+            bail!("unsupported verdict kind `{}`", verdict.verdict_kind);
+        }
+    }
+    Ok(())
+}
+
+/// Insert a batch of verdict rows, sign each under `"contract_run_verdict"`, and
+/// chain ONE op onto `parent_operation_id` — WITHIN an existing IMMEDIATE txn. Shared
+/// by [`record_contract_run_verdicts`] (parent = current op) and the atomic
+/// run+verdicts path (parent = the run's op, so a blast-violation run and its
+/// verdicts commit or roll back together, U6/KTD3).
+#[allow(clippy::too_many_arguments)]
+fn insert_contract_verdicts_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    parent_operation_id: &str,
+    signer: &signing::LocalSigner,
+    request_id: Option<String>,
+    run_id: &str,
+    verdicts: &[ContractRunVerdictInput],
+    now: i64,
+) -> Result<Vec<ContractRunVerdictRecord>> {
+    let mut records = Vec::with_capacity(verdicts.len());
+    for verdict in verdicts {
+        let verdict_id = new_id("contract_verdict");
+        let content_hash = contract_verdict_digest(run_id, verdict, now);
+        tx.execute(
+            "INSERT INTO contract_run_verdicts (
+                id, repo_id, run_id, task_id, verdict_kind, command, passed, detail,
+                evidence_id, content_hash, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                verdict_id,
+                repo_id,
+                run_id,
+                verdict.task_id,
+                verdict.verdict_kind,
+                verdict.command,
+                verdict.passed as i64,
+                verdict.detail,
+                verdict.evidence_id,
+                content_hash,
+                now,
+            ],
+        )?;
+        signer.sign_subject(
+            tx,
+            repo_id,
+            SUBJECT_KIND_CONTRACT_VERDICT,
+            &verdict_id,
+            &content_hash,
+            now,
+        )?;
+        records.push(ContractRunVerdictRecord {
+            verdict_id,
+            run_id: run_id.to_string(),
+            task_id: verdict.task_id.clone(),
+            verdict_kind: verdict.verdict_kind.clone(),
+            command: verdict.command.clone(),
+            passed: verdict.passed,
+            detail: verdict.detail.clone(),
+            evidence_id: verdict.evidence_id.clone(),
+            content_hash,
+            created_at_ms: now,
+        });
+    }
+    // One op-log link per batch, folding the last verdict's digest into the
+    // spine (each verdict row carries its own signature above).
+    let spine_digest = records
+        .last()
+        .map(|record| record.content_hash.clone())
+        .expect("non-empty verdicts");
+    insert_operation_view_chained(
+        tx,
+        repo_id,
+        Some(parent_operation_id),
+        OperationViewInput {
+            request_id,
+            command: "contract".to_string(),
+            kind: "contract_verdicts_recorded".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: json!({
+                "lifecycle": "contract_verdicts_recorded",
+                "run_id": run_id,
+                "count": records.len(),
+            }),
+        },
+        Some(&spine_digest),
+    )?;
+    Ok(records)
+}
+
 /// Record one or more verdict rows against a run in a single transaction, each
 /// signed under `"contract_run_verdict"` and chained (R12/R13/R17). Replay-safe.
 pub fn record_contract_run_verdicts(
@@ -1290,14 +1390,7 @@ pub fn record_contract_run_verdicts(
     run_id: &str,
     verdicts: Vec<ContractRunVerdictInput>,
 ) -> Result<Vec<ContractRunVerdictRecord>> {
-    if verdicts.is_empty() {
-        bail!("at least one verdict is required");
-    }
-    for verdict in &verdicts {
-        if !VERDICT_KINDS.contains(&verdict.verdict_kind.as_str()) {
-            bail!("unsupported verdict kind `{}`", verdict.verdict_kind);
-        }
-    }
+    validate_verdicts(&verdicts)?;
     let context = open_repository(cwd)?;
     let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
@@ -1315,74 +1408,63 @@ pub fn record_contract_run_verdicts(
             bail!("contract run not found");
         }
         let now = now_ms();
-        let mut records = Vec::with_capacity(verdicts.len());
-        for verdict in &verdicts {
-            let verdict_id = new_id("contract_verdict");
-            let content_hash = contract_verdict_digest(run_id, verdict, now);
-            tx.execute(
-                "INSERT INTO contract_run_verdicts (
-                    id, repo_id, run_id, task_id, verdict_kind, command, passed, detail,
-                    evidence_id, content_hash, created_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    verdict_id,
-                    context.repo_id,
-                    run_id,
-                    verdict.task_id,
-                    verdict.verdict_kind,
-                    verdict.command,
-                    verdict.passed as i64,
-                    verdict.detail,
-                    verdict.evidence_id,
-                    content_hash,
-                    now,
-                ],
-            )?;
-            signer.sign_subject(
-                tx,
-                &context.repo_id,
-                SUBJECT_KIND_CONTRACT_VERDICT,
-                &verdict_id,
-                &content_hash,
-                now,
-            )?;
-            records.push(ContractRunVerdictRecord {
-                verdict_id,
-                run_id: run_id.to_string(),
-                task_id: verdict.task_id.clone(),
-                verdict_kind: verdict.verdict_kind.clone(),
-                command: verdict.command.clone(),
-                passed: verdict.passed,
-                detail: verdict.detail.clone(),
-                evidence_id: verdict.evidence_id.clone(),
-                content_hash,
-                created_at_ms: now,
-            });
-        }
-        // One op-log link per batch, folding the last verdict's digest into the
-        // spine (each verdict row carries its own signature above).
-        let spine_digest = records
-            .last()
-            .map(|record| record.content_hash.clone())
-            .expect("non-empty verdicts");
-        insert_operation_view_chained(
+        insert_contract_verdicts_in_tx(
             tx,
             &context.repo_id,
-            Some(&context.current_operation_id),
-            OperationViewInput {
-                request_id: request_id.clone(),
-                command: "contract".to_string(),
-                kind: "contract_verdicts_recorded".to_string(),
-                view_kind: ViewKind::Initialized,
-                state: json!({
-                    "lifecycle": "contract_verdicts_recorded",
-                    "run_id": run_id,
-                    "count": records.len(),
-                }),
-            },
-            Some(&spine_digest),
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            run_id,
+            &verdicts,
+            now,
+        )
+    })
+}
+
+/// Record a run AND its verdict rows in ONE immediate transaction (U6). The two
+/// writes previously would have to run in separate transactions, so a verdict-insert
+/// failure after the run row committed could leave a `blast_violation` run with no
+/// verdict to explain it. Here the verdicts chain onto the run's op and both commit
+/// or roll back together. The run carries `request_id` for replay; the verdict batch's
+/// op is unkeyed (part of the same replay-anchored `contract run` command). Used by
+/// the blast postflight: a clean run records per-task `blast`-pass verdicts, and a
+/// violation records the pass verdicts of prior tasks plus the offending task's
+/// failing verdicts — the offending patch is never referenced by the run row, so GC
+/// reclaims any secret-bearing tree object the snapshot step already wrote (KTD3/R16).
+pub fn record_contract_run_with_verdicts(
+    cwd: &Path,
+    request_id: Option<String>,
+    run_input: RecordContractRunInput,
+    verdicts: Vec<ContractRunVerdictInput>,
+) -> Result<(ContractRunRecord, Vec<ContractRunVerdictRecord>)> {
+    validate_run_input(&run_input)?;
+    validate_verdicts(&verdicts)?;
+    let context = open_repository(cwd)?;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let now = now_ms();
+        let (run, run_op) = insert_contract_run_in_tx(
+            tx,
+            &context.repo_id,
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            &run_input,
+            now,
         )?;
-        Ok(records)
+        let verdict_records = insert_contract_verdicts_in_tx(
+            tx,
+            &context.repo_id,
+            &run_op,
+            &signer,
+            None,
+            &run.run_id,
+            &verdicts,
+            now,
+        )?;
+        Ok((run, verdict_records))
     })
 }
 

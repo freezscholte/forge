@@ -85,7 +85,7 @@ flowchart TB
 **Security and integrity invariants**
 
 - R15. Acceptance commands remain constrained to the reviewed command grammar (`cargo test|clippy|fmt|build|run`, no shell metacharacters), enforced identically at lint time and at execution time; the verifier is fail-closed standalone and never executes a command outside the grammar. No regression of the current eval-sink hardening.
-- R16. Run and verification command output is captured through the existing evidence pipeline, inheriting the excerpt cap and secret redaction. The same secret-redaction pass is applied to captured patch artifacts (R7) and to the stop record's four ingested free-text fields (R8) before those records are written to the ledger and signed — agent-authored content never enters an append-only record unredacted.
+- R16. Run and verification command output is captured through the existing evidence pipeline, inheriting the excerpt cap and secret redaction, and the stop record's four ingested free-text fields (R8) are redacted before being written and signed. Patch artifacts (R7) are guarded fail-closed instead of rewritten: because the patch is also the integration payload (R27), storing redacted bytes would corrupt legitimate content at integrate time, so the blast postflight scans changed content for secret-like material and a detection is a violation — the run fails with a verdict recorded and the offending patch content is not persisted. Agent-authored content never enters an append-only record unredacted or unscanned.
 - R17. Contract, run, stop, and verdict records carry local Ed25519 signatures under the existing trust-level conventions, and `forge doctor` verifies them.
 - R18. Mutating contract subcommands accept `--request-id` with the existing idempotent-replay and conflict semantics.
 
@@ -340,7 +340,7 @@ Dependencies: U1, U5.
 
 Files: crates/forge-cli/src/commands/contract.rs, crates/forge-store/src/contract.rs, crates/forge-cli/tests/forge_contract.rs.
 
-Approach: Port ccx-blast.py's envelope and diff modes, including the statement-aware facade allowance and the default-forbid list that is not weakenable per-contract (R12). Record a verdict against the run and exit 3 on violation.
+Approach: Port ccx-blast.py's envelope and diff modes, including the statement-aware facade allowance and the default-forbid list that is not weakenable per-contract (R12). Record a verdict against the run and exit 3 on violation. The postflight also scans the patch's changed content for secret-like material (reusing the existing secret-detection machinery): a detection is a violation class of its own — the run fails with a verdict recorded and the offending patch content is not persisted (R16 fail-closed patch guard; redaction would corrupt the R27 integration payload).
 
 Patterns to follow: tools/ccx/ccx-blast.py (facade allowance, default-forbid).
 

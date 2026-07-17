@@ -32,7 +32,8 @@ use forge_content_native::{
 };
 use forge_protocol::ResponseEnvelope;
 use forge_store::{
-    ContractIntegrationRecord, ContractRunTaskInput, OpenContractStopInput, RecordContractRunInput,
+    ContractIntegrationRecord, ContractRunTaskInput, ContractRunVerdictInput,
+    OpenContractStopInput, RecordContractRunInput,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -40,6 +41,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
+use crate::commands::contract_blast::{self, BlastViolationClass};
 use crate::{
     command_result, current_base, owner_base_content_ref, ContractArgs, ContractBriefArgs,
     ContractCommand, ContractFreezeArgs, ContractIntegrateArgs, ContractLintArgs, ContractRunArgs,
@@ -1178,7 +1180,9 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 
 /// fnmatch-style glob match. `**` is normalized to `*` (author-friendly,
 /// same as ccx-lint.py's `matches`), then `*`→`.*`, `?`→`.`, full-string anchor.
-fn glob_match(path: &str, pattern: &str) -> bool {
+/// `pub(crate)` so the U6 blast postflight (`contract_blast.rs`) reuses the SINGLE
+/// ported matcher rather than duplicating it (plan U3 single-source rule).
+pub(crate) fn glob_match(path: &str, pattern: &str) -> bool {
     let normalized = pattern.replace("**", "*");
     let mut regex = String::from("^");
     for ch in normalized.chars() {
@@ -1464,6 +1468,27 @@ fn parse_depends_on(source_yaml: &str) -> Result<Vec<String>> {
         }
         Some(_) => Err(anyhow!("depends_on: must be a list of ids")),
     }
+}
+
+/// Read a frozen revision's `allowed_changes.paths` / `.forbidden_paths` globs for
+/// the U6 blast postflight. Parses the EXACT stored source bytes (R1) into the same
+/// serde_json shape the linter uses, so blast and lint read one allowlist.
+fn contract_allowed_changes(
+    cwd: &Path,
+    contract_id: &str,
+    revision: i64,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let record = forge_store::contract_revision(cwd, contract_id, revision)?
+        .ok_or_else(|| anyhow!("frozen revision {contract_id}@{revision} not found for blast"))?;
+    let value: Value = serde_yaml::from_str(&record.source_yaml)
+        .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
+    let allow = allowed_globs(&value);
+    let forbid = value
+        .get("allowed_changes")
+        .and_then(Value::as_object)
+        .map(|allowed| string_list(allowed.get("forbidden_paths")))
+        .unwrap_or_default();
+    Ok((allow, forbid))
 }
 
 /// Resolve the requested contract ids to frozen revisions, enforce per-id
@@ -1929,6 +1954,10 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
         let mut completed_outputs: BTreeMap<String, String> = BTreeMap::new();
         let mut task_states: Vec<TaskState> = Vec::new();
         let mut final_baseline: Option<String> = None;
+        // U6: one `blast`-pass verdict per freshly-completed task, recorded atomically
+        // with the run at the end (clean chain) or folded into a violation's verdict
+        // batch (a task's blast failure halts the chain).
+        let mut blast_verdicts: Vec<ContractRunVerdictInput> = Vec::new();
 
         for (index, task) in plan.iter().enumerate() {
             // KTD9 resume: a task the prior run completed is replayed from its
@@ -2102,12 +2131,87 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                 return Ok((Some(run.run_id), data, Vec::new()));
             }
 
-            // U6 BLAST POSTFLIGHT SEAM: the blast-radius check of `diff`/`post` against
-            // the contract's exclusion_contract and the non-weakenable default-forbid
-            // list (`.forge/**`, env files, key/credential paths) lands in U6 — it
-            // records a blast verdict against the run and exits 3 on violation
-            // (R12/AE7). NOT implemented in U5: a completed patch is accepted here
-            // without blast enforcement. Do not remove this seam without U6.
+            // U6 BLAST POSTFLIGHT (R12/R16/AE7): classify the agent patch against the
+            // contract allow/forbid globs + the non-weakenable default-forbid list, and
+            // scan added/modified post-state content for secrets. A violation halts the
+            // chain with exit 3, records a `blast` verdict naming the path (never the
+            // content), and does NOT persist the offending patch — the post tree object
+            // the snapshot already wrote is left unreferenced so GC reclaims it (KTD3/R16).
+            let (allow, forbid) = contract_allowed_changes(&cwd, &task.contract_id, task.revision)?;
+            let blast = contract_blast::evaluate_blast(&diff, &allow, &forbid, scratch.path())?;
+            if blast.has_violation() {
+                task_states.push(TaskState::from_agent(
+                    task.task_id(),
+                    "failed",
+                    None,
+                    &agent,
+                ));
+                fill_skipped(&mut task_states, &plan, index);
+                // Prior tasks' pass verdicts + this task's failing verdicts, all atomic
+                // with the run row (record_contract_run_with_verdicts).
+                let mut verdicts = std::mem::take(&mut blast_verdicts);
+                let mut violations_json: Vec<Value> = Vec::new();
+                let mut secret_content_detected = false;
+                for violation in &blast.violations {
+                    if violation.class == BlastViolationClass::SecretContent {
+                        secret_content_detected = true;
+                    }
+                    verdicts.push(ContractRunVerdictInput {
+                        task_id: Some(task.task_id()),
+                        verdict_kind: "blast".to_string(),
+                        command: None,
+                        passed: false,
+                        detail: Some(violation.detail.clone()),
+                        evidence_id: None,
+                    });
+                    violations_json.push(json!({
+                        "path": violation.path,
+                        "class": violation.class.as_str(),
+                        "detail": violation.detail,
+                    }));
+                }
+                // patch_content_ref is None on BOTH the run and the offending task, so a
+                // secret-bearing post tree is never referenced (R16 fail-closed guard).
+                let (run, _recorded) = forge_store::record_contract_run_with_verdicts(
+                    &cwd,
+                    request_id,
+                    build_run_input(
+                        &target,
+                        &base_commit,
+                        &final_baseline,
+                        &ack,
+                        "blast_violation",
+                        3,
+                        Some(i64::from(agent.exit_code)),
+                        None,
+                        &task_states,
+                    ),
+                    verdicts,
+                )?;
+                let data = json!({
+                    "outcome": "blast_violation",
+                    "exit_code": 3,
+                    "run_id": run.run_id,
+                    // R25: the typed code travels in a SUCCESS envelope (the run recorded
+                    // its outcome); main.rs maps data.exit_code=3 to the process exit.
+                    "code": "CONTRACT_BLAST_VIOLATION",
+                    "contract_id": task.contract_id,
+                    "revision": task.revision,
+                    "secret_content_detected": secret_content_detected,
+                    "violations": violations_json,
+                    "facade_allowed": blast.facade_allowed,
+                });
+                return Ok((Some(run.run_id), data, Vec::new()));
+            }
+            // Clean blast: record a per-task pass verdict, kept for the final run row.
+            blast_verdicts.push(ContractRunVerdictInput {
+                task_id: Some(task.task_id()),
+                verdict_kind: "blast".to_string(),
+                command: None,
+                passed: true,
+                detail: None,
+                evidence_id: None,
+            });
 
             completed_outputs.insert(task.contract_id.clone(), post.clone());
             final_baseline = Some(baseline);
@@ -2136,24 +2240,36 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             .into());
         }
 
-        // Every task completed (exit 0). The run's patch is the target task's produced
-        // tree, GC-rooted via the contract_runs patch_content_ref walk (gc.rs, KTD3).
+        // Every task completed AND passed blast (exit 0). The run's patch is the target
+        // task's produced tree, GC-rooted via the contract_runs patch_content_ref walk
+        // (gc.rs, KTD3). The per-task `blast`-pass verdicts are recorded atomically with
+        // the run so the ledger shows blast ran clean on every task (U6/R12).
         let final_post = completed_outputs.get(&target.contract_id).cloned();
-        let run = forge_store::record_contract_run(
-            &cwd,
-            request_id,
-            build_run_input(
-                &target,
-                &base_commit,
-                &final_baseline,
-                &ack,
-                "completed",
-                0,
-                Some(0),
-                final_post.clone(),
-                &task_states,
-            ),
-        )?;
+        let run_input = build_run_input(
+            &target,
+            &base_commit,
+            &final_baseline,
+            &ack,
+            "completed",
+            0,
+            Some(0),
+            final_post.clone(),
+            &task_states,
+        );
+        let run = if blast_verdicts.is_empty() {
+            // Degenerate (a resume that ran no fresh task is already refused above): no
+            // fresh blast verdict to record. Fall back to the plain run recorder rather
+            // than tripping the non-empty-verdicts guard.
+            forge_store::record_contract_run(&cwd, request_id, run_input)?
+        } else {
+            forge_store::record_contract_run_with_verdicts(
+                &cwd,
+                request_id,
+                run_input,
+                blast_verdicts,
+            )?
+            .0
+        };
         let data = json!({
             "outcome": "completed",
             "exit_code": 0,
