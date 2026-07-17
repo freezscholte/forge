@@ -9,7 +9,7 @@
 > with the agent invocation as the only script glue — is recorded. That
 > retirement scenario now runs green as
 > `native_chain_end_to_end_retirement_criterion` in
-> `crates/forge-cli/tests/forge_contract.rs`; the scripts stay in place until the
+> `crates/forge-cli/tests/forge_contract_retirement.rs`; the scripts stay in place until the
 > criterion is formally recorded in the release audit. Nothing below is
 > deprecated yet.
 

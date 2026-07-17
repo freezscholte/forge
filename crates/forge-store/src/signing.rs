@@ -727,8 +727,10 @@ fn expected_signed_subjects(conn: &Connection) -> Result<ExpectedSignedSubjects>
     // Contract-family rows (U9/KTD2): every contract, run, stop, and verdict row must
     // carry a valid local signature over its current digest. The four kinds are born
     // signed in migration 022, so there is no pre-signing population to grandfather
-    // (per-kind high-water 0); the enumeration lives in the contract domain module.
-    any_verifiable.extend(crate::contract::expected_contract_signed_subjects(conn)?);
+    // (per-kind high-water 0); the enumeration lives in the contract_doctor domain module.
+    any_verifiable.extend(crate::contract_doctor::expected_contract_signed_subjects(
+        conn,
+    )?);
 
     Ok(ExpectedSignedSubjects {
         any_verifiable,
@@ -790,9 +792,9 @@ fn current_subject_digest(
         // Contract-family kinds (U9/KTD2): recompute the subject's canonical digest
         // from its CURRENT row content so an out-of-band field edit is caught as a
         // `DigestMismatch` and a deleted row as a `SubjectMissing`. The recompute
-        // lives in the contract domain module (it owns the digest functions).
+        // lives in the contract_doctor domain module (it owns the digest functions).
         "contract" | "contract_run" | "contract_stop" | "contract_run_verdict" => {
-            crate::contract::contract_subject_digest(conn, subject_kind, subject_id)
+            crate::contract_doctor::contract_subject_digest(conn, subject_kind, subject_id)
         }
         _ => Ok(None),
     }

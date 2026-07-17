@@ -16,6 +16,7 @@ mod attempts;
 mod compare;
 mod conflict;
 mod contract;
+mod contract_doctor;
 mod contract_run;
 mod doctor;
 mod embargo;
