@@ -163,6 +163,18 @@ pub(crate) fn contract_response(
         ContractCommand::Verify(args) => {
             crate::commands::contract_verify::verify_response(request_id, args)
         }
+        ContractCommand::Stops(args) => {
+            crate::commands::contract_query::stops_response(request_id, args)
+        }
+        ContractCommand::Show(args) => {
+            crate::commands::contract_query::show_response(request_id, args)
+        }
+        ContractCommand::Verdicts(args) => {
+            crate::commands::contract_query::verdicts_response(request_id, args)
+        }
+        ContractCommand::Resolve(args) => {
+            crate::commands::contract_query::resolve_response(request_id, args)
+        }
     }
 }
 
@@ -274,7 +286,7 @@ fn freeze_response(request_id: Option<String>, args: ContractFreezeArgs) -> Resp
 
 /// Canonicalize an operand path at the argument boundary (R19). Relative paths
 /// resolve against the command's working directory.
-fn canonicalize_operand(cwd: &Path, raw: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_operand(cwd: &Path, raw: &Path) -> Result<PathBuf> {
     let candidate = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
@@ -284,7 +296,7 @@ fn canonicalize_operand(cwd: &Path, raw: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve contract path {}", candidate.display()))
 }
 
-fn read_source_string(path: &Path) -> Result<String> {
+pub(crate) fn read_source_string(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("cannot read contract {}", path.display()))?;
     String::from_utf8(bytes).map_err(|_| anyhow!("contract {} is not valid UTF-8", path.display()))
@@ -318,8 +330,8 @@ impl Severity {
     }
 }
 
-struct LintOutcome {
-    contract_id: String,
+pub(crate) struct LintOutcome {
+    pub(crate) contract_id: String,
     findings: Vec<Finding>,
     /// First acceptance command that failed the grammar (drives the typed
     /// `CONTRACT_GRAMMAR_VIOLATION`).
@@ -331,7 +343,7 @@ impl LintOutcome {
         self.findings.iter().any(|f| f.severity == Severity::Error)
     }
 
-    fn verdict(&self) -> &'static str {
+    pub(crate) fn verdict(&self) -> &'static str {
         if self.has_error() {
             "errors"
         } else if self
@@ -345,7 +357,7 @@ impl LintOutcome {
         }
     }
 
-    fn findings_json(&self) -> Vec<Value> {
+    pub(crate) fn findings_json(&self) -> Vec<Value> {
         self.findings
             .iter()
             .map(|f| {
@@ -360,7 +372,7 @@ impl LintOutcome {
 
     /// Convert a failing lint into a typed refusal (grammar first, so AE6 gets
     /// `CONTRACT_GRAMMAR_VIOLATION`; otherwise `CONTRACT_LINT_FAILED`).
-    fn ensure_lint_clean(&self) -> Result<()> {
+    pub(crate) fn ensure_lint_clean(&self) -> Result<()> {
         if let Some(command) = &self.grammar_violation {
             return Err(ForgeError::ContractGrammarViolation {
                 command: command.clone(),
@@ -398,7 +410,7 @@ struct Linter<'a> {
 
 /// Lint a contract file and return its outcome. A read/parse failure is itself an
 /// error finding (fail-closed, like the harness).
-fn lint_contract_file(path: &Path, repo_root: &Path) -> Result<LintOutcome> {
+pub(crate) fn lint_contract_file(path: &Path, repo_root: &Path) -> Result<LintOutcome> {
     let contracts_dir = path
         .parent()
         .map(Path::to_path_buf)
@@ -1451,7 +1463,38 @@ impl PlannedTask {
 }
 
 /// Parse a frozen revision's `depends_on:` id list, mirroring the neighbor parser.
-fn parse_depends_on(source_yaml: &str) -> Result<Vec<String>> {
+/// Expand `seeds` to the full transitive dependency closure over frozen
+/// `depends_on` edges, to fixpoint (R10 Leg 3). The single source of truth for
+/// "which contracts' open stops block this operation": `run_response` seeds it with
+/// the chain's contracts plus every acknowledged out-of-chain dependency; the
+/// `contract show` blocked/runnable status seeds it with the one contract. A
+/// contract with no frozen revision contributes no edges. Cycle-safe via `visited`.
+pub(crate) fn contract_dependency_closure(
+    cwd: &Path,
+    seeds: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>> {
+    let mut closure_ids: Vec<String> = Vec::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: VecDeque<String> = seeds.into_iter().collect();
+    while let Some(id) = frontier.pop_front() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        closure_ids.push(id.clone());
+        if let Some(revision) = forge_store::latest_contract_revision(cwd, &id)?
+            .filter(|record| record.state == "frozen")
+        {
+            for dep in parse_depends_on(&revision.source_yaml)? {
+                if !visited.contains(&dep) {
+                    frontier.push_back(dep);
+                }
+            }
+        }
+    }
+    Ok(closure_ids)
+}
+
+pub(crate) fn parse_depends_on(source_yaml: &str) -> Result<Vec<String>> {
     let parsed: serde_yaml::Value = serde_yaml::from_str(source_yaml)
         .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
     let Some(map) = parsed.as_mapping() else {
@@ -1863,35 +1906,15 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
         // Leg 3 (R10/AE2/AE9): refuse if ANY contract in the FULL transitive
         // dependency closure has an open stop, naming the blocking stop ids — no
         // agent runs. The seeds are the chain's contracts plus every acknowledged
-        // out-of-chain dependency; from there we expand each contract's frozen
-        // `depends_on` to fixpoint, so an open stop on a DEEP dependency (reached only
-        // through an acknowledged dep, e.g. an ack'd `b` whose frozen `depends_on`
-        // names a stopped `a`) still blocks the run. Walking only the direct seeds
-        // (the prior behavior) let such a transitive stop slip the gate. Cycle-safe
-        // via the visited set; a contract with no frozen revision contributes no
-        // edges (and can carry no open stop of its own either).
-        let mut closure_ids: Vec<String> = Vec::new();
-        let mut visited: BTreeSet<String> = BTreeSet::new();
-        let mut frontier: VecDeque<String> = plan
+        // out-of-chain dependency; `contract_dependency_closure` (the single source
+        // shared with `contract show`) expands them over frozen `depends_on` to
+        // fixpoint, so an open stop on a DEEP dependency (reached only through an
+        // acknowledged dep) still blocks the run.
+        let seeds = plan
             .iter()
             .map(|task| task.contract_id.clone())
-            .chain(ack.keys().cloned())
-            .collect();
-        while let Some(id) = frontier.pop_front() {
-            if !visited.insert(id.clone()) {
-                continue;
-            }
-            closure_ids.push(id.clone());
-            if let Some(revision) = forge_store::latest_contract_revision(&cwd, &id)?
-                .filter(|record| record.state == "frozen")
-            {
-                for dep in parse_depends_on(&revision.source_yaml)? {
-                    if !visited.contains(&dep) {
-                        frontier.push_back(dep);
-                    }
-                }
-            }
-        }
+            .chain(ack.keys().cloned());
+        let closure_ids = contract_dependency_closure(&cwd, seeds)?;
         let open = forge_store::open_stops_for_contracts(&cwd, &closure_ids)?;
         if !open.is_empty() {
             let stop_ids = open.into_iter().map(|stop| stop.stop_id).collect();

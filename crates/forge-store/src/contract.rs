@@ -183,6 +183,48 @@ pub fn freeze_contract_revision(
     request_id: Option<String>,
     input: FreezeContractRevisionInput,
 ) -> Result<ContractRevisionRecord> {
+    let context = open_repository(cwd)?;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let now = now_ms();
+        let (record, _op) = freeze_revision_in_tx(
+            tx,
+            &context.repo_id,
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            // Must equal the CLI command string so `command_result`'s pre-flight
+            // replay (`replay_response`) folds a same-request-id retry to the
+            // original result instead of raising REQUEST_ID_CONFLICT.
+            "contract freeze",
+            &input,
+            now,
+        )?;
+        Ok(record)
+    })
+}
+
+/// Freeze a new immutable revision WITHIN an existing IMMEDIATE txn: upsert the
+/// head pointer, insert the signed revision row, and chain ONE op onto
+/// `parent_operation_id` under `command` (the CLI verb, so replay folds). Returns
+/// the record plus the operation id the spine advanced to, so a caller composing a
+/// second chained write in the SAME txn (the resolve-with-bump path, R10) threads
+/// it as the next parent. Shared by [`freeze_contract_revision`] and
+/// [`resolve_contract_stop`], so a stop-driven revision bump is atomic with the
+/// stop resolution.
+#[allow(clippy::too_many_arguments)]
+fn freeze_revision_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    parent_operation_id: &str,
+    signer: &signing::LocalSigner,
+    request_id: Option<String>,
+    command: &str,
+    input: &FreezeContractRevisionInput,
+    now: i64,
+) -> Result<(ContractRevisionRecord, String)> {
     if input.contract_id.trim().is_empty() {
         bail!("contract id must not be empty");
     }
@@ -191,91 +233,83 @@ pub fn freeze_contract_revision(
             bail!("unsupported contract resolution kind `{kind}`");
         }
     }
-    let context = open_repository(cwd)?;
-    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
-    let mut connection = open_connection(&context.database_path)?;
-    with_immediate_retry(&mut connection, |tx| {
-        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        let now = now_ms();
-        let latest_revision: Option<i64> = tx
-            .query_row(
-                "SELECT latest_revision FROM contracts WHERE repo_id = ?1 AND contract_id = ?2",
-                params![context.repo_id, input.contract_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let predecessor_revision = latest_revision.filter(|value| *value > 0);
-        let revision = latest_revision.unwrap_or(0) + 1;
-        // Upsert the head pointer.
-        tx.execute(
-            "INSERT INTO contracts (repo_id, contract_id, latest_revision, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(repo_id, contract_id)
-             DO UPDATE SET latest_revision = excluded.latest_revision, updated_at_ms = excluded.updated_at_ms",
-            params![context.repo_id, input.contract_id, revision, now],
-        )?;
-        let revision_row_id = new_id("contract_rev");
-        let state = "frozen";
-        let content_hash = contract_revision_digest(
-            &input.contract_id,
+    let latest_revision: Option<i64> = tx
+        .query_row(
+            "SELECT latest_revision FROM contracts WHERE repo_id = ?1 AND contract_id = ?2",
+            params![repo_id, input.contract_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let predecessor_revision = latest_revision.filter(|value| *value > 0);
+    let revision = latest_revision.unwrap_or(0) + 1;
+    // Upsert the head pointer.
+    tx.execute(
+        "INSERT INTO contracts (repo_id, contract_id, latest_revision, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(repo_id, contract_id)
+         DO UPDATE SET latest_revision = excluded.latest_revision, updated_at_ms = excluded.updated_at_ms",
+        params![repo_id, input.contract_id, revision, now],
+    )?;
+    let revision_row_id = new_id("contract_rev");
+    let state = "frozen";
+    let content_hash = contract_revision_digest(
+        &input.contract_id,
+        revision,
+        state,
+        &input.source_yaml,
+        input.lint_clean,
+        predecessor_revision,
+        input.resolution_kind.as_deref(),
+        input.resolution_rationale.as_deref(),
+        now,
+    );
+    tx.execute(
+        "INSERT INTO contract_revisions (
+            id, repo_id, contract_id, revision, state, source_yaml, lint_clean,
+            predecessor_revision, resolution_kind, resolution_rationale, content_hash, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            revision_row_id,
+            repo_id,
+            input.contract_id,
             revision,
             state,
-            &input.source_yaml,
-            input.lint_clean,
+            input.source_yaml,
+            input.lint_clean as i64,
             predecessor_revision,
-            input.resolution_kind.as_deref(),
-            input.resolution_rationale.as_deref(),
+            input.resolution_kind,
+            input.resolution_rationale,
+            content_hash,
             now,
-        );
-        tx.execute(
-            "INSERT INTO contract_revisions (
-                id, repo_id, contract_id, revision, state, source_yaml, lint_clean,
-                predecessor_revision, resolution_kind, resolution_rationale, content_hash, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                revision_row_id,
-                context.repo_id,
-                input.contract_id,
-                revision,
-                state,
-                input.source_yaml,
-                input.lint_clean as i64,
-                predecessor_revision,
-                input.resolution_kind,
-                input.resolution_rationale,
-                content_hash,
-                now,
-            ],
-        )?;
-        signer.sign_subject(
-            tx,
-            &context.repo_id,
-            SUBJECT_KIND_CONTRACT,
-            &revision_row_id,
-            &content_hash,
-            now,
-        )?;
-        insert_operation_view_chained(
-            tx,
-            &context.repo_id,
-            Some(&context.current_operation_id),
-            OperationViewInput {
-                request_id: request_id.clone(),
-                // Must equal the CLI command string so `command_result`'s pre-flight
-                // replay (`replay_response`) folds a same-request-id retry to the
-                // original result instead of raising REQUEST_ID_CONFLICT.
-                command: "contract freeze".to_string(),
-                kind: "contract_frozen".to_string(),
-                view_kind: ViewKind::Initialized,
-                state: json!({
-                    "lifecycle": "contract_frozen",
-                    "contract_id": input.contract_id,
-                    "revision": revision,
-                }),
-            },
-            Some(&content_hash),
-        )?;
-        Ok(ContractRevisionRecord {
+        ],
+    )?;
+    signer.sign_subject(
+        tx,
+        repo_id,
+        SUBJECT_KIND_CONTRACT,
+        &revision_row_id,
+        &content_hash,
+        now,
+    )?;
+    let op = insert_operation_view_chained(
+        tx,
+        repo_id,
+        Some(parent_operation_id),
+        OperationViewInput {
+            request_id,
+            command: command.to_string(),
+            kind: "contract_frozen".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: json!({
+                "lifecycle": "contract_frozen",
+                "contract_id": input.contract_id,
+                "revision": revision,
+            }),
+        },
+        Some(&content_hash),
+    )?;
+    Ok((
+        ContractRevisionRecord {
             revision_row_id,
             contract_id: input.contract_id.clone(),
             revision,
@@ -287,8 +321,9 @@ pub fn freeze_contract_revision(
             resolution_rationale: input.resolution_rationale.clone(),
             content_hash,
             created_at_ms: now,
-        })
-    })
+        },
+        op.operation_id,
+    ))
 }
 
 /// Read one frozen revision back verbatim (R1). Returns `None` when the
@@ -1049,110 +1084,225 @@ pub fn open_contract_stop(
     })
 }
 
-/// Resolve an open stop (R10): record a revision-bump link or an explicit
-/// rejection with rationale, re-signing the mutated row under `"contract_stop"`.
-/// Refuses to resolve an already-resolved stop (lifecycle guard). Replay-safe.
+/// Operator-supplied values for a malformed stop's four required fields (R8/R25
+/// reconstruction). Each `Some` field replaces the ingested best-effort value and
+/// is redacted before it enters the append-only record; each `None` keeps the
+/// existing value. The CLI validates a supplied `kind` against the stop
+/// vocabulary before calling, so the store can recompute `malformed` on presence.
+#[derive(Debug, Clone, Default)]
+pub struct StopFieldReconstruction {
+    pub what_needed: Option<String>,
+    pub why_unanswered: Option<String>,
+    pub kind: Option<String>,
+    pub evidence: Option<String>,
+}
+
+impl StopFieldReconstruction {
+    fn is_empty(&self) -> bool {
+        self.what_needed.is_none()
+            && self.why_unanswered.is_none()
+            && self.kind.is_none()
+            && self.evidence.is_none()
+    }
+}
+
+/// Inputs to [`resolve_contract_stop`]. `source_yaml` is the exact bytes to freeze
+/// as the bump revision: the revised, re-linted YAML for `resolution_kind =
+/// "revision"`, or the current frozen bytes verbatim for `"rejection"` (R10 —
+/// an explicit rejection bumps the revision recording the rationale WITHOUT
+/// changing contract content). The CLI lints/reads those bytes; the store freezes
+/// them.
+#[derive(Debug, Clone)]
+pub struct ResolveContractStopInput {
+    pub stop_id: String,
+    pub resolution_kind: String,
+    pub resolution_rationale: Option<String>,
+    pub source_yaml: String,
+    pub reconstruction: StopFieldReconstruction,
+}
+
+/// Resolve an open stop (R10/R24) AND freeze the bump revision it licenses, in ONE
+/// IMMEDIATE txn keyed by a single `request_id` so the two writes are atomic and
+/// idempotent together (a torn resolve can never leave an orphan bump with the stop
+/// still open). Both a revision bump and an explicit rejection create a new frozen
+/// revision (R10); the resolved stop links it via `resolving_revision`. Optional
+/// `reconstruction` fields for a malformed stop are redacted and folded into the
+/// re-signed record, clearing `malformed` once all four fields are present (R8/R25).
+/// Refuses to resolve an already-resolved stop (lifecycle guard). Replay-safe (R18).
 pub fn resolve_contract_stop(
     cwd: &Path,
     request_id: Option<String>,
-    stop_id: &str,
-    resolution_kind: &str,
-    resolution_rationale: Option<&str>,
-    resolving_revision: Option<i64>,
-) -> Result<ContractStopRecord> {
-    if !matches!(resolution_kind, "revision" | "rejection") {
-        bail!("unsupported contract resolution kind `{resolution_kind}`");
+    input: ResolveContractStopInput,
+) -> Result<(ContractRevisionRecord, ContractStopRecord)> {
+    if !matches!(input.resolution_kind.as_str(), "revision" | "rejection") {
+        bail!(
+            "unsupported contract resolution kind `{}`",
+            input.resolution_kind
+        );
     }
     let context = open_repository(cwd)?;
     let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        let existing = contract_stop_on(tx, &context.repo_id, stop_id)?
+        let existing = contract_stop_on(tx, &context.repo_id, &input.stop_id)?
             .ok_or_else(|| anyhow!("contract stop not found"))?;
         if existing.state != "open" {
             bail!("contract stop is not open (state `{}`)", existing.state);
         }
         let now = now_ms();
+        // Redact the rationale ONCE, then record it on both the bump revision and
+        // the resolved stop (redact-before-sign, KTD3).
+        let rationale = redact_field(input.resolution_rationale.as_deref());
+
+        // 1. Freeze the bump revision (content changed, or rejection-preserved),
+        //    chained onto the current op. `request_id` is None here — the resolved
+        //    stop op below is the single replay anchor for this command.
+        let (revision_record, freeze_op) = freeze_revision_in_tx(
+            tx,
+            &context.repo_id,
+            &context.current_operation_id,
+            &signer,
+            None,
+            "contract resolve",
+            &FreezeContractRevisionInput {
+                contract_id: existing.contract_id.clone(),
+                source_yaml: input.source_yaml.clone(),
+                lint_clean: true,
+                resolution_kind: Some(input.resolution_kind.clone()),
+                resolution_rationale: rationale.clone(),
+            },
+            now,
+        )?;
+
+        // 2. Merge any supplied reconstruction fields (redacted) over the ingested
+        //    best-effort values. When nothing is supplied, keep the original
+        //    `malformed` flag (which also captured kind-vocabulary validity); when
+        //    fields ARE supplied, recompute it on presence — the CLI has already
+        //    validated a supplied `kind`.
+        let merge = |supplied: Option<&str>, current: &Option<String>| -> Option<String> {
+            match supplied {
+                Some(value) => redact_field(Some(value)),
+                None => current.clone(),
+            }
+        };
+        let what_needed = merge(
+            input.reconstruction.what_needed.as_deref(),
+            &existing.what_needed,
+        );
+        let why_unanswered = merge(
+            input.reconstruction.why_unanswered.as_deref(),
+            &existing.why_unanswered,
+        );
+        let kind = merge(input.reconstruction.kind.as_deref(), &existing.kind);
+        let evidence = merge(input.reconstruction.evidence.as_deref(), &existing.evidence);
+        let malformed = if input.reconstruction.is_empty() {
+            existing.malformed
+        } else {
+            what_needed.is_none()
+                || why_unanswered.is_none()
+                || kind.is_none()
+                || evidence.is_none()
+        };
+
+        // 3. Re-sign and update the stop row, linking the bump revision.
         let state = "resolved";
-        let rationale = redact_field(resolution_rationale);
+        let resolving_revision = Some(revision_record.revision);
         let content_hash = contract_stop_digest(
             &existing.contract_id,
             existing.revision,
             existing.run_id.as_deref(),
             existing.task_id.as_deref(),
-            existing.what_needed.as_deref(),
-            existing.why_unanswered.as_deref(),
-            existing.kind.as_deref(),
-            existing.evidence.as_deref(),
-            existing.malformed,
+            what_needed.as_deref(),
+            why_unanswered.as_deref(),
+            kind.as_deref(),
+            evidence.as_deref(),
+            malformed,
             state,
-            Some(resolution_kind),
+            Some(&input.resolution_kind),
             rationale.as_deref(),
             resolving_revision,
             now,
         );
         tx.execute(
             "UPDATE contract_stops
-             SET state = ?1, resolution_kind = ?2, resolution_rationale = ?3,
-                 resolving_revision = ?4, content_hash = ?5, updated_at_ms = ?6
-             WHERE repo_id = ?7 AND id = ?8",
+             SET what_needed = ?1, why_unanswered = ?2, kind = ?3, evidence = ?4,
+                 malformed = ?5, state = ?6, resolution_kind = ?7, resolution_rationale = ?8,
+                 resolving_revision = ?9, content_hash = ?10, updated_at_ms = ?11
+             WHERE repo_id = ?12 AND id = ?13",
             params![
+                what_needed,
+                why_unanswered,
+                kind,
+                evidence,
+                malformed as i64,
                 state,
-                resolution_kind,
+                input.resolution_kind,
                 rationale,
                 resolving_revision,
                 content_hash,
                 now,
                 context.repo_id,
-                stop_id,
+                input.stop_id,
             ],
         )?;
         signer.sign_subject(
             tx,
             &context.repo_id,
             SUBJECT_KIND_CONTRACT_STOP,
-            stop_id,
+            &input.stop_id,
             &content_hash,
             now,
         )?;
         insert_operation_view_chained(
             tx,
             &context.repo_id,
-            Some(&context.current_operation_id),
+            Some(&freeze_op),
             OperationViewInput {
                 request_id: request_id.clone(),
-                command: "contract".to_string(),
+                // Must equal the CLI command string so `command_result`'s pre-flight
+                // replay folds a same-request-id retry to the recorded result.
+                command: "contract resolve".to_string(),
                 kind: "contract_stop_resolved".to_string(),
                 view_kind: ViewKind::Initialized,
                 state: json!({
                     "lifecycle": "contract_stop_resolved",
-                    "stop_id": stop_id,
-                    "resolution_kind": resolution_kind,
+                    "stop_id": input.stop_id,
+                    "resolution_kind": input.resolution_kind,
+                    "resolving_revision": revision_record.revision,
                 }),
             },
             Some(&content_hash),
         )?;
-        Ok(ContractStopRecord {
-            stop_id: stop_id.to_string(),
+        let stop_record = ContractStopRecord {
+            stop_id: input.stop_id.clone(),
             contract_id: existing.contract_id,
             revision: existing.revision,
             run_id: existing.run_id,
             task_id: existing.task_id,
-            what_needed: existing.what_needed,
-            why_unanswered: existing.why_unanswered,
-            kind: existing.kind,
-            evidence: existing.evidence,
-            malformed: existing.malformed,
+            what_needed,
+            why_unanswered,
+            kind,
+            evidence,
+            malformed,
             state: state.to_string(),
-            resolution_kind: Some(resolution_kind.to_string()),
+            resolution_kind: Some(input.resolution_kind.clone()),
             resolution_rationale: rationale,
             resolving_revision,
             content_hash,
             created_at_ms: existing.created_at_ms,
             updated_at_ms: now,
-        })
+        };
+        Ok((revision_record, stop_record))
     })
+}
+
+/// Read one stop record back by id (R23 read surface / triage lookup). Returns
+/// `None` when the id does not exist in this repo.
+pub fn contract_stop(cwd: &Path, stop_id: &str) -> Result<Option<ContractStopRecord>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    contract_stop_on(&connection, &context.repo_id, stop_id)
 }
 
 /// List stop records for a repo, optionally filtered to one contract and/or the
@@ -2214,22 +2364,37 @@ mod tests {
         let open = contract_stops(temp.path(), Some("c1"), true).expect("list open");
         assert_eq!(open.len(), 1);
 
-        let resolved = resolve_contract_stop(
+        // An explicit rejection bumps the revision (content unchanged) and links it.
+        let (revision, resolved) = resolve_contract_stop(
             temp.path(),
             None,
-            &stop.stop_id,
-            "rejection",
-            Some("not a real gap; brief already covers it"),
-            Some(2),
+            ResolveContractStopInput {
+                stop_id: stop.stop_id.clone(),
+                resolution_kind: "rejection".to_string(),
+                resolution_rationale: Some("not a real gap; brief already covers it".to_string()),
+                source_yaml: "id: c1\n".to_string(),
+                reconstruction: StopFieldReconstruction::default(),
+            },
         )
         .expect("resolve stop");
         assert_eq!(resolved.state, "resolved");
+        assert_eq!(revision.revision, 2);
+        assert_eq!(revision.source_yaml, "id: c1\n");
         assert_eq!(resolved.resolving_revision, Some(2));
 
         // Second resolve is a forbidden lifecycle transition.
-        let error =
-            resolve_contract_stop(temp.path(), None, &stop.stop_id, "revision", None, Some(3))
-                .expect_err("double-resolve must fail");
+        let error = resolve_contract_stop(
+            temp.path(),
+            None,
+            ResolveContractStopInput {
+                stop_id: stop.stop_id.clone(),
+                resolution_kind: "revision".to_string(),
+                resolution_rationale: None,
+                source_yaml: "id: c1\n".to_string(),
+                reconstruction: StopFieldReconstruction::default(),
+            },
+        )
+        .expect_err("double-resolve must fail");
         assert!(
             error.to_string().contains("not open"),
             "unexpected: {error}"

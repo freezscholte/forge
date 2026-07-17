@@ -73,7 +73,7 @@ pub use conflict::{
 };
 pub use contract::{
     acceptance_command_is_safe, check_acceptance_command, contract_brief, contract_revision,
-    contract_run, contract_run_verdicts, contract_stops, freeze_contract_revision,
+    contract_run, contract_run_verdicts, contract_stop, contract_stops, freeze_contract_revision,
     latest_contract_revision, open_contract_stop, record_contract_run,
     record_contract_run_verdicts, record_contract_run_with_stop, record_contract_run_with_verdicts,
     record_contract_verify_verdicts, resolve_contract_stop, AcceptanceCommandCheck,
@@ -81,8 +81,9 @@ pub use contract::{
     ContractRunRecord, ContractRunTaskInput, ContractRunTaskRecord, ContractRunVerdictInput,
     ContractRunVerdictRecord, ContractStopRecord, ContractVerifyOutcome,
     FreezeContractRevisionInput, OpenContractStopInput, RecordContractRunInput,
-    GLOBAL_POLICY_CONTRACT_ID, SUBJECT_KIND_CONTRACT, SUBJECT_KIND_CONTRACT_RUN,
-    SUBJECT_KIND_CONTRACT_STOP, SUBJECT_KIND_CONTRACT_VERDICT,
+    ResolveContractStopInput, StopFieldReconstruction, GLOBAL_POLICY_CONTRACT_ID,
+    SUBJECT_KIND_CONTRACT, SUBJECT_KIND_CONTRACT_RUN, SUBJECT_KIND_CONTRACT_STOP,
+    SUBJECT_KIND_CONTRACT_VERDICT,
 };
 pub use contract_run::{
     contract_integration_accepted, contract_integration_intent_text, contract_run_by_ref,

@@ -492,6 +492,19 @@ pub(crate) enum ContractCommand {
     /// Independently re-verify a completed run's acceptance on a rebuilt base: run
     /// the frozen contract's fix set then guard set, recording per-command verdicts.
     Verify(ContractVerifyArgs),
+    /// List stop records for triage (read-only). `--open` filters to unresolved
+    /// stops; each carries the four triageable fields and the malformed flag (R23).
+    Stops(ContractStopsArgs),
+    /// Show a run, task, or contract record (read-only): a run's per-task outcomes
+    /// and tally, or a contract's current frozen revision and blocked/runnable
+    /// status over its dependency closure (R23).
+    Show(ContractShowArgs),
+    /// List the recorded check verdicts for a run or task (read-only, R23).
+    Verdicts(ContractVerdictsArgs),
+    /// Resolve an open stop (R10/R24): a revision bump (`--revised <yaml>`) or an
+    /// explicit rejection (`--reject --rationale <text>`). Both freeze a new
+    /// revision; malformed stops accept the four fields inline for reconstruction.
+    Resolve(ContractResolveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -564,6 +577,59 @@ pub(crate) struct ContractBriefArgs {
     /// Write the brief to this path instead of stdout. Canonicalized at the boundary.
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractStopsArgs {
+    /// Only list stops still open (unresolved) — the triage worklist.
+    #[arg(long)]
+    pub(crate) open: bool,
+    /// Restrict to one contract id (default: every contract in the repo).
+    #[arg(long)]
+    pub(crate) contract_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractShowArgs {
+    /// A run id, a completed task id, or a contract id. A run/task ref shows the
+    /// run record; otherwise the target is read as a contract id.
+    pub(crate) target: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractVerdictsArgs {
+    /// A run id or a completed task id whose recorded verdicts to list.
+    pub(crate) target: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractResolveArgs {
+    /// The open stop id to resolve.
+    pub(crate) stop_id: String,
+    /// Revision-bump resolution: lint and freeze this revised YAML as the bump
+    /// revision and link it to the stop. Mutually exclusive with `--reject`.
+    #[arg(long, conflicts_with = "reject")]
+    pub(crate) revised: Option<PathBuf>,
+    /// Explicit rejection: bump the revision recording the rationale WITHOUT
+    /// changing contract content (R10). Requires `--rationale`.
+    #[arg(long, requires = "rationale")]
+    pub(crate) reject: bool,
+    /// The rationale citing the licensing clause (required for `--reject`; also
+    /// recorded for a revision bump when supplied). Redacted before it is stored.
+    #[arg(long)]
+    pub(crate) rationale: Option<String>,
+    /// Reconstruct a malformed stop's "what is needed" field before resolving.
+    #[arg(long)]
+    pub(crate) what_needed: Option<String>,
+    /// Reconstruct a malformed stop's "why the brief does not answer it" field.
+    #[arg(long)]
+    pub(crate) why_unanswered: Option<String>,
+    /// Reconstruct a malformed stop's kind (blocking | assumption | observation).
+    #[arg(long)]
+    pub(crate) kind: Option<String>,
+    /// Reconstruct a malformed stop's file:line evidence field.
+    #[arg(long)]
+    pub(crate) evidence: Option<String>,
 }
 
 #[derive(Debug, Args)]

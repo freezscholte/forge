@@ -1277,15 +1277,23 @@ fn contract_run_resume_after_triage_resumes_from_stopped_task() {
     );
     assert_eq!(error_code(&refused), "CONTRACT_OPEN_STOP");
 
-    // Triage: resolve the stop. U8 ships the resolve subcommand; until then this
-    // direct state flip is the test's stand-in for a recorded triage resolution.
-    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
-    conn.execute(
-        "UPDATE contract_stops SET state = 'resolved', resolution_kind = 'rejection',
-                resolution_rationale = 'test triage stand-in' WHERE id = ?1",
-        [&stop_id],
-    )
-    .expect("resolve stop (U8 stand-in)");
+    // Triage: resolve the stop via the real U8 subcommand (explicit rejection).
+    let resolved = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "resolve",
+                &stop_id,
+                "--reject",
+                "--rationale",
+                "brief already covers it; not a real gap",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(resolved["status"], "success");
+    assert_eq!(resolved["data"]["resolved_stop"]["state"], "resolved");
 
     // Phase 2: resume. ccx-a is replayed (canary must stay silent); ccx-b runs.
     let canary = repo.path().join("triage-resume-canary");
@@ -2062,4 +2070,364 @@ fn contract_verify_of_stopped_run_is_typed_refusal() {
         0,
         "an incomplete run yields no verify verdicts"
     );
+}
+
+// ===========================================================================
+// U8: query (`stops` / `show` / `verdicts`) + triage (`resolve`)
+// ===========================================================================
+
+/// Run `contract resolve` and return the `--json` envelope.
+fn contract_resolve(repo: &TestRepo, extra: &[&str]) -> Value {
+    let mut args: Vec<String> = vec!["--json".into(), "contract".into(), "resolve".into()];
+    for a in extra {
+        args.push((*a).to_string());
+    }
+    json_output(repo.forge().args(&args).assert().success())
+}
+
+#[test]
+fn contract_stops_open_lists_both_contracts_with_triageable_fields() {
+    // Covers AE9 (query half, R23): two contracts each with an open stop are both
+    // listed by `stops --open` with the four triageable fields and the malformed flag.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-c", &[]);
+
+    // Each independent contract files its own well-formed stop.
+    contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    contract_run(&repo, &["ccx-c"], STOP_AGENT, 2);
+    assert_eq!(stop_count(&repo), 2);
+
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "stops", "--open"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["count"], 2);
+    let stops = env["data"]["stops"].as_array().expect("stops array");
+    assert_eq!(stops.len(), 2);
+    let ids: Vec<&str> = stops
+        .iter()
+        .map(|s| s["contract_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"ccx-a") && ids.contains(&"ccx-c"), "{ids:?}");
+    for stop in stops {
+        // All four triageable fields plus the malformed flag and blocking status.
+        assert!(stop["what_needed"]
+            .as_str()
+            .unwrap()
+            .contains("need the shape"));
+        assert!(stop["why_unanswered"]
+            .as_str()
+            .unwrap()
+            .contains("brief omits"));
+        assert_eq!(stop["kind"], "blocking");
+        assert!(stop["evidence"].as_str().unwrap().contains("src/lib.rs:1"));
+        assert_eq!(stop["malformed"], false);
+        assert_eq!(stop["blocking"], true);
+        assert_eq!(stop["state"], "open");
+        assert_eq!(stop["revision"], 1);
+    }
+}
+
+#[test]
+fn contract_resolve_revision_bump_clears_stop_and_licenses_rerun() {
+    // Covers R10/R24 end-to-end: a run is refused while a stop is open; a
+    // revision-bump resolution clears it and licenses a fresh rerun.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let stopped = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = stopped["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // Refused while open.
+    let refused = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "contract",
+                "run",
+                "ccx-a",
+                "--agent-cmd",
+                EDIT_AGENT,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(error_code(&refused), "CONTRACT_OPEN_STOP");
+
+    // Revise the contract on disk (still lint-clean, same id) and resolve --revised.
+    let revised = contract_yaml("ccx-a", &[]).replace(
+        "interface: Build the thing in the module.",
+        "interface: Build the thing in the module (clarified after triage).",
+    );
+    write(&repo, "contracts/a.yaml", &revised);
+    let resolved = contract_resolve(&repo, &[&stop_id, "--revised", "contracts/a.yaml"]);
+    assert_eq!(resolved["data"]["resolution_kind"], "revision");
+    assert_eq!(resolved["data"]["resolved_stop"]["state"], "resolved");
+    assert_eq!(resolved["data"]["revision"]["revision"], 2);
+    assert_eq!(resolved["data"]["resolved_stop"]["resolving_revision"], 2);
+
+    // The rerun is now licensed and completes.
+    let rerun = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    assert_eq!(rerun["data"]["outcome"], "completed");
+}
+
+#[test]
+fn contract_resolve_rejection_bumps_revision_without_changing_content() {
+    // Covers R10: an explicit rejection bumps the revision recording the rationale
+    // WITHOUT changing contract content, and the rationale is redacted before store.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let stopped = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = stopped["data"]["stop_id"].as_str().unwrap().to_string();
+
+    // Capture the frozen revision-1 bytes before resolving.
+    let before = json_output(
+        repo.forge()
+            .args(["--json", "contract", "show", "ccx-a"])
+            .assert()
+            .success(),
+    );
+    let original_yaml = before["data"]["revision"]["source_yaml"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resolved = contract_resolve(
+        &repo,
+        &[
+            &stop_id,
+            "--reject",
+            "--rationale",
+            "not a real gap; API_TOKEN=supersecretvalue in the config already answers it",
+        ],
+    );
+    assert_eq!(resolved["data"]["resolution_kind"], "rejection");
+    assert_eq!(resolved["data"]["revision"]["revision"], 2);
+    // Content byte-for-byte unchanged (R10 rejection preserves content).
+    assert_eq!(resolved["data"]["revision"]["source_yaml"], original_yaml);
+    // The rationale is redacted before it enters the signed record (KTD3).
+    let stop_rationale = resolved["data"]["resolved_stop"]["resolution_rationale"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !stop_rationale.contains("supersecretvalue"),
+        "rationale must be redacted: {stop_rationale}"
+    );
+    let rev_rationale = resolved["data"]["revision"]["resolution_rationale"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !rev_rationale.contains("supersecretvalue"),
+        "revision rationale must be redacted: {rev_rationale}"
+    );
+
+    // The stop no longer blocks reruns.
+    let rerun = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    assert_eq!(rerun["data"]["outcome"], "completed");
+}
+
+#[test]
+fn contract_resolve_reconstructs_malformed_stop_fields() {
+    // Malformed reconstruction (R8/R25): a malformed stop's four fields are supplied
+    // at resolve time; the resulting record is complete and its signature verifies.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], "echo 'help I am stuck' > UNKNOWN.md", 2);
+    assert_eq!(env["data"]["malformed"], true);
+    let stop_id = env["data"]["stop_id"].as_str().unwrap().to_string();
+
+    let resolved = contract_resolve(
+        &repo,
+        &[
+            &stop_id,
+            "--reject",
+            "--rationale",
+            "reconstructed after triage",
+            "--what-needed",
+            "the exact trait bound to implement",
+            "--why-unanswered",
+            "the brief omits the bound",
+            "--kind",
+            "blocking",
+            "--evidence",
+            "crates/forge-core/src/lib.rs:10",
+        ],
+    );
+    let stop = &resolved["data"]["resolved_stop"];
+    assert_eq!(stop["state"], "resolved");
+    // Reconstruction cleared the malformed flag: all four fields are now present.
+    assert_eq!(stop["malformed"], false);
+    assert!(stop["what_needed"]
+        .as_str()
+        .unwrap()
+        .contains("trait bound"));
+    assert!(stop["why_unanswered"].as_str().unwrap().contains("omits"));
+    assert_eq!(stop["kind"], "blocking");
+    assert!(stop["evidence"].as_str().unwrap().contains("lib.rs:10"));
+
+    // The re-signed record is valid: a ledger signature exists for the stop whose
+    // signed digest matches the record's CURRENT content hash (reconstruction
+    // re-signed the mutated row). Full two-sided `forge doctor` coverage of the new
+    // kinds lands in U9 (KTD2); here we assert the re-sign directly.
+    let content_hash = stop["content_hash"].as_str().unwrap();
+    let stop_id_val = stop["stop_id"].as_str().unwrap();
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let signed_digest: String = conn
+        .query_row(
+            "SELECT signed_digest FROM ledger_signatures
+             WHERE subject_kind = 'contract_stop' AND subject_id = ?1
+             ORDER BY rowid DESC LIMIT 1",
+            [stop_id_val],
+            |r| r.get(0),
+        )
+        .expect("a signature row exists for the reconstructed stop");
+    assert_eq!(
+        signed_digest, content_hash,
+        "the re-signed stop's signature must cover its current content hash"
+    );
+}
+
+#[test]
+fn contract_resolve_bad_kind_is_rejected() {
+    // A reconstruction --kind outside the vocabulary is refused before any write.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let env = contract_run(&repo, &["ccx-a"], "echo stuck > UNKNOWN.md", 2);
+    let stop_id = env["data"]["stop_id"].as_str().unwrap().to_string();
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "resolve",
+            &stop_id,
+            "--reject",
+            "--rationale",
+            "x",
+            "--kind",
+            "nonsense",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn contract_resolve_replay_is_idempotent() {
+    // R18/KTD6: replaying a resolve request-id returns the recorded result and does
+    // NOT create a second bump revision.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let stopped = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let stop_id = stopped["data"]["stop_id"].as_str().unwrap().to_string();
+
+    let args = [
+        "--json",
+        "--request-id",
+        "resolve-1",
+        "contract",
+        "resolve",
+        &stop_id,
+        "--reject",
+        "--rationale",
+        "covered already",
+    ];
+    let first = json_output(repo.forge().args(args).assert().success());
+    assert_eq!(first["data"]["revision"]["revision"], 2);
+    let count_after_first = revision_count(&repo);
+
+    let replay = json_output(repo.forge().args(args).assert().success());
+    assert_eq!(replay["status"], "success");
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(
+        revision_count(&repo),
+        count_after_first,
+        "a replayed resolve must not freeze a second bump revision"
+    );
+}
+
+#[test]
+fn contract_show_run_and_contract_round_trip_expected_fields() {
+    // R23: `show <run-id>` carries per-task outcomes + a tally counting stops as
+    // successes pending triage; `show <contract-id>` carries the frozen revision and
+    // blocked/runnable status.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+
+    // A stopped chain: the run tally counts the stop as a success pending triage.
+    let stopped = contract_run(&repo, &["ccx-a", "ccx-b"], STOP_AGENT, 2);
+    let run_id = stopped["data"]["run_id"].as_str().unwrap().to_string();
+    let show_run = json_output(
+        repo.forge()
+            .args(["--json", "contract", "show", &run_id])
+            .assert()
+            .success(),
+    );
+    assert_eq!(show_run["data"]["kind"], "run");
+    assert_eq!(show_run["data"]["run"]["outcome"], "stopped");
+    assert_eq!(show_run["data"]["tally"]["stopped"], 1);
+    assert_eq!(show_run["data"]["tally"]["failed"], 0);
+    assert_eq!(show_run["data"]["tally"]["successes_pending_triage"], 1);
+    let tasks = show_run["data"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks[0]["outcome"], "stopped");
+    assert_eq!(tasks[1]["outcome"], "skipped");
+
+    // show <contract-id>: ccx-a is blocked by its own open stop; ccx-b is blocked
+    // transitively through its dependency on ccx-a.
+    let show_a = json_output(
+        repo.forge()
+            .args(["--json", "contract", "show", "ccx-a"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(show_a["data"]["kind"], "contract");
+    assert_eq!(show_a["data"]["revision"]["revision"], 1);
+    assert_eq!(show_a["data"]["blocked"], true);
+    assert_eq!(show_a["data"]["runnable"], false);
+    assert!(!show_a["data"]["blocking_stop_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn contract_show_runnable_contract_reports_no_block() {
+    // R23: a frozen contract with no open stop in its closure is runnable.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let show = json_output(
+        repo.forge()
+            .args(["--json", "contract", "show", "ccx-a"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(show["data"]["runnable"], true);
+    assert_eq!(show["data"]["blocked"], false);
+}
+
+#[test]
+fn contract_verdicts_lists_recorded_run_verdicts() {
+    // R23: a completed run records per-task blast-pass verdicts; `verdicts <run-id>`
+    // round-trips their kind / pass-fail / command shape.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let completed = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let run_id = completed["data"]["run_id"].as_str().unwrap().to_string();
+
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "verdicts", &run_id])
+            .assert()
+            .success(),
+    );
+    assert_eq!(env["data"]["run_id"], run_id);
+    let verdicts = env["data"]["verdicts"].as_array().expect("verdicts array");
+    assert!(
+        !verdicts.is_empty(),
+        "a completed run records blast verdicts"
+    );
+    assert_eq!(verdicts[0]["verdict_kind"], "blast");
+    assert_eq!(verdicts[0]["passed"], true);
 }

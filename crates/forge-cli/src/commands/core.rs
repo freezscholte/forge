@@ -2443,6 +2443,7 @@ pub(crate) fn is_mutating_command(command: &str) -> bool {
             | "contract run"
             | "contract integrate"
             | "contract verify"
+            | "contract resolve"
             | "key status"
             | "key rotate"
             | "org init"
