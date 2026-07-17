@@ -149,7 +149,13 @@ fn unknown_top_level_key_errors_naming_the_key_and_freezes_nothing() {
 
 #[test]
 fn metacharacter_acceptance_refused_with_grammar_violation() {
-    // Covers AE6 (shell-metacharacter form).
+    // Covers AE6. The authoring surfaces (lint AND freeze, which re-lints) both refuse
+    // a shell-metacharacter acceptance command with the SAME CONTRACT_GRAMMAR_VIOLATION
+    // code and freeze nothing. AE6's "both surfaces" also spans the EXECUTION surface:
+    // `contract_verify_grammar_violation_executes_nothing` (R15) proves `verify` re-gates
+    // the identical grammar rule before running anything. Same rule, same typed code,
+    // every surface. (The `non_cargo_*` test is a grammar-family variant, not a second
+    // AE6 tag.)
     let repo = init_repo();
     let contract = CLEAN_CONTRACT.replace(
         "    - cargo test -p forge-core",
@@ -179,7 +185,9 @@ fn metacharacter_acceptance_refused_with_grammar_violation() {
 
 #[test]
 fn non_cargo_acceptance_refused_with_grammar_violation() {
-    // Covers AE6 (non-cargo command form).
+    // Grammar-family variant of AE6 (the canonical AE6 test is
+    // `metacharacter_acceptance_refused_with_grammar_violation`): a non-cargo command
+    // is refused at lint with the same CONTRACT_GRAMMAR_VIOLATION code, freezing nothing.
     let repo = init_repo();
     let contract = CLEAN_CONTRACT.replace("    - cargo test -p forge-core", "    - make test");
     write(&repo, "contracts/demo.yaml", &contract);
@@ -911,29 +919,41 @@ fn contract_run_transitive_open_stop_through_acked_dep_refuses() {
 #[test]
 fn contract_run_nonzero_exit_without_unknown_fails_exit_1() {
     // Covers AE5 (R11/R14): a crashed agent (nonzero exit, no UNKNOWN.md) records a
-    // failed run with exit 1.
+    // failed run with exit 1, and the dependent task never executes. The chain is
+    // ccx-a → ccx-b; ccx-a's agent crashes, so ccx-b is skipped.
     let repo = run_repo();
     freeze_contract(&repo, "ccx-a", &[]);
-    let env = contract_run(&repo, &["ccx-a"], "exit 3", 1);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    let env = contract_run(&repo, &["ccx-a", "ccx-b"], "exit 3", 1);
     assert_eq!(env["status"], "success");
     assert_eq!(env["data"]["outcome"], "failed");
     assert_eq!(env["data"]["exit_code"], 1);
     assert_eq!(stop_count(&repo), 0, "a crash is not a stop");
+    // The crashed task is failed and its dependent never ran (AE5 no-dependents clause).
+    let run_id = env["data"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-a"), "failed");
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-b"), "skipped");
 }
 
 #[test]
 fn contract_run_empty_patch_fails_exit_1() {
     // Covers AE8 (R11/R14): a zero exit with an empty patch records a failed run,
-    // exit 1 — an empty patch never passes as success.
+    // exit 1 — an empty patch never passes as success — and the dependent task never
+    // executes. The chain is ccx-a → ccx-b; ccx-a produces an empty patch, ccx-b skips.
     let repo = run_repo();
     freeze_contract(&repo, "ccx-a", &[]);
-    let env = contract_run(&repo, &["ccx-a"], "true", 1);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    let env = contract_run(&repo, &["ccx-a", "ccx-b"], "true", 1);
     assert_eq!(env["data"]["outcome"], "failed");
     assert_eq!(env["data"]["exit_code"], 1);
     assert!(env["data"]["reason"]
         .as_str()
         .unwrap()
         .contains("empty patch"));
+    // The empty-patch task is failed and its dependent never ran (AE8 no-dependents clause).
+    let run_id = env["data"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-a"), "failed");
+    assert_eq!(task_outcome(&repo, &run_id, "ccx-b"), "skipped");
 }
 
 #[test]
@@ -1753,6 +1773,75 @@ fn contract_run_clean_records_blast_pass_verdict() {
     );
 }
 
+#[test]
+fn envelope_contract_across_stop_regression_and_blast() {
+    // Covers AE11 (R25): for the AE1 (stop), AE3 (guard regression), and AE7 (blast)
+    // scenarios the `--json` envelope encodes the SAME state the process exit code does,
+    // redundantly — status, the `data.outcome` discriminator, the typed code, and the
+    // referenced record ids. A stop pairs exit 2 with envelope status success and NO
+    // error code; a regression/violation pairs its nonzero exit with a success envelope
+    // whose `data.code` names the typed outcome. This is the single explicit AE11 sweep
+    // that layers the full envelope contract onto the three exit-code scenarios.
+
+    // AE1 leg — a stop: exit 2, status success, outcome=stopped, stop_id + run_id
+    // referenced, and no envelope error (success pending triage, never a run failure).
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    freeze_contract(&repo, "ccx-b", &["ccx-a"]);
+    let stop = contract_run(&repo, &["ccx-a", "ccx-b"], STOP_AGENT, 2);
+    assert_eq!(stop["status"], "success");
+    assert_eq!(stop["data"]["outcome"], "stopped");
+    assert_eq!(stop["data"]["exit_code"], 2);
+    assert!(
+        stop["data"]["stop_id"].as_str().is_some(),
+        "stop_id record id must be referenced"
+    );
+    assert!(
+        stop["data"]["run_id"].as_str().is_some(),
+        "run_id record id must be referenced"
+    );
+    assert!(
+        stop["errors"].as_array().is_none_or(|e| e.is_empty()),
+        "a stop is never encoded as an envelope error: {:?}",
+        stop["errors"]
+    );
+
+    // AE3 leg — a guard regression: exit 4, status success, outcome=guard_regressed,
+    // code CONTRACT_GUARD_REGRESSED, run_id + verdict_ids referenced.
+    let repo = run_repo();
+    install_verify_crate(&repo, true);
+    freeze_verify_contract(&repo, "ccx-vg", &["cargo build"], &["cargo fmt --check"]);
+    let run_id = completed_verify_run(&repo, "ccx-vg");
+    let verify = contract_verify(&repo, &run_id, 4);
+    assert_eq!(verify["status"], "success");
+    assert_eq!(verify["data"]["outcome"], "guard_regressed");
+    assert_eq!(verify["data"]["exit_code"], 4);
+    assert_eq!(verify["data"]["code"], "CONTRACT_GUARD_REGRESSED");
+    assert_eq!(verify["data"]["run_id"], run_id);
+    assert!(
+        !verify["data"]["verdict_ids"]
+            .as_array()
+            .expect("verdict_ids array")
+            .is_empty(),
+        "verdict record ids must be referenced"
+    );
+
+    // AE7 leg — a blast violation: exit 3, status success, outcome=blast_violation,
+    // code CONTRACT_BLAST_VIOLATION, run_id referenced.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let agent = "mkdir -p .forge && echo x > .forge/canary && echo change >> out.txt";
+    let blast = contract_run(&repo, &["ccx-a"], agent, 3);
+    assert_eq!(blast["status"], "success");
+    assert_eq!(blast["data"]["outcome"], "blast_violation");
+    assert_eq!(blast["data"]["exit_code"], 3);
+    assert_eq!(blast["data"]["code"], "CONTRACT_BLAST_VIOLATION");
+    assert!(
+        blast["data"]["run_id"].as_str().is_some(),
+        "run_id record id must be referenced"
+    );
+}
+
 // ===========================================================================
 // U7: `forge contract verify` — fix/guard re-verification on a rebuilt base
 // ===========================================================================
@@ -2533,6 +2622,25 @@ fn any_object_contains(repo: &TestRepo, needle: &str) -> bool {
     false
 }
 
+/// Whether any PACKED native object's DECOMPRESSED payload contains `needle`. Packs
+/// are zstd-compressed, so a raw byte scan of `.forge/packs` would miss the secret;
+/// this reads each packed object back through forge-content-native's transparent
+/// `read_object` (which decompresses pack frames) — the meaningful pack scrub check.
+fn any_pack_object_contains(repo: &TestRepo, needle: &str) -> bool {
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let Ok(infos) = store.packed_object_infos() else {
+        return false;
+    };
+    for info in infos {
+        if let Ok(bytes) = store.read_object(&info.object_id) {
+            if String::from_utf8_lossy(&bytes).contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// `gc --dry-run` envelope `data`.
 fn gc_dry_run(repo: &TestRepo) -> Value {
     json_output(
@@ -2680,14 +2788,45 @@ fn gc_reclaims_secret_refused_unreferenced_post_tree() {
             .is_empty(),
         "the refused post-tree must be unreferenced and collectable"
     );
-    let digest = dry["plan_digest"].as_str().unwrap();
-    gc_delete(&repo, digest);
-    // gc reclaimed the loose plaintext object (packs are zlib-compressed, so a plaintext
-    // substring scan of the loose store is the meaningful scrub check).
+
+    // Run the dry-run + delete cycle TWICE. The FIRST gc_delete removes the loose
+    // plaintext object, but because `pack_candidate_native_objects` is NOT
+    // reachability-filtered (gc.rs), it also REPACKS every unprotected loose object —
+    // including this unreachable secret tree — into a fresh zstd pack. So a loose-only
+    // scan would falsely report the secret scrubbed while it survives compressed in a
+    // pack. The SECOND cycle would prune a now-wholly-unreachable pack via
+    // `deletable_native_packs` IF that pack were past the protection window.
+    for _ in 0..2 {
+        let dry = gc_dry_run(&repo);
+        let digest = dry["plan_digest"].as_str().unwrap().to_string();
+        gc_delete(&repo, &digest);
+        backdate_all_native_objects(&repo);
+    }
+
+    // What IS unconditionally true and load-bearing: the LOOSE plaintext object is gone.
     assert!(
         !any_object_contains(&repo, "AKIASEKRETGCMARKER"),
         "gc must reclaim the loose plaintext secret object"
     );
+    // doctor stays green throughout (no dangling refs, chain intact).
     let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
     assert_eq!(report["data"]["ok"], true);
+
+    // RESIDUAL (honest): the second pass does NOT reclaim the secret-bearing pack,
+    // because gc re-stamps `packed_at_ms = now` when it writes the repack, so the fresh
+    // pack is inside the protection window and `pack_entry_protected` shields it — even
+    // though every backdated loose object it was built from was long past the window.
+    // Net effect: a secret-content-refused post-tree's plaintext is scrubbed from the
+    // LOOSE store but lingers zstd-compressed in a protected pack until the window
+    // elapses. This is a known gc property (repack-of-unreachable + fresh packed_at_ms),
+    // filed for follow-up triage; it does not weaken the loose-scrub guarantee above.
+    // The assertion documents the observed state so a future fix (reachability-filtered
+    // repack, or inheriting the loose mtime as packed_at_ms) will flip it and force this
+    // test to be revisited.
+    assert!(
+        any_pack_object_contains(&repo, "AKIASEKRETGCMARKER"),
+        "RESIDUAL: the secret currently survives in a protected pack after two gc passes; \
+         if this assertion fails, gc now scrubs the pack too — update this test and close \
+         the residual"
+    );
 }

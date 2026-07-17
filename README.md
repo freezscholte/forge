@@ -221,6 +221,63 @@ forge trust policy --accept locally_signed --export third_party_attested
 Peer-imported signatures remain cryptographically verifiable, but they do not
 silently satisfy local, hosted-runner, or third-party policy.
 
+## Contract-Driven Agent Work
+
+The `forge contract` family runs scoped, contract-driven agent tasks as
+first-class signed ledger records: contracts, runs, stops, and verdicts each get
+their own lifecycle, uniformly covered by signing, `forge doctor`, and trust
+policy. A contract is authored as a `ccx.contract.v1` YAML file (task, interface,
+`acceptance.fix` / `acceptance.guard` cargo commands, `allowed_changes.paths`,
+optional `depends_on`); the native object is the ledger record of a linted,
+frozen revision of that file.
+
+```bash
+forge contract lint contracts/my-task.yaml       # six rule families, v1 strictness
+forge contract freeze contracts/my-task.yaml      # records an immutable frozen revision
+forge contract brief my-task                       # byte-stable brief for the frozen revision
+forge contract run my-task --agent-cmd "claude -p"   # execute the agent for one task
+forge contract verify <run-id>                     # re-run fix then guard on a rebuilt base
+forge contract integrate <run-id>                  # re-apply the patch onto HEAD as an attempt
+```
+
+Query and triage the records (all `--json`):
+
+```bash
+forge contract stops --open                         # open stops with their four triage fields
+forge contract show my-task                          # current frozen revision + blocked/runnable
+forge contract verdicts <run-id>                     # per-command fix/guard/blast verdicts
+forge contract resolve <stop-id> --revised contracts/my-task.yaml   # revision-bump triage
+forge contract resolve <stop-id> --reject --rationale "brief already covers it"
+```
+
+Exit codes encode outcomes redundantly with the `--json` envelope's
+`data.outcome` discriminator and typed `data.code`:
+
+- `run` — `0` all tasks ran, `1` a run failed (crashed agent or empty patch),
+  `2` a stop was filed, `3` a blast-radius violation.
+- `verify` — `0` fix and guard green, `2` the fix set failed, `4` fix green but a
+  guard regressed.
+
+A stop is a **success pending triage**, never a run failure: it pairs process
+exit `2` with envelope status `success` and is tallied as a successful stop. The
+stop-on-unknown gate has three legs, all machine-enforced:
+
+1. an agent that writes `UNKNOWN.md` at the repo root halts the chain and forge
+   ingests it into a typed stop record (fail-closed: the file always halts and
+   always opens a stop, marked `malformed` when the four fields cannot be parsed);
+2. stops are recorded and surfaced as success outcomes pending triage, as their
+   own record kind, in every tally and status surface;
+3. triage-before-rerun is enforced — forge refuses to run any task whose contract,
+   or any contract in its dependency closure, has an open stop; resolution is a
+   contract revision bump or an explicit rejection, both recorded on the stop.
+
+Forge does no agent session management. During a run it executes the agent command
+once as an opaque subprocess and captures its exit status. That command is taken
+**only** from an explicit `--agent-cmd` flag — there is no repo-config fallback in
+v1, so a repo-shipped command source cannot become a supply-chain surface.
+Contract acceptance green licenses integration of a task's output into the stack;
+it is never a merge, and the `/ce-code-review` gate stays non-optional.
+
 ## Current Command Groups
 
 - lifecycle: `init`, `start`, `save`, `run`, `propose`, `check`, `accept`,
@@ -243,7 +300,10 @@ silently satisfy local, hosted-runner, or third-party policy.
 - sync: `sync export`, `sync inspect`, `sync import`, `sync clone`,
   `sync fetch`, `sync pull`, `sync push`, `sync serve`
 - Git interop: `export branch`, `export pr-body`, `export verify-branch`
-- contract: `schema`
+- contract: `contract lint`, `contract freeze`, `contract brief`,
+  `contract run`, `contract verify`, `contract integrate`, `contract stops`,
+  `contract show`, `contract verdicts`, `contract resolve`
+- schema: `schema`
 
 Run `forge schema --json` for the machine-readable command shapes, error
 registry, and provenance notes.

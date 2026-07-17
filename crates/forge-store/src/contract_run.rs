@@ -162,6 +162,12 @@ pub fn record_contract_integration(
                     "task_id": link.task_id,
                     "attempt_id": link.attempt_id,
                     "intent_id": link.intent_id,
+                    // The exact domain digest this op folds into its chain link. Doctor's
+                    // op-chain re-walk (`op_domain_digest`, U9/KTD2) recovers it from HERE
+                    // — uniform with every other contract-family op. Omitting it made the
+                    // integrate op an unrecoverable `broken_link` under `forge doctor`
+                    // (doctor recomputed with digest=None while this op folded Some(..)).
+                    "subject_digest": content_hash,
                 }),
             },
             Some(&content_hash),
