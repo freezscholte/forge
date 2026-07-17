@@ -1744,3 +1744,322 @@ fn contract_run_clean_records_blast_pass_verdict() {
         "a clean run must record at least one blast pass verdict"
     );
 }
+
+// ===========================================================================
+// U7: `forge contract verify` — fix/guard re-verification on a rebuilt base
+// ===========================================================================
+//
+// The scratch base a verify rebuilds is the run's full post-state tree, so the
+// acceptance commands must run against a real cargo project committed as the run
+// base. The fixture is a TINY, dependency-free standalone crate at the repo root:
+// `cargo fmt --check` (no compile) and `cargo build` (a trivial compile) are both
+// cheap and hermetic (no network). The agent only edits the allowed `out.txt`, so
+// blast stays clean and the run completes — leaving the crate's formatting state
+// (well-formed vs. deliberately mis-formatted) as the lever that drives fix/guard
+// pass/fail deterministically.
+
+const VERIFY_CARGO_TOML: &str =
+    "[package]\nname = \"verifyfixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+/// rustfmt-clean, compiles — both `cargo build` and `cargo fmt --check` pass.
+const GOOD_LIB: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+/// Compiles fine (so `cargo build` passes) but mis-formatted (so `cargo fmt --check`
+/// fails) — the single lever for the exit-4 (guard regressed) and exit-2 (fix failed)
+/// cases, swapping which command is fix vs. guard.
+const MISFORMATTED_LIB: &str = "pub fn add(a:i32,b:i32)->i32{a+b}\n";
+
+/// Install the standalone cargo fixture crate into the repo worktree so the run base
+/// (and therefore the rebuilt verify scratch) contains a real cargo project.
+fn install_verify_crate(repo: &TestRepo, misformatted: bool) {
+    write(repo, "Cargo.toml", VERIFY_CARGO_TOML);
+    write(
+        repo,
+        "src/lib.rs",
+        if misformatted {
+            MISFORMATTED_LIB
+        } else {
+            GOOD_LIB
+        },
+    );
+}
+
+/// Freeze a lint-clean verify contract for `id` with the given fix/guard sets. The
+/// agent only touches `out.txt` (the sole allowed path), so the run completes clean.
+fn freeze_verify_contract(repo: &TestRepo, id: &str, fix: &[&str], guard: &[&str]) {
+    let mut yaml = format!(
+        "schema: ccx.contract.v1\n\
+id: {id}\n\
+revision: 1\n\
+ticket: NER-999\n\
+task: Add two integers.\n\
+interface: Provide an add function.\n\
+acceptance:\n  fix:\n"
+    );
+    for cmd in fix {
+        yaml.push_str(&format!("    - {cmd}\n"));
+    }
+    if !guard.is_empty() {
+        yaml.push_str("  guard:\n");
+        for cmd in guard {
+            yaml.push_str(&format!("    - {cmd}\n"));
+        }
+    }
+    yaml.push_str(
+        "allowed_changes:\n  paths: [out.txt]\n\
+authority: {source: human, confidence: high, reviewer: test}\n",
+    );
+    write(
+        repo,
+        &format!("contracts/{}", contract_file_name(id)),
+        &yaml,
+    );
+    repo.forge()
+        .args([
+            "--json",
+            "contract",
+            "freeze",
+            &format!("contracts/{}", contract_file_name(id)),
+        ])
+        .assert()
+        .success();
+}
+
+/// Run `contract verify <target>`, asserting the process exit code, returning the JSON.
+fn contract_verify(repo: &TestRepo, target: &str, expect_exit: i32) -> Value {
+    json_output(
+        repo.forge()
+            .args(["--json", "contract", "verify", target])
+            .assert()
+            .code(expect_exit),
+    )
+}
+
+/// Count verify verdict rows (fix/guard/aggregate) for a run — excludes the `blast`
+/// verdict the run itself records, so it isolates what verify wrote.
+fn verify_verdict_count(repo: &TestRepo, run_id: &str) -> i64 {
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM contract_run_verdicts
+         WHERE run_id = ?1 AND verdict_kind IN ('fix','guard','aggregate')",
+        [run_id],
+        |r| r.get(0),
+    )
+    .expect("count verify verdicts")
+}
+
+/// A completed run of a single verify contract, returning its run id.
+fn completed_verify_run(repo: &TestRepo, id: &str) -> String {
+    let env = contract_run(repo, &[id], EDIT_AGENT, 0);
+    assert_eq!(env["data"]["outcome"], "completed");
+    env["data"]["run_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn contract_verify_all_green_passes_and_records_aggregate() {
+    // All fix + guard green → exit 0, outcome passed, an aggregate verdict recorded.
+    let repo = run_repo();
+    install_verify_crate(&repo, false);
+    freeze_verify_contract(&repo, "ccx-vok", &["cargo build"], &["cargo fmt --check"]);
+    let run_id = completed_verify_run(&repo, "ccx-vok");
+
+    let env = contract_verify(&repo, &run_id, 0);
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["outcome"], "passed");
+    assert_eq!(env["data"]["exit_code"], 0);
+    assert!(
+        env["data"].get("code").is_none(),
+        "clean verify has no code"
+    );
+
+    // One fix + one guard + one aggregate verdict row, all passed.
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let agg_passed: i64 = conn
+        .query_row(
+            "SELECT passed FROM contract_run_verdicts
+             WHERE run_id = ?1 AND verdict_kind = 'aggregate'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .expect("aggregate verdict exists");
+    assert_eq!(agg_passed, 1, "aggregate must be a pass on all-green");
+    assert_eq!(
+        verify_verdict_count(&repo, &run_id),
+        3,
+        "fix + guard + aggregate verdict rows"
+    );
+}
+
+#[test]
+fn contract_verify_guard_regression_exit_4() {
+    // Covers AE3 (R13/R14/R25): fix passes, one guard regresses → exit 4,
+    // CONTRACT_GUARD_REGRESSED in the envelope, per-command verdict rows for every
+    // entry including the failed guard. The mis-formatted crate compiles (fix
+    // `cargo build` passes) but fails `cargo fmt --check` (the guard).
+    let repo = run_repo();
+    install_verify_crate(&repo, true);
+    freeze_verify_contract(
+        &repo,
+        "ccx-vguard",
+        &["cargo build"],
+        &["cargo fmt --check"],
+    );
+    let run_id = completed_verify_run(&repo, "ccx-vguard");
+
+    let env = contract_verify(&repo, &run_id, 4);
+    assert_eq!(env["status"], "success"); // a regression is not an envelope error (R25)
+    assert_eq!(env["data"]["outcome"], "guard_regressed");
+    assert_eq!(env["data"]["exit_code"], 4);
+    assert_eq!(env["data"]["code"], "CONTRACT_GUARD_REGRESSED");
+
+    // A verdict row exists for EVERY entry, and the failed guard is recorded failing.
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let fix_passed: i64 = conn
+        .query_row(
+            "SELECT passed FROM contract_run_verdicts
+             WHERE run_id = ?1 AND verdict_kind = 'fix' AND command = 'cargo build'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .expect("fix verdict row exists");
+    assert_eq!(fix_passed, 1, "fix (cargo build) must pass");
+    let guard_passed: i64 = conn
+        .query_row(
+            "SELECT passed FROM contract_run_verdicts
+             WHERE run_id = ?1 AND verdict_kind = 'guard' AND command = 'cargo fmt --check'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .expect("failed guard verdict row exists");
+    assert_eq!(
+        guard_passed, 0,
+        "the regressed guard must be recorded failing"
+    );
+}
+
+#[test]
+fn contract_verify_fix_failure_exit_2_guards_still_run() {
+    // Fix failure → exit 2, CONTRACT_FIX_FAILED — and guards STILL run (verify-task.sh
+    // record-completeness). Same mis-formatted crate, but now `cargo fmt --check` is
+    // the FIX (fails) and `cargo build` is the GUARD (still executed, passes).
+    let repo = run_repo();
+    install_verify_crate(&repo, true);
+    freeze_verify_contract(&repo, "ccx-vfix", &["cargo fmt --check"], &["cargo build"]);
+    let run_id = completed_verify_run(&repo, "ccx-vfix");
+
+    let env = contract_verify(&repo, &run_id, 2);
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["outcome"], "fix_failed");
+    assert_eq!(env["data"]["exit_code"], 2);
+    assert_eq!(env["data"]["code"], "CONTRACT_FIX_FAILED");
+
+    // The guard ran despite the fix failure — its verdict row proves it (R13).
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let guard_passed: i64 = conn
+        .query_row(
+            "SELECT passed FROM contract_run_verdicts
+             WHERE run_id = ?1 AND verdict_kind = 'guard' AND command = 'cargo build'",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .expect("guard verdict row exists even though the fix failed");
+    assert_eq!(guard_passed, 1, "guards always run and are recorded (R13)");
+}
+
+#[test]
+fn contract_verify_grammar_violation_executes_nothing() {
+    // Fail-closed standalone (R15): a frozen revision whose acceptance carries a
+    // non-cargo command (simulating a tampered/non-lint-clean frozen contract reaching
+    // verify) is refused CONTRACT_GRAMMAR_VIOLATION with ZERO commands executed — no
+    // verify verdict row is recorded (the canary). Verify never trusts that freeze
+    // linted the contract clean.
+    let repo = run_repo();
+    install_verify_crate(&repo, false);
+    freeze_verify_contract(&repo, "ccx-vgrammar", &["cargo build"], &[]);
+    let run_id = completed_verify_run(&repo, "ccx-vgrammar");
+
+    // Tamper the frozen revision's stored bytes to inject an eval-sink command that
+    // lint would have refused — verify must re-gate it before executing anything.
+    let db = repo.path().join(".forge/forge.db");
+    let conn = rusqlite::Connection::open(&db).expect("open db");
+    conn.execute(
+        "UPDATE contract_revisions SET source_yaml = ?1
+         WHERE contract_id = 'ccx-vgrammar' AND revision = 1",
+        rusqlite::params![
+            "schema: ccx.contract.v1\nid: ccx-vgrammar\nrevision: 1\n\
+acceptance:\n  fix:\n    - rm -rf /\n"
+        ],
+    )
+    .expect("tamper revision yaml");
+    drop(conn);
+
+    let env = contract_verify(&repo, &run_id, 1);
+    assert_eq!(env["status"], "error");
+    assert_eq!(error_code(&env), "CONTRACT_GRAMMAR_VIOLATION");
+    // Canary: nothing executed → no verify verdict row was recorded for the run.
+    assert_eq!(
+        verify_verdict_count(&repo, &run_id),
+        0,
+        "a grammar violation must execute and record nothing"
+    );
+}
+
+#[test]
+fn contract_verify_replay_returns_recorded_without_reexecuting() {
+    // R18/KTD6: replaying a verify request-id returns the recorded result WITHOUT
+    // re-executing the acceptance commands — the verify verdict rows do not grow.
+    let repo = run_repo();
+    install_verify_crate(&repo, false);
+    freeze_verify_contract(
+        &repo,
+        "ccx-vreplay",
+        &["cargo build"],
+        &["cargo fmt --check"],
+    );
+    let run_id = completed_verify_run(&repo, "ccx-vreplay");
+
+    let args = [
+        "--json",
+        "--request-id",
+        "verify-1",
+        "contract",
+        "verify",
+        &run_id,
+    ];
+    let first = json_output(repo.forge().args(args).assert().code(0));
+    assert_eq!(first["data"]["outcome"], "passed");
+    let after_first = verify_verdict_count(&repo, &run_id);
+    assert_eq!(
+        after_first, 3,
+        "first verify records fix + guard + aggregate"
+    );
+
+    let replay = json_output(repo.forge().args(args).assert().code(0));
+    assert_eq!(replay["status"], "success");
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(
+        verify_verdict_count(&repo, &run_id),
+        after_first,
+        "replay must not re-execute or record a second verdict batch"
+    );
+}
+
+#[test]
+fn contract_verify_of_stopped_run_is_typed_refusal() {
+    // A stopped run has no produced patch to verify → typed refusal, no verdicts.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+    let stopped = contract_run(&repo, &["ccx-a"], STOP_AGENT, 2);
+    let run_id = stopped["data"]["run_id"].as_str().unwrap().to_string();
+
+    let env = contract_verify(&repo, &run_id, 1);
+    assert_eq!(env["status"], "error");
+    assert_eq!(error_code(&env), "CONTRACT_NOT_INTEGRABLE");
+    assert_eq!(
+        verify_verdict_count(&repo, &run_id),
+        0,
+        "an incomplete run yields no verify verdicts"
+    );
+}

@@ -489,6 +489,9 @@ pub(crate) enum ContractCommand {
     Run(ContractRunArgs),
     /// Re-apply a completed run's patch onto the current HEAD as a linked attempt.
     Integrate(ContractIntegrateArgs),
+    /// Independently re-verify a completed run's acceptance on a rebuilt base: run
+    /// the frozen contract's fix set then guard set, recording per-command verdicts.
+    Verify(ContractVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -527,6 +530,16 @@ pub(crate) struct ContractRunArgs {
 pub(crate) struct ContractIntegrateArgs {
     /// A completed run id or a completed task id to integrate onto HEAD.
     pub(crate) target: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractVerifyArgs {
+    /// A completed run id or a completed task id whose acceptance to re-verify.
+    pub(crate) target: String,
+    /// Read the acceptance fix/guard sets from a specific frozen revision instead
+    /// of the one the run recorded (default: the run's revision).
+    #[arg(long)]
+    pub(crate) revision: Option<i64>,
 }
 
 #[derive(Debug, Args)]

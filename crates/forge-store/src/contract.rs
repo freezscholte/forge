@@ -1308,6 +1308,13 @@ fn insert_contract_verdicts_in_tx(
     parent_operation_id: &str,
     signer: &signing::LocalSigner,
     request_id: Option<String>,
+    // The op-log command string this verdict batch is recorded under. The
+    // run/blast paths pass `"contract"` (the batch is chained onto the run's own
+    // replay-anchored op); the verify path passes `"contract verify"` so the
+    // batch's op IS the replay anchor and `command_result`'s pre-flight replay
+    // folds a same-request-id retry to the recorded result without re-executing
+    // the fix/guard commands (KTD6).
+    command: &str,
     run_id: &str,
     verdicts: &[ContractRunVerdictInput],
     now: i64,
@@ -1368,7 +1375,7 @@ fn insert_contract_verdicts_in_tx(
         Some(parent_operation_id),
         OperationViewInput {
             request_id,
-            command: "contract".to_string(),
+            command: command.to_string(),
             kind: "contract_verdicts_recorded".to_string(),
             view_kind: ViewKind::Initialized,
             state: json!({
@@ -1414,6 +1421,51 @@ pub fn record_contract_run_verdicts(
             &context.current_operation_id,
             &signer,
             request_id.clone(),
+            "contract",
+            run_id,
+            &verdicts,
+            now,
+        )
+    })
+}
+
+/// Record the fix/guard/aggregate verdict rows of a `forge contract verify` run
+/// (U7). Identical to [`record_contract_run_verdicts`] except the op-log command is
+/// `"contract verify"` so `command_result`'s pre-flight replay folds a same-request-id
+/// retry to the recorded verify result WITHOUT re-executing the acceptance commands
+/// (KTD6). Each verdict row is signed under `"contract_run_verdict"` and chained
+/// (R13/R17). Replay-safe (R18).
+pub fn record_contract_verify_verdicts(
+    cwd: &Path,
+    request_id: Option<String>,
+    run_id: &str,
+    verdicts: Vec<ContractRunVerdictInput>,
+) -> Result<Vec<ContractRunVerdictRecord>> {
+    validate_verdicts(&verdicts)?;
+    let context = open_repository(cwd)?;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let run_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM contract_runs WHERE repo_id = ?1 AND id = ?2",
+                params![context.repo_id, run_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !run_exists {
+            bail!("contract run not found");
+        }
+        let now = now_ms();
+        insert_contract_verdicts_in_tx(
+            tx,
+            &context.repo_id,
+            &context.current_operation_id,
+            &signer,
+            request_id.clone(),
+            "contract verify",
             run_id,
             &verdicts,
             now,
@@ -1460,6 +1512,7 @@ pub fn record_contract_run_with_verdicts(
             &run_op,
             &signer,
             None,
+            "contract",
             &run.run_id,
             &verdicts,
             now,

@@ -160,6 +160,9 @@ pub(crate) fn contract_response(
         ContractCommand::Brief(args) => brief_response(request_id, args),
         ContractCommand::Run(args) => run_response(request_id, args),
         ContractCommand::Integrate(args) => integrate_response(request_id, args),
+        ContractCommand::Verify(args) => {
+            crate::commands::contract_verify::verify_response(request_id, args)
+        }
     }
 }
 
