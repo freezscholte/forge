@@ -392,3 +392,28 @@ The supported public wording should avoid claiming a hosted multi-tenant service
 global identity, revocation infrastructure, resumable network transfer, or
 cross-organization certificate authority. Hosted collaboration, organization-wide
 policy management, and identity governance remain product follow-ons.
+
+## Addendum 2026-07-18 — CCX native contracts + R21 retirement dogfood
+
+The contract-driven agent-work surface (`forge contract` family: lint, freeze,
+brief, run, integrate, verify, stops, show, runs, verdicts, resolve — plan
+`docs/plans/completed/2026-07-10-001-feat-ccx-native-contracts-plan.md`) merged
+to main at `035e8f3` after two multi-model review gates (triage:
+`docs/code-reviews/2026-07-18-ccx-native-contracts.md`).
+
+**R21 retirement criterion: satisfied in anger** (dogfood #3, 2026-07-18,
+record: `docs/code-reviews/2026-07-18-dogfood3-gc-repack.md`): a real
+Fable-agent contract run implemented the gc repack-reachability fix through
+the native surface end-to-end — author → freeze → run (first run refused by
+the blast secret-content gate, triaged as a tooling defect and fixed as
+diff-aware scanning `29f70d6`) → rerun completed → verify green (fix=2
+guard=3) → integrate → accept → doctor green — with the agent invocation as
+the only script glue. Per the plan's staged-stability decision, the contract
+ledger kinds and their envelope surfaces are now **adopter-grade stable**, and
+the overlapping `tools/ccx` script stages (lint/brief/blast/run/verify) are
+**retired**; the scripts remain in-tree as the frozen reference
+implementation and for their self-tests.
+
+Additional supportable claim: forge gc never repacks unreachable objects;
+refused (e.g. secret-bearing) content is reclaimed from the loose store and
+packs in one gc cycle (`b5d7f3c`).
