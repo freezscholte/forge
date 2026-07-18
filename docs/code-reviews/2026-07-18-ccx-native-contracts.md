@@ -4,7 +4,7 @@
 - **Branch:** `brainstorm/ccx-harness-to-native` (local only)
 - **base-sha:** `e8b1be28c765006fb1cceb228f0479d2e583aec6` (local main)
 - **head-sha (reviewed):** `733e7be` (13 commits); review fixes land in the follow-up `fix(review)` commit `f2fb5ea`
-- **Gate:** `/ce-code-review` — 11 personas (correctness, security, adversarial at session model; testing, maintainability, project-standards, api-contract, reliability, data-migration, agent-native, learnings at mid-tier) + Codex cross-model adversarial pass + 8-validator wave + orchestrator direct verification. Verify trio, `scripts/ci.sh` (95/95 e2e), and every per-unit review gate were green before this review. Plan `docs/plans/2026-07-10-001-feat-ccx-native-contracts-plan.md` passed as explicit requirements source.
+- **Gate:** `/ce-code-review` — 11 personas (correctness, security, adversarial at session model; testing, maintainability, project-standards, api-contract, reliability, data-migration, agent-native, learnings at mid-tier) + Codex cross-model adversarial pass + 8-validator wave + orchestrator direct verification. Verify trio, `scripts/ci.sh` (95/95 e2e), and every per-unit review gate were green before this review. Plan `docs/plans/completed/2026-07-10-001-feat-ccx-native-contracts-plan.md` passed as explicit requirements source.
 - **Verdict:** Ready with fixes (all applied same-session in `f2fb5ea`; zero deferred findings; one pre-existing residual carries a pending ticket).
 
 ## Real-actionable (fixed in the `fix(review)` commit)

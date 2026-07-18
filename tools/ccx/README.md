@@ -3,7 +3,7 @@
 > **Native surface note.** The `forge contract` command family now covers
 > lint / brief / blast / run / verify natively as first-class signed ledger
 > records (see the "Contract-Driven Agent Work" section of the top-level
-> `README.md` and `docs/plans/2026-07-10-001-feat-ccx-native-contracts-plan.md`).
+> `README.md` and `docs/plans/completed/2026-07-10-001-feat-ccx-native-contracts-plan.md`).
 > These scripts remain **authoritative** until the R21 retirement dogfood — a
 > full native chain (author → freeze → run → stop → triage → verify → integrate)
 > with the agent invocation as the only script glue — is recorded. That
