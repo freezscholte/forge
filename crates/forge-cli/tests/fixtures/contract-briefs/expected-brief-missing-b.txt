@@ -1,0 +1,62 @@
+--- GLOBAL POLICY (normative) ---
+# Test-fixture global policy — included in EVERY brief, before any contract.
+schema: ccx.contract.v1
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace)
+  verify:
+    - cargo fmt --all --check
+    - cargo test --workspace
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Conventional Commits (feat:/fix:/chore: ...).
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v1
+id: ccx-brief-task
+revision: 1
+ticket: NER-000
+task: Fixture task for ccx-brief tests
+
+interface: |
+  Test fixture only. Emit this contract with both declared neighbors.
+
+acceptance:
+  fix:
+    - cargo test -p forge-cli
+  guard:
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+neighbors:
+  - ccx-brief-neighbor-a
+  - ccx-brief-neighbor-b
+
+allowed_changes:
+  paths: [tools/ccx/**]
+
+authority: {source: human, confidence: high, reviewer: test-fixture}
+
+--- NEIGHBOR CONTRACT (normative): ccx-brief-neighbor-a ---
+schema: ccx.contract.v1
+id: ccx-brief-neighbor-a
+revision: 1
+ticket: NER-000
+task: Fixture neighbor A for ccx-brief tests
+
+interface: |
+  Test fixture only. No neighbors.
+
+acceptance:
+  fix:
+    - cargo test -p forge-store
+
+allowed_changes:
+  paths: [tools/ccx/**]
+
+authority: {source: human, confidence: high, reviewer: test-fixture}
+
+--- NEIGHBOR CONTRACT MISSING: ccx-brief-neighbor-b (surface as unknown, do not guess) ---
+

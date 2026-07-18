@@ -1,0 +1,14 @@
+# Test-fixture global policy — included in EVERY brief, before any contract.
+schema: ccx.contract.v1
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace)
+  verify:
+    - cargo fmt --all --check
+    - cargo test --workspace
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Conventional Commits (feat:/fix:/chore: ...).
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing.

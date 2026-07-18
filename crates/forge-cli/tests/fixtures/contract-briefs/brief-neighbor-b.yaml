@@ -1,0 +1,17 @@
+schema: ccx.contract.v1
+id: ccx-brief-neighbor-b
+revision: 1
+ticket: NER-000
+task: Fixture neighbor B for ccx-brief tests
+
+interface: |
+  Test fixture only. No neighbors.
+
+acceptance:
+  fix:
+    - cargo test -p forge-core
+
+allowed_changes:
+  paths: [tools/ccx/**]
+
+authority: {source: human, confidence: high, reviewer: test-fixture}

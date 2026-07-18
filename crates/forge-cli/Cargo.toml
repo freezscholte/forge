@@ -19,7 +19,10 @@ forge-export-git = { path = "../forge-export-git" }
 forge-protocol = { path = "../forge-protocol" }
 forge-store = { path = "../forge-store" }
 forge-sync = { path = "../forge-sync" }
+regex.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

@@ -1,5 +1,18 @@
 # CCX Thin Harness
 
+> **Native surface note.** The `forge contract` command family now covers
+> lint / brief / blast / run / verify natively as first-class signed ledger
+> records (see the "Contract-Driven Agent Work" section of the top-level
+> `README.md` and `docs/plans/2026-07-10-001-feat-ccx-native-contracts-plan.md`).
+> These scripts remain **authoritative** until the R21 retirement dogfood — a
+> full native chain (author → freeze → run → stop → triage → verify → integrate)
+> with the agent invocation as the only script glue — is recorded. That
+> retirement scenario now runs green as
+> `native_chain_end_to_end_retirement_criterion` in
+> `crates/forge-cli/tests/forge_contract_retirement.rs`; the scripts stay in place until the
+> criterion is formally recorded in the release audit. Nothing below is
+> deprecated yet.
+
 A small, Git-compatible toolkit for running **context-closed tasks**:
 implementation work executed by fresh agent sessions from byte-stable
 contract briefs instead of transferred conversation history. Files and

@@ -47,6 +47,32 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "ORG_AUTHORITY_REQUIRED",
     "PRIVATE_CONTENT_INVALID",
     "PRIVATE_DECRYPT_AUTHORITY_MISSING",
+    "CONTRACT_LINT_FAILED",
+    "CONTRACT_NOT_FROZEN",
+    "CONTRACT_OPEN_STOP",
+    "STALE_UNKNOWN_FILE",
+    "CONTRACT_STOP_MALFORMED",
+    "CONTRACT_BLAST_VIOLATION",
+    "CONTRACT_GUARD_REGRESSED",
+    "CONTRACT_FIX_FAILED",
+    "CONTRACT_GRAMMAR_VIOLATION",
+    "CONTRACT_NOT_INTEGRABLE",
+];
+
+/// The CCX contract typed codes (KTD10) that U2 registers. Kept as a named subset
+/// so the round-trip assertion below reads as "every contract code an agent must be
+/// able to enumerate via `forge schema` is present".
+const CONTRACT_ERROR_CODES: &[&str] = &[
+    "CONTRACT_LINT_FAILED",
+    "CONTRACT_NOT_FROZEN",
+    "CONTRACT_OPEN_STOP",
+    "STALE_UNKNOWN_FILE",
+    "CONTRACT_STOP_MALFORMED",
+    "CONTRACT_BLAST_VIOLATION",
+    "CONTRACT_GUARD_REGRESSED",
+    "CONTRACT_FIX_FAILED",
+    "CONTRACT_GRAMMAR_VIOLATION",
+    "CONTRACT_NOT_INTEGRABLE",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -117,6 +143,29 @@ fn registry_contains_every_forge_error_code_plus_lock_timeout() {
         codes.contains("LOCK_TIMEOUT"),
         "published registry is missing CLI code LOCK_TIMEOUT"
     );
+}
+
+#[test]
+fn schema_registers_every_contract_code_as_non_retryable() {
+    // CCX U2 (KTD10/R25): every contract typed code round-trips through
+    // `forge schema --json` — a cold-start agent operator can enumerate them — and
+    // each is a non-retryable domain outcome (no after_ms backoff).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let doc = schema_in(temp.path());
+    let errors = doc["errors"].as_array().expect("errors array");
+
+    for code in CONTRACT_ERROR_CODES {
+        let entry = errors
+            .iter()
+            .find(|entry| entry["code"] == *code)
+            .unwrap_or_else(|| panic!("published registry is missing contract code {code}"));
+        assert_eq!(entry["retryable"], false, "{code} must be non-retryable");
+        assert!(entry["after_ms"].is_null(), "{code} carries no backoff");
+        assert!(
+            entry["details_keys"].is_array(),
+            "{code} documents its details keys"
+        );
+    }
 }
 
 #[test]

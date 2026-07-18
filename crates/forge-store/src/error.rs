@@ -323,6 +323,94 @@ pub enum ForgeError {
     /// cannot be attributed (NER-386). Deterministic. `path` is user-supplied
     /// (secret-risk redacted in `details`, omitted from `Display`).
     BinaryBlob { path: String },
+    /// Contract lint (CCX U3) rejected a `ccx.contract.v1` YAML revision: one or
+    /// more of the six rule families failed (R4/AE4). Deterministic and
+    /// non-retryable — fix the contract and re-lint. `violations` are rule-family
+    /// diagnostics over authored contract config (which is already stored verbatim
+    /// per R1, so this is not a new egress), carried structured so an agent can act
+    /// without parsing the human message.
+    ContractLintFailed { violations: Vec<String> },
+    /// A run or verify was requested against a contract revision that is not a
+    /// lint-clean frozen revision — it is absent, still draft, or frozen but not
+    /// lint-clean (R2). Deterministic — freeze a lint-clean revision first.
+    /// `contract_id` is an authored config id and `revision` an integer, never a
+    /// path, so `details` emits them un-redacted.
+    ContractNotFrozen { contract_id: String, revision: i64 },
+    /// A run was refused because the target contract, or a contract in its
+    /// dependency closure, has an open stop record (Leg 3, R10/AE2/AE9).
+    /// Deterministic — triage the named stops (revision bump or explicit rejection)
+    /// first. `stop_ids` are opaque minted stop ids, safe to surface.
+    ContractOpenStop { stop_ids: Vec<String> },
+    /// `contract run` refused to start because `UNKNOWN.md` already exists at the
+    /// workspace root (R26/AE10) — a DIRTY_WORKTREE-family preflight so a stale file
+    /// cannot be attributed to the wrong run. Deterministic — triage or remove the
+    /// stale file. The filename is a fixed constant, never a user-supplied path.
+    StaleUnknownFile,
+    /// An ingested stop could not have all four required fields extracted and was
+    /// recorded best-effort as malformed (R8/R25). This is an INFORMATIONAL flag,
+    /// not a run failure: the stop still counts as a success pending triage and
+    /// still blocks reruns. Surfaced as a distinct code so an operator knows the
+    /// fields need reconstruction. `stop_id` is an opaque minted id.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today (like
+    /// [`ForgeError::ContractFixFailed`]/[`ForgeError::ContractGuardRegressed`]): a
+    /// malformed ingest is a recorded stop, so `contract run` returns a SUCCESS
+    /// envelope carrying the bare code string `"CONTRACT_STOP_MALFORMED"` in
+    /// `data.code` (see `contract.rs`), not an error. The variant is retained so the
+    /// code stays enumerable via `forge schema` (KTD10) and so `error_to_object`/
+    /// `code()` map it correctly should a future path surface it as an error. Do not delete.
+    ContractStopMalformed { stop_id: String },
+    /// A run's produced patch touched a path on the non-weakenable default-forbid
+    /// blast list (`.forge/**`, env files, key/credential paths) (R12/AE7, exit 3).
+    /// Deterministic. `forbidden_paths` are the offending patch paths, secret-risk
+    /// redacted in `details` exactly like `DirtyWorktree`, and never printed by
+    /// `Display` (which reaches the response `message`/stderr un-redacted).
+    ///
+    /// Intentionally never CONSTRUCTED as an error today (like
+    /// [`ForgeError::ContractFixFailed`]/[`ForgeError::ContractGuardRegressed`]): a
+    /// blast violation is a recorded run outcome, so `contract run` returns a SUCCESS
+    /// envelope carrying the bare code string `"CONTRACT_BLAST_VIOLATION"` in
+    /// `data.code` with `exit_code = 3` (see `contract.rs`), not an error. The variant
+    /// is retained so the code stays enumerable via `forge schema` (KTD10) and so
+    /// `error_to_object`/`code()` map it correctly should a future path surface it as
+    /// an error. Do not delete.
+    ContractBlastViolation { forbidden_paths: Vec<String> },
+    /// Verification's fix set passed but a guard command regressed (R13/R14/AE3,
+    /// verify exit 4) — mechanically distinguishing works-but-regressed from
+    /// not-done. Deterministic. `regressed` names the guard commands, secret-token
+    /// redacted defensively though the cargo grammar (R15) forbids metacharacters.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today: per R25, `contract verify`
+    /// records its verdicts and returns a SUCCESS envelope carrying the bare code
+    /// string `"CONTRACT_GUARD_REGRESSED"` in `data.code` with `exit_code = 4` (see
+    /// `contract_verify.rs`) — a guard regression is a recorded outcome, not a
+    /// command failure. The variant is retained so the code stays enumerable via
+    /// `forge schema` (KTD10) and so `error_to_object`/`code()` map it correctly
+    /// should a future path ever surface it as an error. Do not delete.
+    ContractGuardRegressed { regressed: Vec<String> },
+    /// Verification's fix set failed (R13/R14, verify exit 2) — the task is not
+    /// done. Guards still ran so the record is complete. Deterministic. `failed`
+    /// names the fix commands, secret-token redacted defensively.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today, for the same reason as
+    /// [`ForgeError::ContractGuardRegressed`]: `contract verify` emits the bare code
+    /// string `"CONTRACT_FIX_FAILED"` in a SUCCESS envelope's `data.code` with
+    /// `exit_code = 2` (R25). Retained for `forge schema` enumeration (KTD10) and
+    /// error-mapping completeness. Do not delete.
+    ContractFixFailed { failed: Vec<String> },
+    /// An acceptance command fell outside the reviewed cargo-only grammar or carried
+    /// a shell metacharacter (R15/AE6), rejected identically at lint and execution.
+    /// Deterministic. `command` is the offending user-authored command, secret-token
+    /// redacted in BOTH `details` and `Display` (mirroring `UnsupportedStructuredGate`).
+    ContractGrammarViolation { command: String },
+    /// `contract integrate` refused to re-apply a completed run's patch (R27/KTD8):
+    /// the run did not complete with a patch, a dependency is not yet accepted into
+    /// HEAD, or the patch no longer applies (a 3-way merge conflict at the current
+    /// HEAD). Deterministic — accept the named dependency first, or re-run the task
+    /// fresh against the current base. `reason` is a fixed classifier string plus
+    /// opaque ids (run/contract/dependency ids), never a path or agent free text, so
+    /// `details` emits it un-redacted.
+    ContractNotIntegrable { reason: String },
 }
 
 impl ForgeError {
@@ -377,6 +465,16 @@ impl ForgeError {
             ForgeError::NoNativeHistory { .. } => "NO_NATIVE_HISTORY",
             ForgeError::PathNotFound { .. } => "PATH_NOT_FOUND",
             ForgeError::BinaryBlob { .. } => "BINARY_BLOB",
+            ForgeError::ContractLintFailed { .. } => "CONTRACT_LINT_FAILED",
+            ForgeError::ContractNotFrozen { .. } => "CONTRACT_NOT_FROZEN",
+            ForgeError::ContractOpenStop { .. } => "CONTRACT_OPEN_STOP",
+            ForgeError::StaleUnknownFile => "STALE_UNKNOWN_FILE",
+            ForgeError::ContractStopMalformed { .. } => "CONTRACT_STOP_MALFORMED",
+            ForgeError::ContractBlastViolation { .. } => "CONTRACT_BLAST_VIOLATION",
+            ForgeError::ContractGuardRegressed { .. } => "CONTRACT_GUARD_REGRESSED",
+            ForgeError::ContractFixFailed { .. } => "CONTRACT_FIX_FAILED",
+            ForgeError::ContractGrammarViolation { .. } => "CONTRACT_GRAMMAR_VIOLATION",
+            ForgeError::ContractNotIntegrable { .. } => "CONTRACT_NOT_INTEGRABLE",
         }
     }
 
@@ -611,6 +709,36 @@ impl ForgeError {
                 json!({ "path": redacted_path(path), "tip": tip })
             }
             ForgeError::BinaryBlob { path } => json!({ "path": redacted_path(path) }),
+            ForgeError::ContractLintFailed { violations } => {
+                json!({ "violations": violations })
+            }
+            ForgeError::ContractNotFrozen {
+                contract_id,
+                revision,
+            } => json!({ "contract_id": contract_id, "revision": revision }),
+            ForgeError::ContractOpenStop { stop_ids } => json!({ "stop_ids": stop_ids }),
+            ForgeError::StaleUnknownFile => json!({
+                "file": "UNKNOWN.md",
+                "recovery_hint": "Triage the existing UNKNOWN.md into a stop record, or remove it, before starting a new run."
+            }),
+            ForgeError::ContractStopMalformed { stop_id } => json!({
+                "stop_id": stop_id,
+                "recovery_hint": "The stop's four required fields could not be fully extracted; supply the missing fields via the triage surface."
+            }),
+            // The offending paths are the default-forbid blast list (`.forge/**`, env
+            // files, key/credential paths), some of which are secret-risk names — so
+            // details go through the same `redact_paths` egress guard as DirtyWorktree.
+            ForgeError::ContractBlastViolation { forbidden_paths } => redact_paths(forbidden_paths),
+            ForgeError::ContractGuardRegressed { regressed } => {
+                json!({ "regressed": redact_command_lines(regressed) })
+            }
+            ForgeError::ContractFixFailed { failed } => {
+                json!({ "failed": redact_command_lines(failed) })
+            }
+            ForgeError::ContractGrammarViolation { command } => {
+                json!({ "command": redact_command_line(command) })
+            }
+            ForgeError::ContractNotIntegrable { reason } => json!({ "reason": reason }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -644,6 +772,24 @@ fn redact_paths(paths: &[String]) -> Value {
         })
         .collect();
     json!({ "paths": displayed, "redacted_count": redacted_count })
+}
+
+/// Redact secret-like `key=value` argv in a single command string, tokenized on
+/// whitespace (the same per-token discipline as `CheckNotPassed`'s unmet gates, so
+/// a secret in any position is caught — not just the first `=`). Contract
+/// acceptance commands are grammar-constrained to the cargo family with no
+/// metacharacters (R15), so this is defense-in-depth for a rejected/echoed command.
+fn redact_command_line(command: &str) -> String {
+    command
+        .split_whitespace()
+        .map(|token| forge_content::redact_secret_like_text(token).0)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Apply [`redact_command_line`] to every command in a list.
+fn redact_command_lines(commands: &[String]) -> Vec<String> {
+    commands.iter().map(|c| redact_command_line(c)).collect()
 }
 
 impl std::fmt::Display for ForgeError {
@@ -874,6 +1020,59 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "cannot blame: the blob at the queried path is binary (not UTF-8 text)"
             ),
+            ForgeError::ContractLintFailed { violations } => write!(
+                f,
+                "contract lint failed with {} violation(s); fix the contract and re-lint",
+                violations.len()
+            ),
+            ForgeError::ContractNotFrozen {
+                contract_id,
+                revision,
+            } => write!(
+                f,
+                "contract {contract_id}@{revision} is not a lint-clean frozen revision; freeze a lint-clean revision before running or verifying"
+            ),
+            ForgeError::ContractOpenStop { stop_ids } => write!(
+                f,
+                "refusing to run: {} open stop record(s) block this contract or its dependency closure ({}); triage them first",
+                stop_ids.len(),
+                stop_ids.join(",")
+            ),
+            ForgeError::StaleUnknownFile => write!(
+                f,
+                "UNKNOWN.md already exists at the workspace root; triage or remove the stale stop file before starting a new run"
+            ),
+            ForgeError::ContractStopMalformed { stop_id } => write!(
+                f,
+                "stop {stop_id} was ingested best-effort and is malformed; its four required fields need reconstruction"
+            ),
+            // Path-free: the offending blast paths may be secret-risk and this
+            // Display reaches the response message/stderr un-redacted (details() redacts).
+            ForgeError::ContractBlastViolation { .. } => write!(
+                f,
+                "blast-radius violation: the produced patch touches a path on the non-weakenable default-forbid list"
+            ),
+            ForgeError::ContractGuardRegressed { regressed } => write!(
+                f,
+                "verification: fix set passed but {} guard command(s) regressed",
+                regressed.len()
+            ),
+            ForgeError::ContractFixFailed { failed } => {
+                write!(f, "verification: {} fix command(s) failed", failed.len())
+            }
+            ForgeError::ContractGrammarViolation { command } => {
+                // Redact before the token reaches the human message: `error_to_object`
+                // routes this Display into the response `message` and stderr, neither of
+                // which passes through details()'s redaction (mirrors UnsupportedStructuredGate).
+                let command = redact_command_line(command);
+                write!(
+                    f,
+                    "command `{command}` is outside the reviewed cargo-only acceptance grammar (or carries a shell metacharacter)"
+                )
+            }
+            ForgeError::ContractNotIntegrable { reason } => {
+                write!(f, "contract run is not integrable: {reason}")
+            }
         }
     }
 }
@@ -1192,6 +1391,66 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["path"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_LINT_FAILED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["violations"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_NOT_FROZEN",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["contract_id", "revision"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_OPEN_STOP",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["stop_ids"],
+        },
+        ErrorCodeSpec {
+            code: "STALE_UNKNOWN_FILE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["file", "recovery_hint"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_STOP_MALFORMED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["stop_id", "recovery_hint"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_BLAST_VIOLATION",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["paths", "redacted_count"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_GUARD_REGRESSED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["regressed"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_FIX_FAILED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["failed"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_GRAMMAR_VIOLATION",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["command"],
+        },
+        ErrorCodeSpec {
+            code: "CONTRACT_NOT_INTEGRABLE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["reason"],
         },
     ]
 }
@@ -1860,6 +2119,120 @@ mod tests {
         }
     }
 
+    /// KTD10 (CCX U2): the nine contract typed codes map to their registered code
+    /// strings, are all non-retryable domain outcomes, and their machine-visible
+    /// `details` redact the two egress surfaces that carry non-opaque content — the
+    /// blast-violation path list (secret-risk paths) and the grammar-violation
+    /// command (secret-like argv). Mirrors the other `*_details_redact_*` guards.
+    #[test]
+    fn contract_codes_classify_and_redact() {
+        // Code + non-retryability for the whole new set at once.
+        let all = [
+            (
+                ForgeError::ContractLintFailed {
+                    violations: vec!["rule 1".into()],
+                },
+                "CONTRACT_LINT_FAILED",
+            ),
+            (
+                ForgeError::ContractNotFrozen {
+                    contract_id: "c1".into(),
+                    revision: 1,
+                },
+                "CONTRACT_NOT_FROZEN",
+            ),
+            (
+                ForgeError::ContractOpenStop {
+                    stop_ids: vec!["contract_stop_x".into()],
+                },
+                "CONTRACT_OPEN_STOP",
+            ),
+            (ForgeError::StaleUnknownFile, "STALE_UNKNOWN_FILE"),
+            (
+                ForgeError::ContractStopMalformed {
+                    stop_id: "contract_stop_x".into(),
+                },
+                "CONTRACT_STOP_MALFORMED",
+            ),
+            (
+                ForgeError::ContractBlastViolation {
+                    forbidden_paths: vec![".forge/config".into()],
+                },
+                "CONTRACT_BLAST_VIOLATION",
+            ),
+            (
+                ForgeError::ContractGuardRegressed {
+                    regressed: vec!["cargo clippy".into()],
+                },
+                "CONTRACT_GUARD_REGRESSED",
+            ),
+            (
+                ForgeError::ContractFixFailed {
+                    failed: vec!["cargo test".into()],
+                },
+                "CONTRACT_FIX_FAILED",
+            ),
+            (
+                ForgeError::ContractGrammarViolation {
+                    command: "cargo test".into(),
+                },
+                "CONTRACT_GRAMMAR_VIOLATION",
+            ),
+            (
+                ForgeError::ContractNotIntegrable {
+                    reason: "dependency ccx-a is not accepted into HEAD".into(),
+                },
+                "CONTRACT_NOT_INTEGRABLE",
+            ),
+        ];
+        for (error, code) in &all {
+            assert_eq!(error.code(), *code);
+            assert!(!error.retryable(), "{code} must be non-retryable");
+            assert_eq!(error.after_ms(), None, "{code}");
+        }
+
+        // CONTRACT_OPEN_STOP names the blocking stop ids (R10/AE2/AE9).
+        let open = ForgeError::ContractOpenStop {
+            stop_ids: vec!["contract_stop_a".into(), "contract_stop_b".into()],
+        };
+        assert_eq!(open.details()["stop_ids"][0], "contract_stop_a");
+        assert!(open.to_string().contains("contract_stop_a"));
+
+        // CONTRACT_BLAST_VIOLATION redacts a secret-risk path but keeps `.forge/*`
+        // (which is NOT secret-risk) visible, and its Display is path-free.
+        let blast = ForgeError::ContractBlastViolation {
+            forbidden_paths: vec![".forge/config".into(), ".env".into()],
+        };
+        let details = blast.details();
+        let serialized = details["paths"].to_string();
+        assert!(serialized.contains(".forge/config"), "non-secret path kept");
+        assert!(!serialized.contains(".env"), "secret path redacted");
+        assert_eq!(details["redacted_count"], 1);
+        let message = blast.to_string();
+        assert!(
+            !message.contains(".forge") && !message.contains(".env"),
+            "blast Display must be path-free: {message}"
+        );
+
+        // CONTRACT_GRAMMAR_VIOLATION redacts a secret-like argv token in BOTH surfaces.
+        let grammar = ForgeError::ContractGrammarViolation {
+            command: "deploy --token=ghp_supersecret".into(),
+        };
+        assert!(!grammar.details()["command"]
+            .as_str()
+            .unwrap()
+            .contains("ghp_supersecret"));
+        assert!(!grammar.to_string().contains("ghp_supersecret"));
+
+        // CONTRACT_NOT_FROZEN Display carries the phrase the store refusal test pins.
+        assert!(ForgeError::ContractNotFrozen {
+            contract_id: "c1".into(),
+            revision: 1,
+        }
+        .to_string()
+        .contains("lint-clean frozen"));
+    }
+
     #[test]
     fn round_trips_through_anyhow() {
         let error: anyhow::Error = ForgeError::NoSnapshot.into();
@@ -2024,6 +2397,35 @@ mod tests {
             ForgeError::BinaryBlob {
                 path: "blob.bin".into(),
             },
+            ForgeError::ContractLintFailed {
+                violations: vec!["rule 3: primitive not found".into()],
+            },
+            ForgeError::ContractNotFrozen {
+                contract_id: "c1".into(),
+                revision: 1,
+            },
+            ForgeError::ContractOpenStop {
+                stop_ids: vec!["contract_stop_x".into()],
+            },
+            ForgeError::StaleUnknownFile,
+            ForgeError::ContractStopMalformed {
+                stop_id: "contract_stop_x".into(),
+            },
+            ForgeError::ContractBlastViolation {
+                forbidden_paths: vec![".forge/config".into()],
+            },
+            ForgeError::ContractGuardRegressed {
+                regressed: vec!["cargo clippy".into()],
+            },
+            ForgeError::ContractFixFailed {
+                failed: vec!["cargo test".into()],
+            },
+            ForgeError::ContractGrammarViolation {
+                command: "rm -rf".into(),
+            },
+            ForgeError::ContractNotIntegrable {
+                reason: "dependency not accepted".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -2074,7 +2476,17 @@ mod tests {
                 | ForgeError::WorkspaceDrift { .. }
                 | ForgeError::NoNativeHistory { .. }
                 | ForgeError::PathNotFound { .. }
-                | ForgeError::BinaryBlob { .. } => {}
+                | ForgeError::BinaryBlob { .. }
+                | ForgeError::ContractLintFailed { .. }
+                | ForgeError::ContractNotFrozen { .. }
+                | ForgeError::ContractOpenStop { .. }
+                | ForgeError::StaleUnknownFile
+                | ForgeError::ContractStopMalformed { .. }
+                | ForgeError::ContractBlastViolation { .. }
+                | ForgeError::ContractGuardRegressed { .. }
+                | ForgeError::ContractFixFailed { .. }
+                | ForgeError::ContractGrammarViolation { .. }
+                | ForgeError::ContractNotIntegrable { .. } => {}
             }
         }
 

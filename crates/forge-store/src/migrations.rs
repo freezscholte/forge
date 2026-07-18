@@ -133,6 +133,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "021_embargo_workflow",
         include_str!("../migrations/021_embargo_workflow.sql"),
     ),
+    (
+        22,
+        "022_contracts",
+        include_str!("../migrations/022_contracts.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -482,7 +487,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 21);
+        assert_eq!(schema_head(), 22);
     }
 
     #[test]
@@ -522,6 +527,7 @@ mod tests {
         assert_eq!(versions[18].0, 19);
         assert_eq!(versions[19].0, 20);
         assert_eq!(versions[20].0, 21);
+        assert_eq!(versions[21].0, 22);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
@@ -543,6 +549,7 @@ mod tests {
         assert!(versions[18].1.is_some(), "019 checksum must be non-NULL");
         assert!(versions[19].1.is_some(), "020 checksum must be non-NULL");
         assert!(versions[20].1.is_some(), "021 checksum must be non-NULL");
+        assert!(versions[21].1.is_some(), "022 checksum must be non-NULL");
 
         // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
         // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header

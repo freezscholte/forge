@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         Command::Trust(args) => trust_response(request_id, args),
         Command::Visibility(args) => visibility_response(request_id, args),
         Command::Embargo(args) => embargo_response(request_id, args),
+        Command::Contract(args) => commands::contract::contract_response(request_id, args),
         Command::Key(args) => key_response(request_id, args),
         Command::Org(args) => org_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
@@ -101,7 +102,20 @@ fn main() -> ExitCode {
     }
 
     if response.status == ResponseStatus::Success {
-        ExitCode::SUCCESS
+        // `contract run`/`verify` carry the harness exit-code split (run 0/1/2/3,
+        // verify 0/2/4, R14/KTD10) in `data.exit_code` while keeping envelope status
+        // SUCCESS — a stop pairs exit 2 with success (R25). Every other successful
+        // command exits 0. A missing/out-of-range code falls back to 0.
+        match response.command.as_str() {
+            "contract run" | "contract verify" => response
+                .data
+                .get("exit_code")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|code| *code <= u64::from(u8::MAX))
+                .map(|code| ExitCode::from(code as u8))
+                .unwrap_or(ExitCode::SUCCESS),
+            _ => ExitCode::SUCCESS,
+        }
     } else {
         ExitCode::from(1)
     }

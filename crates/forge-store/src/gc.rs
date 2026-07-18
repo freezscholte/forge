@@ -128,7 +128,18 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
           WHERE resolver_backend = 'native_merge' AND ours_content_ref IS NOT NULL
          UNION
          SELECT theirs_content_ref AS content_ref FROM conflict_sets
-          WHERE resolver_backend = 'native_merge' AND theirs_content_ref IS NOT NULL",
+          WHERE resolver_backend = 'native_merge' AND theirs_content_ref IS NOT NULL
+         UNION
+         -- CCX contract runs (U5/KTD3): a completed run's produced-patch tree object
+         -- and every per-task patch tree object are durable GC roots, walked here via
+         -- verify_content_ref exactly like a snapshot/proposal content_ref. A new
+         -- ObjectKind that is not a GC root is a data-loss bug. (U9 formalizes the
+         -- two-sided doctor/gc test coverage.)
+         SELECT patch_content_ref AS content_ref FROM contract_runs
+          WHERE patch_content_ref IS NOT NULL
+         UNION
+         SELECT patch_content_ref AS content_ref FROM contract_run_tasks
+          WHERE patch_content_ref IS NOT NULL",
     )?;
     let refs = statement.query_map([], |row| row.get::<_, String>(0))?;
     for content_ref in refs {
