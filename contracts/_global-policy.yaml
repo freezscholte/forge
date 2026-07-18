@@ -1,0 +1,20 @@
+schema: ccx.contract.v1
+kind: global_policy
+policy: |
+  Repo-wide rules for every contract task in this repository.
+
+  - Rust workspace, toolchain pinned by rust-toolchain.toml. rustfmt defaults;
+    clippy warnings are hard failures.
+  - Error handling is anyhow throughout; typed ForgeError variants carry the
+    machine-visible codes and are recovered by downcast. Never add a new error
+    code without registering it in error_registry() and the forge_schema.rs
+    drift-guard lists.
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take declarations and re-exports only. Rust files respect the 3000-line
+    ceiling enforced by scripts/check-rust-line-count.sh.
+  - Security defaults are non-negotiable: snapshot exclusions, secret
+    redaction before signing, the tamper-evident ledger chain, and the
+    cargo-only acceptance command grammar must not weaken.
+  - Tests live beside the code they prove: store-level tests in the domain
+    module, CLI integration tests in crates/forge-cli/tests/ driving the
+    compiled binary with assert_cmd + tempfile.
