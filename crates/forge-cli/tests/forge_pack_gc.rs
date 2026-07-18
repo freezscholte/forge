@@ -14,13 +14,25 @@ fn json_output(assert: assert_cmd::assert::Assert) -> Value {
 }
 
 #[test]
-fn gc_packs_old_loose_objects_and_reclaims_verified_loose_duplicates() {
+fn gc_packs_old_reachable_loose_objects_and_deletes_unreachable_orphans() {
+    // Repack candidates are REACHABLE loose objects only. Reachable content (built
+    // through a real start/save lifecycle) is repacked with its loose duplicate
+    // reclaimed; an unreferenced orphan blob is planned under
+    // `deletable_loose_native_objects` and deleted outright — never copied into a
+    // fresh (protection-window-shielded) pack.
     let repo = native_repo();
+    repo.forge()
+        .args(["--json", "start", "pack reachable content"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("packed.txt"), "pack me\n").expect("write worktree file");
+    repo.forge().args(["--json", "save"]).assert().success();
+
     let store = NativeObjectStore::new(repo.path());
-    let id = store
-        .write_object(ObjectKind::Blob, b"pack me")
-        .expect("write loose object");
-    mark_object_old(repo.path(), &id);
+    let orphan = store
+        .write_object(ObjectKind::Blob, b"unreachable orphan")
+        .expect("write orphan loose object");
+    backdate_all_loose_objects(repo.path());
 
     let dry = json_output(
         repo.forge()
@@ -28,9 +40,23 @@ fn gc_packs_old_loose_objects_and_reclaims_verified_loose_duplicates() {
             .assert()
             .success(),
     );
+    let candidates: Vec<ObjectId> = dry["data"]["pack_candidate_native_objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| ObjectId::parse(value.as_str().unwrap()).expect("candidate id"))
+        .collect();
+    assert!(
+        !candidates.is_empty(),
+        "reachable old loose objects must be repack candidates: dry={dry}"
+    );
+    assert!(
+        !contains_id(&dry["data"]["pack_candidate_native_objects"], &orphan),
+        "an unreachable loose object must never be a repack candidate"
+    );
     assert!(contains_id(
-        &dry["data"]["pack_candidate_native_objects"],
-        &id
+        &dry["data"]["deletable_loose_native_objects"],
+        &orphan
     ));
     assert!(dry["data"]["loose_duplicate_native_objects"]
         .as_array()
@@ -48,16 +74,24 @@ fn gc_packs_old_loose_objects_and_reclaims_verified_loose_duplicates() {
             .assert()
             .success(),
     );
-    assert!(contains_id(&gc["data"]["deleted"], &id));
     assert_eq!(
         gc["data"]["created_packs"].as_array().unwrap().len(),
         1,
         "gc={gc}"
     );
-    assert!(!object_path(repo.path(), &id).exists());
-    assert_eq!(
-        store.read_object(&id).expect("read packed object"),
-        b"pack me"
+    for id in &candidates {
+        assert!(contains_id(&gc["data"]["deleted"], id));
+        assert!(!object_path(repo.path(), id).exists());
+        assert!(
+            store.read_object(id).is_ok(),
+            "repacked reachable object must stay readable"
+        );
+    }
+    assert!(contains_id(&gc["data"]["deleted"], &orphan));
+    assert!(!object_path(repo.path(), &orphan).exists());
+    assert!(
+        store.read_object(&orphan).is_err(),
+        "the unreachable orphan must be reclaimed, not repacked"
     );
 
     let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
@@ -70,12 +104,16 @@ fn gc_packs_old_loose_objects_and_reclaims_verified_loose_duplicates() {
 
 #[test]
 fn gc_crash_after_pack_write_overretains_loose_duplicates() {
+    // Only reachable loose objects are repacked, so the pack-then-crash scenario
+    // needs reachable content from a real start/save lifecycle.
     let repo = native_repo();
-    let store = NativeObjectStore::new(repo.path());
-    let id = store
-        .write_object(ObjectKind::Blob, b"crash safe")
-        .expect("write loose object");
-    mark_object_old(repo.path(), &id);
+    repo.forge()
+        .args(["--json", "start", "crash safe content"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("crash.txt"), "crash safe\n").expect("write worktree file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    backdate_all_loose_objects(repo.path());
 
     let dry = json_output(
         repo.forge()
@@ -83,6 +121,16 @@ fn gc_crash_after_pack_write_overretains_loose_duplicates() {
             .assert()
             .success(),
     );
+    let id = ObjectId::parse(
+        dry["data"]["pack_candidate_native_objects"]
+            .as_array()
+            .unwrap()
+            .first()
+            .expect("a reachable repack candidate")
+            .as_str()
+            .unwrap(),
+    )
+    .expect("candidate id");
     let digest = dry["data"]["plan_digest"].as_str().unwrap();
     run_until_crash(
         repo.path(),
@@ -96,12 +144,9 @@ fn gc_crash_after_pack_write_overretains_loose_duplicates() {
         1,
         "pack/index should be durable before loose deletion starts"
     );
-    assert_eq!(
-        NativeObjectStore::new(repo.path())
-            .read_object(&id)
-            .expect("read after crash"),
-        b"crash safe"
-    );
+    NativeObjectStore::new(repo.path())
+        .read_object(&id)
+        .expect("read after crash");
     let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
     assert_eq!(doctor["data"]["ok"], true, "doctor={doctor}");
 }
@@ -202,7 +247,7 @@ fn doctor_reports_corrupt_pack_and_gc_yes_refuses_deletion() {
 }
 
 #[test]
-fn gc_plan_digest_changes_when_pack_candidates_change() {
+fn gc_plan_digest_changes_when_collectable_loose_set_changes() {
     let repo = native_repo();
     let store = NativeObjectStore::new(repo.path());
     let first = store
@@ -229,7 +274,7 @@ fn gc_plan_digest_changes_when_pack_candidates_change() {
 
     assert_ne!(
         before["data"]["plan_digest"], after["data"]["plan_digest"],
-        "adding a pack candidate must change the gc plan digest"
+        "adding a collectable unreachable loose object must change the gc plan digest"
     );
 }
 
@@ -254,6 +299,26 @@ fn run_until_crash(repo: &std::path::Path, crash_point: &str, args: &[&str]) {
         "expected injected crash `{crash_point}` to abort `forge {args:?}`, but it succeeded:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+fn backdate_all_loose_objects(repo_path: &std::path::Path) {
+    let objects = repo_path.join(".forge/objects/sha256");
+    let Ok(prefixes) = std::fs::read_dir(&objects) else {
+        return;
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(entries) = std::fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        for object in entries.flatten() {
+            let status = std::process::Command::new("touch")
+                .args(["-t", "202001010000"])
+                .arg(object.path())
+                .status()
+                .expect("run touch");
+            assert!(status.success(), "backdate mtime failed");
+        }
+    }
 }
 
 fn mark_object_old(repo_path: &std::path::Path, id: &ObjectId) {
