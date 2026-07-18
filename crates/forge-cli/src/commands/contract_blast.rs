@@ -22,17 +22,25 @@
 //!     workspace filesystem directly ([`scan_scratch_default_forbid`]): base and
 //!     dependency materialization both enforce the same exclusions, so ANY
 //!     policy-excluded file present in the scratch tree was written by the agent.
-//!   * A secret-content scan (R16 detect-and-refuse): the post-state content of each
-//!     added/modified NON-excluded file is run through the shared
-//!     `redact_evidence_excerpt` detector; a non-empty redaction set is a violation
-//!     whose patch is refused persistence — storing redacted bytes would corrupt the
-//!     R27 integration payload, so the whole run fails fail-closed instead. Only the
-//!     PATH is ever surfaced or recorded, never the detected content.
+//!   * A secret-content scan (R16 detect-and-refuse), DIFF-AWARE so it covers only
+//!     agent-AUTHORED content: for an ADDED file the whole post-state content is run
+//!     through the shared `redact_evidence_excerpt` detector; for a MODIFIED file only
+//!     the lines the agent ADDED relative to the pre-agent baseline (a line-set
+//!     difference — post lines not present in the baseline blob) are scanned. A
+//!     non-empty redaction set is a violation whose patch is refused persistence —
+//!     storing redacted bytes would corrupt the R27 integration payload, so the whole
+//!     run fails fail-closed instead. Only the PATH is ever surfaced or recorded,
+//!     never the detected content. Scanning the whole post-state (the pre-fix
+//!     behavior) false-positived when a modified file already carried secret-shaped
+//!     fixture strings signed into the base tree, contradicting R16's "agent-authored
+//!     content" wording; the diff-aware scan flags only genuinely new secret lines.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use forge_content::{is_ignored_by_policy, DiffLineTag, FileDiff, HunkDiff, TreeDiff};
+use forge_content_native::{read_blob_at_path, NativeObjectStore};
 
 use super::contract::glob_match;
 
@@ -323,11 +331,17 @@ fn hunks_decl_only(hunks: &[HunkDiff]) -> bool {
 /// * `scratch_root` — the post-run scratch workspace, read for (a) default-forbid
 ///   paths the snapshot dropped and (b) added/modified post-state content scanned
 ///   for secrets.
+/// * `store` / `baseline_ref` — the native object store and the pre-agent baseline
+///   content ref (the `a`-side of the run's `diff_native_content_refs(baseline,
+///   post)`), used to read a MODIFIED file's baseline blob so the secret-content scan
+///   covers only agent-ADDED lines (diff-aware R16).
 pub(crate) fn evaluate_blast(
     diff: &TreeDiff,
     allow: &[String],
     forbid: &[String],
     scratch_root: &Path,
+    store: &NativeObjectStore,
+    baseline_ref: &str,
 ) -> Result<BlastOutcome> {
     let mut outcome = BlastOutcome::default();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -374,9 +388,10 @@ pub(crate) fn evaluate_blast(
         }
     }
 
-    // Secret-content scan (R16): each added/modified NON-excluded file's post-state
-    // content. Deletions are skipped; excluded files are already forbidden above and
-    // their content is never persisted, so they need no separate scan.
+    // Secret-content scan (R16), DIFF-AWARE: for an ADDED file the whole post-state
+    // content; for a MODIFIED file only the lines the agent added relative to the
+    // pre-agent baseline. Deletions are skipped; excluded files are already forbidden
+    // above and their content is never persisted, so they need no separate scan.
     for file in &diff.files {
         if file.status.starts_with('D') {
             continue; // deletion has no post-state content
@@ -384,7 +399,7 @@ pub(crate) fn evaluate_blast(
         if classify_path(&file.path, allow, forbid).is_some() {
             continue; // already a path violation; do not double-report
         }
-        if scan_file_for_secret(scratch_root, file)? {
+        if scan_file_for_secret(scratch_root, file, store, baseline_ref)? {
             outcome.violations.push(BlastViolation {
                 path: file.path.clone(),
                 class: BlastViolationClass::SecretContent,
@@ -396,12 +411,32 @@ pub(crate) fn evaluate_blast(
     Ok(outcome)
 }
 
-/// Read a changed file's post-state content from the scratch workspace and return
-/// `true` if the shared secret detector fires. Bounded at [`SECRET_SCAN_LIMIT`];
-/// non-UTF-8 (binary) content is skipped (documented choice — the redactor operates
-/// on text and a binary blob is not a secret-assignment carrier). NEVER returns or
-/// records the content itself.
-fn scan_file_for_secret(scratch_root: &Path, file: &FileDiff) -> Result<bool> {
+/// Scan a changed file's agent-AUTHORED content and return `true` if the shared
+/// secret detector fires. Diff-aware (R16): for a MODIFIED file only the lines the
+/// agent ADDED relative to the pre-agent baseline are scanned; for an ADDED file the
+/// whole post-state content is scanned (unchanged behavior).
+///
+/// The post-state is read from the scratch workspace; the baseline blob is read from
+/// the store via [`read_blob_at_path`]. Both sides are bounded at
+/// [`SECRET_SCAN_LIMIT`]; non-UTF-8 (binary) content is skipped (documented choice —
+/// the redactor operates on text and a binary blob is not a secret-assignment
+/// carrier). NEVER returns or records the content itself.
+///
+/// Precision note: the added set is a simple LINE-SET difference (post lines not
+/// present in the baseline). A pre-existing fixture line that the agent MOVED is
+/// therefore not re-flagged (its text still exists in the baseline set — correct),
+/// and a pre-existing line the agent DUPLICATED is likewise not re-flagged
+/// (acceptable: the content already exists in the signed base tree). Only genuinely
+/// new secret-bearing lines trigger. This is deliberately not an LCS diff; erring
+/// toward treating a line as pre-existing (never toward hiding a new secret line) is
+/// the safe direction because a truly new line can never coincide with a baseline
+/// line's exact bytes without the secret already being in the base.
+fn scan_file_for_secret(
+    scratch_root: &Path,
+    file: &FileDiff,
+    store: &NativeObjectStore,
+    baseline_ref: &str,
+) -> Result<bool> {
     let path = scratch_root.join(&file.path);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -410,10 +445,42 @@ fn scan_file_for_secret(scratch_root: &Path, file: &FileDiff) -> Result<bool> {
         Err(_) => return Ok(false),
     };
     let window = &bytes[..bytes.len().min(SECRET_SCAN_LIMIT)];
-    let Ok(text) = std::str::from_utf8(window) else {
+    let Ok(post_text) = std::str::from_utf8(window) else {
         return Ok(false); // binary / non-UTF-8: skipped with intent
     };
-    let (_redacted, kinds) = forge_content::redact_evidence_excerpt(text);
+
+    // ADDED file (no baseline content): scan the whole post-state. `status` uses git's
+    // name-status letters (`A`/`M`/`D`, `R<score>`); anything that is not a plain
+    // modification is treated as fully agent-authored (scan whole), erring toward
+    // scanning more.
+    let baseline_bytes = if file.status.starts_with('M') {
+        read_blob_at_path(store, baseline_ref, &file.path)?
+    } else {
+        None
+    };
+    let Some(baseline_bytes) = baseline_bytes else {
+        let (_redacted, kinds) = forge_content::redact_evidence_excerpt(post_text);
+        return Ok(!kinds.is_empty());
+    };
+
+    // MODIFIED file: scan only the lines present in post but not in the baseline. The
+    // baseline is bounded and non-UTF-8-skipped exactly like the post side; a
+    // non-UTF-8 baseline (binary→text edit) collapses to an empty pre-existing set, so
+    // the whole post-state is scanned — the fail-toward-scanning-more direction.
+    let baseline_window = &baseline_bytes[..baseline_bytes.len().min(SECRET_SCAN_LIMIT)];
+    let baseline_lines: BTreeSet<&str> = match std::str::from_utf8(baseline_window) {
+        Ok(text) => text.lines().collect(),
+        Err(_) => BTreeSet::new(),
+    };
+    let added: String = post_text
+        .lines()
+        .filter(|line| !baseline_lines.contains(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if added.is_empty() {
+        return Ok(false);
+    }
+    let (_redacted, kinds) = forge_content::redact_evidence_excerpt(&added);
     Ok(!kinds.is_empty())
 }
 
@@ -591,7 +658,10 @@ mod tests {
             dropped_secret_paths: Vec::new(),
             warnings: Vec::new(),
         };
-        let outcome = evaluate_blast(&diff, &[], &[], scratch.path()).unwrap();
+        // The diff is empty, so the diff-aware secret scan never reads the baseline;
+        // a placeholder store/ref suffices for this path-only assertion.
+        let store = NativeObjectStore::new(scratch.path());
+        let outcome = evaluate_blast(&diff, &[], &[], scratch.path(), &store, "").unwrap();
 
         assert!(outcome.has_violation());
         let violation = outcome
