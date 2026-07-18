@@ -100,6 +100,22 @@ pub(crate) fn verify_response(
             })?;
         let (fix, guard) = parse_acceptance(&record.source_yaml)?;
 
+        // F3(c): defense-in-depth — a frozen revision whose acceptance parses to ZERO
+        // commands (empty fix AND guard) would execute nothing yet record a green
+        // aggregate verdict, signing a passed=true roll-up that proves nothing. Lint
+        // R4 now rejects an empty fix set, but verify never trusts that a revision was
+        // lint-clean (fail-closed, like the grammar gate below), so refuse typed here
+        // rather than record a vacuous green.
+        if fix.is_empty() && guard.is_empty() {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "verify refused: contract {}@{} has an empty acceptance set (no fix or guard commands to execute)",
+                    run.contract_id, revision
+                ),
+            }
+            .into());
+        }
+
         // 3. FAIL-CLOSED eval-sink gate (R15): grammar-check EVERY command BEFORE any
         // execution. A single non-conforming command refuses the whole verify with
         // CONTRACT_GRAMMAR_VIOLATION and nothing runs — verify never trusts that the
@@ -140,6 +156,7 @@ pub(crate) fn verify_response(
         let fix_failed = run_set(
             scratch.path(),
             "fix",
+            revision,
             &task_id,
             &fix,
             &mut verdicts,
@@ -148,6 +165,7 @@ pub(crate) fn verify_response(
         let guard_failed = run_set(
             scratch.path(),
             "guard",
+            revision,
             &task_id,
             &guard,
             &mut verdicts,
@@ -176,6 +194,7 @@ pub(crate) fn verify_response(
         // guarantees at least one verdict row exists even for an empty acceptance set,
         // so the store's non-empty-batch guard always holds.
         verdicts.push(ContractRunVerdictInput {
+            revision,
             task_id: Some(task_id.clone()),
             verdict_kind: "aggregate".to_string(),
             command: None,
@@ -191,8 +210,14 @@ pub(crate) fn verify_response(
 
         // 7. Record all verdicts atomically under the "contract verify" op so a
         // same-request-id replay folds to this result (KTD6).
-        let recorded =
-            forge_store::record_contract_verify_verdicts(&cwd, request_id, &run.run_id, verdicts)?;
+        let recorded = forge_store::record_contract_verify_verdicts(
+            &cwd,
+            request_id,
+            &run.run_id,
+            verdicts,
+            outcome.as_str(),
+            exit_code,
+        )?;
         let verdict_ids: Vec<String> = recorded.iter().map(|v| v.verdict_id.clone()).collect();
 
         let mut data = json!({
@@ -220,9 +245,11 @@ pub(crate) fn verify_response(
 /// is already grammar-checked, so the whitespace split into argv is safe (no shell
 /// metacharacters can survive the gate) and `capture_with_timeout` runs it directly —
 /// output excerpts inherit EXCERPT_LIMIT + secret redaction (R16).
+#[allow(clippy::too_many_arguments)]
 fn run_set(
     workspace: &Path,
     kind: &str,
+    revision: i64,
     task_id: &str,
     commands: &[String],
     verdicts: &mut Vec<ContractRunVerdictInput>,
@@ -258,6 +285,7 @@ fn run_set(
             )
         };
         verdicts.push(ContractRunVerdictInput {
+            revision,
             task_id: Some(task_id.to_string()),
             verdict_kind: kind.to_string(),
             command: Some(cmd.clone()),

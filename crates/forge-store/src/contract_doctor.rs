@@ -168,22 +168,23 @@ pub(crate) fn contract_subject_digest(
         SUBJECT_KIND_CONTRACT_VERDICT => {
             let verdict = conn
                 .query_row(
-                    "SELECT run_id, task_id, verdict_kind, command, passed, detail, evidence_id,
-                            created_at_ms
+                    "SELECT run_id, revision, task_id, verdict_kind, command, passed, detail,
+                            evidence_id, created_at_ms
                      FROM contract_run_verdicts WHERE id = ?1",
                     params![subject_id],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             ContractRunVerdictInput {
-                                task_id: row.get(1)?,
-                                verdict_kind: row.get(2)?,
-                                command: row.get(3)?,
-                                passed: row.get::<_, i64>(4)? != 0,
-                                detail: row.get(5)?,
-                                evidence_id: row.get(6)?,
+                                revision: row.get(1)?,
+                                task_id: row.get(2)?,
+                                verdict_kind: row.get(3)?,
+                                command: row.get(4)?,
+                                passed: row.get::<_, i64>(5)? != 0,
+                                detail: row.get(6)?,
+                                evidence_id: row.get(7)?,
                             },
-                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
                         ))
                     },
                 )
@@ -222,6 +223,111 @@ pub(crate) fn expected_contract_signed_subjects(
         }
     }
     Ok(subjects)
+}
+
+/// Cross-check that every contract-family op's referenced domain row still exists
+/// (F5/KTD2). Each contract op records its subject row id in its `state_json`; unlike
+/// evidence/decisions (recomputed from the live row) the contract family recovers its
+/// op digest from that frozen `state_json`, so a deleted row does not break the
+/// op-chain, and the signature pass's `SubjectMissing` only fires while the row's
+/// `ledger_signatures` survive — so a row+signature CO-deletion is invisible to both.
+/// This pass reads each op's referenced id and confirms the row is present; a missing
+/// row is a `ReferencedRowMissing` finding naming the table and id. Read-only.
+///
+/// Covered ops and their referenced rows:
+/// - `contract_frozen` → `contract_revisions(contract_id, revision)`
+/// - `contract_run_recorded` / `contract_verdicts_recorded` / `contract_integrated`
+///   → `contract_runs(run_id)`
+/// - `contract_stop_opened` → `contract_stops(stop_id)`
+pub(crate) fn contract_referenced_row_issues(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Vec<crate::doctor::ContractRowFinding>> {
+    use crate::doctor::{ContractRowFinding, ContractRowFindingKind};
+
+    let mut statement = conn.prepare(
+        "SELECT o.id, o.kind, v.state_json
+         FROM operations o
+         JOIN views v ON v.id = o.resulting_view_id
+         WHERE o.repo_id = ?1
+           AND o.kind IN (
+               'contract_frozen', 'contract_run_recorded', 'contract_stop_opened',
+               'contract_verdicts_recorded', 'contract_integrated'
+           )
+         ORDER BY o.id",
+    )?;
+    let rows = statement
+        .query_map(params![repo_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut findings = Vec::new();
+    for (operation_id, kind, state_json) in rows {
+        let state: Value = serde_json::from_str(&state_json).unwrap_or(Value::Null);
+        // (table, subject_id, existence-query, params) per op kind.
+        let missing = match kind.as_str() {
+            "contract_run_recorded" | "contract_verdicts_recorded" | "contract_integrated" => {
+                let Some(run_id) = state.get("run_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let exists = row_exists(
+                    conn,
+                    "SELECT 1 FROM contract_runs WHERE repo_id = ?1 AND id = ?2",
+                    params![repo_id, run_id],
+                )?;
+                (!exists).then(|| ("contract_runs", run_id.to_string()))
+            }
+            "contract_stop_opened" => {
+                let Some(stop_id) = state.get("stop_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let exists = row_exists(
+                    conn,
+                    "SELECT 1 FROM contract_stops WHERE repo_id = ?1 AND id = ?2",
+                    params![repo_id, stop_id],
+                )?;
+                (!exists).then(|| ("contract_stops", stop_id.to_string()))
+            }
+            "contract_frozen" => {
+                let (Some(contract_id), Some(revision)) = (
+                    state.get("contract_id").and_then(Value::as_str),
+                    state.get("revision").and_then(Value::as_i64),
+                ) else {
+                    continue;
+                };
+                let exists = row_exists(
+                    conn,
+                    "SELECT 1 FROM contract_revisions
+                     WHERE repo_id = ?1 AND contract_id = ?2 AND revision = ?3",
+                    params![repo_id, contract_id, revision],
+                )?;
+                (!exists).then(|| ("contract_revisions", format!("{contract_id}@{revision}")))
+            }
+            _ => None,
+        };
+        if let Some((table, subject_id)) = missing {
+            findings.push(ContractRowFinding {
+                kind: ContractRowFindingKind::ReferencedRowMissing,
+                table: table.to_string(),
+                subject_id,
+                operation_id,
+            });
+        }
+    }
+    Ok(findings)
+}
+
+/// Whether the given single-row existence query returns a row.
+fn row_exists(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<bool> {
+    Ok(conn
+        .query_row(sql, params, |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 #[cfg(test)]

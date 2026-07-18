@@ -351,12 +351,29 @@ pub enum ForgeError {
     /// not a run failure: the stop still counts as a success pending triage and
     /// still blocks reruns. Surfaced as a distinct code so an operator knows the
     /// fields need reconstruction. `stop_id` is an opaque minted id.
+    ///
+    /// Intentionally never CONSTRUCTED as an error today (like
+    /// [`ForgeError::ContractFixFailed`]/[`ForgeError::ContractGuardRegressed`]): a
+    /// malformed ingest is a recorded stop, so `contract run` returns a SUCCESS
+    /// envelope carrying the bare code string `"CONTRACT_STOP_MALFORMED"` in
+    /// `data.code` (see `contract.rs`), not an error. The variant is retained so the
+    /// code stays enumerable via `forge schema` (KTD10) and so `error_to_object`/
+    /// `code()` map it correctly should a future path surface it as an error. Do not delete.
     ContractStopMalformed { stop_id: String },
     /// A run's produced patch touched a path on the non-weakenable default-forbid
     /// blast list (`.forge/**`, env files, key/credential paths) (R12/AE7, exit 3).
     /// Deterministic. `forbidden_paths` are the offending patch paths, secret-risk
     /// redacted in `details` exactly like `DirtyWorktree`, and never printed by
     /// `Display` (which reaches the response `message`/stderr un-redacted).
+    ///
+    /// Intentionally never CONSTRUCTED as an error today (like
+    /// [`ForgeError::ContractFixFailed`]/[`ForgeError::ContractGuardRegressed`]): a
+    /// blast violation is a recorded run outcome, so `contract run` returns a SUCCESS
+    /// envelope carrying the bare code string `"CONTRACT_BLAST_VIOLATION"` in
+    /// `data.code` with `exit_code = 3` (see `contract.rs`), not an error. The variant
+    /// is retained so the code stays enumerable via `forge schema` (KTD10) and so
+    /// `error_to_object`/`code()` map it correctly should a future path surface it as
+    /// an error. Do not delete.
     ContractBlastViolation { forbidden_paths: Vec<String> },
     /// Verification's fix set passed but a guard command regressed (R13/R14/AE3,
     /// verify exit 4) — mechanically distinguishing works-but-regressed from

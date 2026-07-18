@@ -201,6 +201,9 @@ CREATE TABLE IF NOT EXISTS contract_run_verdicts (
     id TEXT PRIMARY KEY,
     repo_id TEXT NOT NULL REFERENCES repositories(id),
     run_id TEXT NOT NULL REFERENCES contract_runs(id),
+    -- The frozen contract revision whose acceptance/blast policy produced this
+    -- verdict (F6): binds the signed verdict to the exact revision it evaluated.
+    revision INTEGER NOT NULL,
     task_id TEXT,
     verdict_kind TEXT NOT NULL CHECK (
         verdict_kind IN ('blast', 'fix', 'guard', 'aggregate')

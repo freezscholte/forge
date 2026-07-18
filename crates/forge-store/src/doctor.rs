@@ -36,6 +36,10 @@ pub struct DoctorReport {
     /// Corrupt `views.state_json` rows that make GC's reachability root set
     /// untrustworthy. Empty in a healthy repo.
     pub ledger_view_issues: Vec<LedgerViewFinding>,
+    /// Contract-family ops whose referenced domain row was deleted (F5): a
+    /// row+signature co-deletion that the op-chain and signature passes miss. Empty
+    /// in a healthy repo.
+    pub contract_row_issues: Vec<ContractRowFinding>,
     /// Native pack/index entries that fail offset, checksum, decompression, hash, or kind
     /// verification. Empty in a healthy repo.
     pub native_pack_issues: Vec<String>,
@@ -124,6 +128,33 @@ pub struct LedgerViewFinding {
 pub enum LedgerViewFindingKind {
     CorruptStateJson,
     UnparseableCommitId,
+}
+
+/// A contract-family op in the ledger whose referenced domain row no longer exists
+/// (F5). Unlike evidence/decision doctoring — which recomputes each row's digest
+/// from the LIVE row — the contract family recovers each op's folded digest from the
+/// FROZEN op `state_json`, so a `broken_link` never fires when a row is deleted; and
+/// the signature pass's `SubjectMissing` only fires from `ledger_signatures`, so
+/// co-deleting a row AND its signature rows leaves both passes green. This
+/// cross-check closes that hole: every contract op names its subject row id in its
+/// `state_json`, so a missing row is a tamper finding. Carries only opaque ids and a
+/// closed table label — never row content. Empty in a healthy repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractRowFinding {
+    pub kind: ContractRowFindingKind,
+    /// The domain table the op referenced (`contract_revisions`/`contract_runs`/
+    /// `contract_stops`).
+    pub table: String,
+    /// The opaque row id (or `contract_id@revision` for a revision) the op names.
+    pub subject_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractRowFindingKind {
+    /// A signed contract-family op references a domain row that has been deleted.
+    ReferencedRowMissing,
 }
 
 pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
@@ -251,6 +282,18 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             ledger_view_issues.len()
         ));
     }
+    // F5: contract-family ops recover their folded digest from the FROZEN op
+    // state_json, so a deleted domain row + its deleted signature rows evade both the
+    // op-chain and signature passes. Cross-check that every contract op's referenced
+    // row still exists.
+    let contract_row_issues =
+        contract_doctor::contract_referenced_row_issues(&connection, &context.repo_id)?;
+    if !contract_row_issues.is_empty() {
+        issues.push(format!(
+            "{} contract op(s) reference a deleted row",
+            contract_row_issues.len()
+        ));
+    }
     let native_pack_issues = native_store.validate_packs();
     if !native_pack_issues.is_empty() {
         issues.push(format!(
@@ -274,6 +317,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         tampered_rows,
         native_history_issues,
         ledger_view_issues,
+        contract_row_issues,
         native_pack_issues,
         signature_issues,
         signature_key_summary,

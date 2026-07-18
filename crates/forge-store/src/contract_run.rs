@@ -68,6 +68,64 @@ pub fn open_stops_for_contracts(
     Ok(blocking)
 }
 
+/// A lightweight read-only row of the run list (F12): enough for a cold-start
+/// operator to recover a run id and its outcome after the invoking process's
+/// stdout is gone (`contract show <id>` resolves a contract's revision, not a run
+/// list; a failed/blast_violation run leaves no stop record to recover the id
+/// from). Deliberately NOT the full [`crate::contract::ContractRunRecord`] with
+/// per-task rows — just the recovery/triage fields.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContractRunListRow {
+    pub run_id: String,
+    pub contract_id: String,
+    pub revision: i64,
+    pub outcome: String,
+    pub exit_code: i64,
+    pub created_at_ms: i64,
+}
+
+/// List recorded runs newest-first (F12), optionally filtered by `contract_id`
+/// and/or `outcome`. Read-only: no lock, no signing — mirrors `contract_stops`'
+/// connection/query idiom.
+pub fn contract_runs(
+    cwd: &Path,
+    contract_id: Option<&str>,
+    outcome: Option<&str>,
+) -> Result<Vec<ContractRunListRow>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let mut sql = String::from(
+        "SELECT id, contract_id, revision, outcome, exit_code, created_at_ms
+         FROM contract_runs
+         WHERE repo_id = ?1",
+    );
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&context.repo_id];
+    if let Some(contract_id) = contract_id.as_ref() {
+        binds.push(contract_id);
+        sql.push_str(&format!(" AND contract_id = ?{}", binds.len()));
+    }
+    if let Some(outcome) = outcome.as_ref() {
+        binds.push(outcome);
+        sql.push_str(&format!(" AND outcome = ?{}", binds.len()));
+    }
+    sql.push_str(" ORDER BY created_at_ms DESC, id DESC");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(binds.as_slice(), |row| {
+            Ok(ContractRunListRow {
+                run_id: row.get(0)?,
+                contract_id: row.get(1)?,
+                revision: row.get(2)?,
+                outcome: row.get(3)?,
+                exit_code: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Whether contract `dep_contract_id` is already accepted into HEAD (KTD8).
 ///
 /// Anti-spoof (B3/KTD8): a dependency counts as accepted iff its task's completed

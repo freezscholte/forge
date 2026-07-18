@@ -2830,3 +2830,86 @@ fn gc_reclaims_secret_refused_unreferenced_post_tree() {
          the residual"
     );
 }
+
+#[test]
+fn contract_runs_lists_and_filters() {
+    // F12: `contract runs` lists recorded runs (id + outcome) so a cold-start
+    // operator can recover a failed/crashed run's id once the invoking process's
+    // stdout is gone — a failed run leaves no stop record, and `contract show <id>`
+    // resolves a contract's revision, not a run list.
+    let repo = run_repo();
+    freeze_contract(&repo, "ccx-a", &[]);
+
+    // A completed run and a crashed (failed) run of the same contract.
+    let completed = contract_run(&repo, &["ccx-a"], EDIT_AGENT, 0);
+    let completed_id = completed["data"]["run_id"].as_str().unwrap().to_string();
+    let failed = contract_run(&repo, &["ccx-a"], "exit 3", 1);
+    let failed_id = failed["data"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(failed["data"]["outcome"], "failed");
+    assert_ne!(completed_id, failed_id);
+
+    // Unfiltered: both runs are listed with their outcomes and run ids.
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "runs"])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["data"]["count"], 2);
+    let outcome_for = |env: &Value, run_id: &str| -> String {
+        env["data"]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == run_id)
+            .unwrap_or_else(|| panic!("run {run_id} listed"))["outcome"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(outcome_for(&env, &completed_id), "completed");
+    assert_eq!(outcome_for(&env, &failed_id), "failed");
+
+    // --contract-id ccx-a still lists both (both belong to ccx-a).
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "runs", "--contract-id", "ccx-a"])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["count"], 2);
+
+    // --outcome failed filters to just the crashed run — the recovery path.
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "runs", "--outcome", "failed"])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["count"], 1);
+    assert_eq!(env["data"]["runs"][0]["run_id"], failed_id);
+
+    // A second contract's run is excluded when filtering by the first contract's id.
+    freeze_contract(&repo, "ccx-b", &[]);
+    contract_run(&repo, &["ccx-b"], EDIT_AGENT, 0);
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "runs", "--contract-id", "ccx-a"])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["count"], 2, "only ccx-a's two runs");
+    for run in env["data"]["runs"].as_array().unwrap() {
+        assert_eq!(run["contract_id"], "ccx-a");
+    }
+
+    // Unfiltered now sees all three recorded runs.
+    let env = json_output(
+        repo.forge()
+            .args(["--json", "contract", "runs"])
+            .assert()
+            .code(0),
+    );
+    assert_eq!(env["data"]["count"], 3);
+}

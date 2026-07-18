@@ -22,7 +22,8 @@ use crate::commands::contract::{
     canonicalize_operand, contract_dependency_closure, lint_contract_file, read_source_string,
 };
 use crate::{
-    command_result, ContractResolveArgs, ContractShowArgs, ContractStopsArgs, ContractVerdictsArgs,
+    command_result, ContractResolveArgs, ContractRunsArgs, ContractShowArgs, ContractStopsArgs,
+    ContractVerdictsArgs,
 };
 
 /// The recognized stop-kind vocabulary (mirrors `parse_unknown_fields`). A
@@ -55,6 +56,29 @@ pub(crate) fn stops_response(
                 "open_only": args.open,
                 "count": stops_json.len(),
                 "stops": stops_json,
+            }),
+            Vec::new(),
+        ))
+    })
+}
+
+/// `forge contract runs [--contract-id <id>] [--outcome <o>]` — read-only (no repo
+/// lock). Lists recorded runs newest-first (F12) so a cold-start operator can
+/// recover a run id and its outcome once the invoking process's stdout is gone (a
+/// failed/blast_violation run leaves no stop record, and `contract show <id>`
+/// resolves a contract's revision, not a run list).
+pub(crate) fn runs_response(
+    request_id: Option<String>,
+    args: ContractRunsArgs,
+) -> ResponseEnvelope {
+    command_result("contract runs", request_id, move |cwd, _| {
+        let rows =
+            forge_store::contract_runs(&cwd, args.contract_id.as_deref(), args.outcome.as_deref())?;
+        Ok((
+            None,
+            json!({
+                "count": rows.len(),
+                "runs": serde_json::to_value(&rows)?,
             }),
             Vec::new(),
         ))

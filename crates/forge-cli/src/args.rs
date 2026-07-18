@@ -501,6 +501,10 @@ pub(crate) enum ContractCommand {
     Show(ContractShowArgs),
     /// List the recorded check verdicts for a run or task (read-only, R23).
     Verdicts(ContractVerdictsArgs),
+    /// List recorded runs newest-first (read-only, F12): recover a run id and its
+    /// outcome after the invoking process's stdout is gone. `--contract-id` and
+    /// `--outcome` filter the list.
+    Runs(ContractRunsArgs),
     /// Resolve an open stop (R10/R24): a revision bump (`--revised <yaml>`) or an
     /// explicit rejection (`--reject --rationale <text>`). Both freeze a new
     /// revision; malformed stops accept the four fields inline for reconstruction.
@@ -587,6 +591,16 @@ pub(crate) struct ContractStopsArgs {
     /// Restrict to one contract id (default: every contract in the repo).
     #[arg(long)]
     pub(crate) contract_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ContractRunsArgs {
+    /// Restrict to one contract id (default: every contract in the repo).
+    #[arg(long)]
+    pub(crate) contract_id: Option<String>,
+    /// Restrict to one outcome (for example `completed`, `failed`, `stopped`).
+    #[arg(long)]
+    pub(crate) outcome: Option<String>,
 }
 
 #[derive(Debug, Args)]

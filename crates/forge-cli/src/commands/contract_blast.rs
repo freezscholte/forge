@@ -353,14 +353,23 @@ pub(crate) fn evaluate_blast(
         });
     }
 
-    // Default-forbid classes the snapshot excluded from the diff (`.forge/**`,
-    // `.env`, keys, `*credentials*`): find them by walking the scratch tree.
+    // Policy-excluded classes the snapshot dropped from the diff (`.forge/**`,
+    // `.env`, keys, `*credentials*`, and the broader secret-risk names like `id_dsa`,
+    // `*.p12`, `*secret*`): find them by walking the scratch tree, fail-closed. The
+    // detail distinguishes the narrow default-forbid subset from the broader
+    // secret-risk-only case so an operator can tell them apart; both are
+    // ForbiddenPath-class (exit 3).
     for path in scan_scratch_default_forbid(scratch_root)? {
         if seen.insert(path.clone()) {
+            let detail = if is_default_forbidden(&path) {
+                format!("default_forbidden: {path}")
+            } else {
+                format!("policy_excluded: {path}")
+            };
             outcome.violations.push(BlastViolation {
                 path: path.clone(),
                 class: BlastViolationClass::ForbiddenPath,
-                detail: format!("default_forbidden: {path}"),
+                detail,
             });
         }
     }
@@ -409,10 +418,26 @@ fn scan_file_for_secret(scratch_root: &Path, file: &FileDiff) -> Result<bool> {
 }
 
 /// Walk the scratch workspace and return the relative paths (with `/` separators)
-/// that are BOTH `is_ignored_by_policy` AND match a default-forbid glob — i.e. the
-/// agent-written `.forge/…`, `.env`, key, and credential files the snapshot dropped
-/// before the tree diff. Base/dependency materialization enforce the same
-/// exclusions, so such a file present here was written by the agent (KTD7).
+/// of EVERY file that is `is_ignored_by_policy` — fail-closed. This is broader than
+/// the [`DEFAULT_FORBID`] list on purpose: `is_ignored_by_policy` (via
+/// `is_secret_risk_path`) also covers secret-risk names that are NOT default-forbid
+/// globs (`id_dsa`, `*.p12`, `*.pfx`, `*secret*`, singular `*credential*`, …). Those
+/// paths are dropped from the snapshot before the tree diff, so if we only flagged the
+/// narrower default-forbid subset an agent could plant/exfiltrate such a file
+/// invisibly (it would be excluded from the snapshot AND never reported).
+///
+/// Flagging every policy-excluded file found here is safe because the scratch tree is
+/// materialized ONLY via `materialize_tree` (forge-content-native), which writes just
+/// the base+dependency TREE content and `continue`s on every `is_ignored_by_policy`
+/// entry — it never writes `.forge` or the `WORKSPACE_MARKER_FILE`. The base and
+/// dependency snapshots that produced that content were themselves taken with
+/// `is_ignored_by_policy` paths excluded. Therefore ANY `is_ignored_by_policy` file
+/// present in the scratch tree was written by the agent (KTD7) → a real blast
+/// violation. The walk skips `.git`/`target`/`node_modules` via [`WALK_SKIP_DIRS`].
+///
+/// The caller distinguishes the default-forbid subset (`default_forbidden:` detail)
+/// from the broader secret-risk-only case (`policy_excluded:` detail) via
+/// [`is_default_forbidden`] on each returned path.
 fn scan_scratch_default_forbid(scratch_root: &Path) -> Result<Vec<String>> {
     let mut hits = Vec::new();
     let mut stack = vec![scratch_root.to_path_buf()];
@@ -439,7 +464,7 @@ fn scan_scratch_default_forbid(scratch_root: &Path) -> Result<Vec<String>> {
             } else if file_type.is_file() {
                 if let Ok(rel) = path.strip_prefix(scratch_root) {
                     let rel = rel.to_string_lossy().replace('\\', "/");
-                    if is_ignored_by_policy(&rel) && is_default_forbidden(&rel) {
+                    if is_ignored_by_policy(&rel) {
                         hits.push(rel);
                     }
                 }
@@ -529,5 +554,52 @@ mod tests {
             classify_path("docs/x.md", &["src/**".to_string()], &[]),
             Some("outside allowlist")
         );
+    }
+
+    #[test]
+    fn scan_flags_secret_risk_name_not_on_default_forbid() {
+        // `id_dsa` is `is_ignored_by_policy` (via is_secret_risk_path) but is NOT on the
+        // narrower DEFAULT_FORBID list. Fail-closed: an agent-written `id_dsa` in the
+        // scratch tree must still be flagged, or it could be planted/exfiltrated
+        // invisibly (the snapshot drops it AND the old conjunction never reported it).
+        assert!(!is_default_forbidden("id_dsa"));
+        assert!(is_ignored_by_policy("id_dsa"));
+
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(
+            scratch.path().join("id_dsa"),
+            b"-----BEGIN PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        // A benign file in the same tree must NOT be flagged.
+        std::fs::write(scratch.path().join("main.rs"), b"fn main() {}\n").unwrap();
+
+        let hits = scan_scratch_default_forbid(scratch.path()).unwrap();
+        assert_eq!(hits, vec!["id_dsa".to_string()]);
+    }
+
+    #[test]
+    fn evaluate_blast_reports_secret_risk_scratch_file_as_policy_excluded() {
+        // End-to-end: an empty diff plus a scratch tree carrying an agent-written
+        // `id_dsa` still produces a ForbiddenPath violation, tagged `policy_excluded:`
+        // (not `default_forbidden:`, since `id_dsa` is not on DEFAULT_FORBID).
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(scratch.path().join("id_dsa"), b"key bytes\n").unwrap();
+
+        let diff = TreeDiff {
+            files: Vec::new(),
+            dropped_secret_paths: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let outcome = evaluate_blast(&diff, &[], &[], scratch.path()).unwrap();
+
+        assert!(outcome.has_violation());
+        let violation = outcome
+            .violations
+            .iter()
+            .find(|v| v.path == "id_dsa")
+            .expect("id_dsa must be flagged");
+        assert_eq!(violation.class, BlastViolationClass::ForbiddenPath);
+        assert_eq!(violation.detail, "policy_excluded: id_dsa");
     }
 }

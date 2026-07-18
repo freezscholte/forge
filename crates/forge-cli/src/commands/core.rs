@@ -1703,6 +1703,13 @@ pub(crate) fn replay_response(
         "propose" => Some("proposal_created"),
         "start" | "attempt start" => Some("attempt_started"),
         "org init" => Some("org_initialized"),
+        // F4: `contract run`/`verify` carry the harness exit split (run 0/1/2/3,
+        // verify 0/2/4) in `data.exit_code`, which `main` maps to the process exit.
+        // Without merging the recorded `replay_data`, a same-request-id replay would
+        // return a bare `{idempotent_replay}` payload with no `exit_code`, so `main`
+        // silently exits 0 — masking a recorded stop/failure/blast/regression.
+        "contract run" => Some("contract_run_recorded"),
+        "contract verify" => Some("contract_verdicts_recorded"),
         _ => None,
     } {
         if existing.kind.as_deref() == Some(expected_kind) {

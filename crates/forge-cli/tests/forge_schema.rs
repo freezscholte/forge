@@ -56,6 +56,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "CONTRACT_GUARD_REGRESSED",
     "CONTRACT_FIX_FAILED",
     "CONTRACT_GRAMMAR_VIOLATION",
+    "CONTRACT_NOT_INTEGRABLE",
 ];
 
 /// The CCX contract typed codes (KTD10) that U2 registers. Kept as a named subset
@@ -71,6 +72,7 @@ const CONTRACT_ERROR_CODES: &[&str] = &[
     "CONTRACT_GUARD_REGRESSED",
     "CONTRACT_FIX_FAILED",
     "CONTRACT_GRAMMAR_VIOLATION",
+    "CONTRACT_NOT_INTEGRABLE",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.

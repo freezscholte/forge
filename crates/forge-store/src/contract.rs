@@ -699,8 +699,17 @@ fn insert_contract_run_in_tx(
                 "lifecycle": "contract_run_recorded",
                 "run_id": run_id,
                 "outcome": input.outcome,
+                "exit_code": input.exit_code,
                 // The folded domain digest, for doctor's op-chain recovery (U9/KTD2).
                 "subject_digest": content_hash,
+                // F4: a same-request-id replay must return the recorded harness exit
+                // split (run 0/1/2/3), not fall back to SUCCESS. Persisted in the SAME
+                // txn that records the run so the pre-flight replay can hand it back.
+                "replay_data": {
+                    "run_id": run_id,
+                    "outcome": input.outcome,
+                    "exit_code": input.exit_code,
+                },
             }),
         },
         Some(&content_hash),
@@ -1438,6 +1447,10 @@ pub(crate) fn map_contract_stop_row(
 pub struct ContractRunVerdictRecord {
     pub verdict_id: String,
     pub run_id: String,
+    /// The frozen contract revision whose acceptance/blast policy produced this
+    /// verdict (F6). Binds a signed verdict to the exact revision it evaluated, so a
+    /// verdict recorded under one revision can never be silently read as another's.
+    pub revision: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub verdict_kind: String,
@@ -1454,6 +1467,9 @@ pub struct ContractRunVerdictRecord {
 
 #[derive(Debug, Clone)]
 pub struct ContractRunVerdictInput {
+    /// The frozen contract revision this verdict evaluated (F6), folded into the
+    /// verdict digest so the signed row is revision-bound.
+    pub revision: i64,
     pub task_id: Option<String>,
     pub verdict_kind: String,
     pub command: Option<String>,
@@ -1472,6 +1488,7 @@ pub(crate) fn contract_verdict_digest(
     let mut digest = ContractDigest::new(SUBJECT_KIND_CONTRACT_VERDICT);
     digest
         .str(run_id)
+        .i64(input.revision)
         .opt_str(input.task_id.as_deref())
         .str(&input.verdict_kind)
         .opt_str(input.command.as_deref())
@@ -1517,6 +1534,11 @@ fn insert_contract_verdicts_in_tx(
     command: &str,
     run_id: &str,
     verdicts: &[ContractRunVerdictInput],
+    // F4: when set, the verify path's `{run_id, outcome, exit_code}` replay payload,
+    // persisted in the op state so a same-request-id replay returns the recorded
+    // verify exit split (0/2/4) instead of falling back to SUCCESS. `None` for the
+    // run-time blast batch, whose replay anchor is the run's own op (not this one).
+    replay_data: Option<Value>,
     now: i64,
 ) -> Result<Vec<ContractRunVerdictRecord>> {
     let mut records = Vec::with_capacity(verdicts.len());
@@ -1525,13 +1547,14 @@ fn insert_contract_verdicts_in_tx(
         let content_hash = contract_verdict_digest(run_id, verdict, now);
         tx.execute(
             "INSERT INTO contract_run_verdicts (
-                id, repo_id, run_id, task_id, verdict_kind, command, passed, detail,
+                id, repo_id, run_id, revision, task_id, verdict_kind, command, passed, detail,
                 evidence_id, content_hash, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 verdict_id,
                 repo_id,
                 run_id,
+                verdict.revision,
                 verdict.task_id,
                 verdict.verdict_kind,
                 verdict.command,
@@ -1553,6 +1576,7 @@ fn insert_contract_verdicts_in_tx(
         records.push(ContractRunVerdictRecord {
             verdict_id,
             run_id: run_id.to_string(),
+            revision: verdict.revision,
             task_id: verdict.task_id.clone(),
             verdict_kind: verdict.verdict_kind.clone(),
             command: verdict.command.clone(),
@@ -1569,6 +1593,20 @@ fn insert_contract_verdicts_in_tx(
         .last()
         .map(|record| record.content_hash.clone())
         .expect("non-empty verdicts");
+    let mut state = json!({
+        "lifecycle": "contract_verdicts_recorded",
+        "run_id": run_id,
+        "count": records.len(),
+        // The folded spine digest (this batch's last verdict content_hash), for
+        // doctor's op-chain recovery (U9/KTD2). A run can have several verdict
+        // batches (blast at run time, fix/guard at verify time), each its own op
+        // folding its OWN batch's last digest — so it is recorded per op here,
+        // not recomputed by "the run's last verdict" (which would be ambiguous).
+        "subject_digest": spine_digest,
+    });
+    if let (Some(replay_data), Some(object)) = (replay_data, state.as_object_mut()) {
+        object.insert("replay_data".to_string(), replay_data);
+    }
     insert_operation_view_chained(
         tx,
         repo_id,
@@ -1578,17 +1616,7 @@ fn insert_contract_verdicts_in_tx(
             command: command.to_string(),
             kind: "contract_verdicts_recorded".to_string(),
             view_kind: ViewKind::Initialized,
-            state: json!({
-                "lifecycle": "contract_verdicts_recorded",
-                "run_id": run_id,
-                "count": records.len(),
-                // The folded spine digest (this batch's last verdict content_hash), for
-                // doctor's op-chain recovery (U9/KTD2). A run can have several verdict
-                // batches (blast at run time, fix/guard at verify time), each its own op
-                // folding its OWN batch's last digest — so it is recorded per op here,
-                // not recomputed by "the run's last verdict" (which would be ambiguous).
-                "subject_digest": spine_digest,
-            }),
+            state,
         },
         Some(&spine_digest),
     )?;
@@ -1630,6 +1658,7 @@ pub fn record_contract_run_verdicts(
             "contract",
             run_id,
             &verdicts,
+            None,
             now,
         )
     })
@@ -1646,6 +1675,12 @@ pub fn record_contract_verify_verdicts(
     request_id: Option<String>,
     run_id: &str,
     verdicts: Vec<ContractRunVerdictInput>,
+    // F4: the CLI-computed verify outcome discriminator and harness exit split
+    // (0/2/4), persisted in the op state so a same-request-id replay returns them
+    // instead of falling back to SUCCESS. Verify has no persisted outcome column
+    // (verdicts are rows), so the CLI supplies them here.
+    outcome: &str,
+    exit_code: u64,
 ) -> Result<Vec<ContractRunVerdictRecord>> {
     validate_verdicts(&verdicts)?;
     let context = open_repository(cwd)?;
@@ -1665,6 +1700,11 @@ pub fn record_contract_verify_verdicts(
             bail!("contract run not found");
         }
         let now = now_ms();
+        let replay_data = json!({
+            "run_id": run_id,
+            "outcome": outcome,
+            "exit_code": exit_code,
+        });
         insert_contract_verdicts_in_tx(
             tx,
             &context.repo_id,
@@ -1674,6 +1714,7 @@ pub fn record_contract_verify_verdicts(
             "contract verify",
             run_id,
             &verdicts,
+            Some(replay_data),
             now,
         )
     })
@@ -1721,6 +1762,7 @@ pub fn record_contract_run_with_verdicts(
             "contract",
             &run.run_id,
             &verdicts,
+            None,
             now,
         )?;
         Ok((run, verdict_records))
@@ -1732,7 +1774,7 @@ pub fn contract_run_verdicts(cwd: &Path, run_id: &str) -> Result<Vec<ContractRun
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let mut statement = connection.prepare(
-        "SELECT id, run_id, task_id, verdict_kind, command, passed, detail, evidence_id,
+        "SELECT id, run_id, revision, task_id, verdict_kind, command, passed, detail, evidence_id,
                 content_hash, created_at_ms
          FROM contract_run_verdicts
          WHERE repo_id = ?1 AND run_id = ?2
@@ -1743,14 +1785,15 @@ pub fn contract_run_verdicts(cwd: &Path, run_id: &str) -> Result<Vec<ContractRun
             Ok(ContractRunVerdictRecord {
                 verdict_id: row.get(0)?,
                 run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                verdict_kind: row.get(3)?,
-                command: row.get(4)?,
-                passed: row.get::<_, i64>(5)? != 0,
-                detail: row.get(6)?,
-                evidence_id: row.get(7)?,
-                content_hash: row.get(8)?,
-                created_at_ms: row.get(9)?,
+                revision: row.get(2)?,
+                task_id: row.get(3)?,
+                verdict_kind: row.get(4)?,
+                command: row.get(5)?,
+                passed: row.get::<_, i64>(6)? != 0,
+                detail: row.get(7)?,
+                evidence_id: row.get(8)?,
+                content_hash: row.get(9)?,
+                created_at_ms: row.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1836,24 +1879,34 @@ fn brief_missing_neighbor(nid: &str) -> String {
 /// mirroring ccx-brief.py: `neighbors: null`/absent is empty; a list of strings is
 /// accepted in declared order; anything else is an error.
 fn parse_brief_neighbors(source_yaml: &str) -> Result<Vec<String>> {
+    parse_yaml_id_list_field(source_yaml, "neighbors")
+}
+
+/// Parse a top-level `field:` whose value must be a YAML list of string ids from a
+/// frozen contract's verbatim source (R1). Single source shared by the CLI's
+/// `depends_on` parser and the store's `neighbors` parser so the two id-list surfaces
+/// cannot drift. A missing/`null` field or a non-mapping document yields an empty
+/// list; a present-but-non-list field, or a list with a non-string entry, is a typed
+/// error naming the field.
+pub fn parse_yaml_id_list_field(source_yaml: &str, field: &str) -> Result<Vec<String>> {
     let parsed: serde_yaml::Value = serde_yaml::from_str(source_yaml)
         .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
-    let mapping = parsed
-        .as_mapping()
-        .ok_or_else(|| anyhow!("frozen contract is not a YAML mapping"))?;
-    match mapping.get(serde_yaml::Value::from("neighbors")) {
+    let Some(mapping) = parsed.as_mapping() else {
+        return Ok(Vec::new());
+    };
+    match mapping.get(serde_yaml::Value::from(field)) {
         None | Some(serde_yaml::Value::Null) => Ok(Vec::new()),
         Some(serde_yaml::Value::Sequence(items)) => {
             let mut ids = Vec::with_capacity(items.len());
             for item in items {
                 match item.as_str() {
                     Some(id) => ids.push(id.to_string()),
-                    None => bail!("neighbors: must be a list of ids"),
+                    None => bail!("{field}: must be a list of ids"),
                 }
             }
             Ok(ids)
         }
-        Some(_) => bail!("neighbors: must be a list of ids"),
+        Some(_) => bail!("{field}: must be a list of ids"),
     }
 }
 
@@ -2489,6 +2542,7 @@ mod tests {
             &run.run_id,
             vec![
                 ContractRunVerdictInput {
+                    revision: 1,
                     task_id: Some("t1".to_string()),
                     verdict_kind: "fix".to_string(),
                     command: Some("cargo test".to_string()),
@@ -2497,6 +2551,7 @@ mod tests {
                     evidence_id: None,
                 },
                 ContractRunVerdictInput {
+                    revision: 1,
                     task_id: Some("t1".to_string()),
                     verdict_kind: "aggregate".to_string(),
                     command: None,

@@ -100,6 +100,7 @@ fn full_population_repo() -> tempfile::TempDir {
         None,
         run_input("c1", 1, "blast_violation", 3),
         vec![ContractRunVerdictInput {
+            revision: 1,
             task_id: Some("c1".to_string()),
             verdict_kind: "blast".to_string(),
             command: None,
@@ -119,6 +120,7 @@ fn full_population_repo() -> tempfile::TempDir {
         &verified.run_id,
         vec![
             ContractRunVerdictInput {
+                revision: 1,
                 task_id: Some("c1".to_string()),
                 verdict_kind: "fix".to_string(),
                 command: Some("cargo test".to_string()),
@@ -127,6 +129,7 @@ fn full_population_repo() -> tempfile::TempDir {
                 evidence_id: None,
             },
             ContractRunVerdictInput {
+                revision: 1,
                 task_id: Some("c1".to_string()),
                 verdict_kind: "guard".to_string(),
                 command: Some("cargo clippy".to_string()),
@@ -135,6 +138,7 @@ fn full_population_repo() -> tempfile::TempDir {
                 evidence_id: None,
             },
             ContractRunVerdictInput {
+                revision: 1,
                 task_id: Some("c1".to_string()),
                 verdict_kind: "aggregate".to_string(),
                 command: None,
@@ -143,6 +147,8 @@ fn full_population_repo() -> tempfile::TempDir {
                 evidence_id: None,
             },
         ],
+        "passed",
+        0,
     )
     .expect("verify verdicts");
 
@@ -267,5 +273,97 @@ fn unsigned_contract_row_is_flagged() {
         }),
         "expected MissingSignature for the unsigned revision: {:?}",
         report.signature_issues
+    );
+}
+
+#[test]
+fn co_deleted_stop_row_and_signature_flagged_by_doctor() {
+    // F5: a contract-family op recovers its folded digest from the FROZEN op
+    // state_json, and the signature pass only fires while ledger_signatures survive.
+    // So co-deleting a stop ROW and its signature rows evades BOTH passes — the exact
+    // hole that would leave doctor green and unblock Leg-3. The referenced-row
+    // cross-check closes it.
+    let temp = init_native_repo();
+    freeze_contract_revision(temp.path(), None, frozen("c1", "id: c1\n")).expect("freeze");
+    let (_run, stop) = record_contract_run_with_stop(
+        temp.path(),
+        None,
+        run_input("c1", 1, "stopped", 2),
+        stop_input("c1", 1, "need the shape"),
+    )
+    .expect("stopped run + stop");
+
+    let db = open_db(temp.path());
+    db.execute(
+        "DELETE FROM ledger_signatures WHERE subject_kind = 'contract_stop' AND subject_id = ?1",
+        params![stop.stop_id],
+    )
+    .expect("delete stop signature");
+    db.execute(
+        "DELETE FROM contract_stops WHERE id = ?1",
+        params![stop.stop_id],
+    )
+    .expect("delete stop row");
+
+    let report = doctor(temp.path()).expect("doctor");
+    assert!(
+        !report.ok,
+        "a co-deleted stop row + signature must fail doctor (F5)"
+    );
+    assert!(
+        report.contract_row_issues.iter().any(|finding| {
+            finding.table == "contract_stops" && finding.subject_id == stop.stop_id
+        }),
+        "expected a ReferencedRowMissing for the deleted stop: {:?}",
+        report.contract_row_issues
+    );
+    // The signature pass is genuinely blind here (its signature was co-deleted), which
+    // is why the cross-check is load-bearing.
+    assert!(
+        !report
+            .signature_issues
+            .iter()
+            .any(|f| f.subject_id == stop.stop_id),
+        "the co-deleted signature evades the signature pass by construction"
+    );
+}
+
+#[test]
+fn co_deleted_run_row_and_signature_flagged_by_doctor() {
+    // F5: same hole for a run row + its signature.
+    let temp = init_native_repo();
+    freeze_contract_revision(temp.path(), None, frozen("c1", "id: c1\n")).expect("freeze");
+    let run =
+        record_contract_run(temp.path(), None, run_input("c1", 1, "completed", 0)).expect("run");
+
+    let db = open_db(temp.path());
+    db.execute(
+        "DELETE FROM ledger_signatures WHERE subject_kind = 'contract_run' AND subject_id = ?1",
+        params![run.run_id],
+    )
+    .expect("delete run signature");
+    // Per-task rows FK-reference the run; drop them before the run row.
+    db.execute(
+        "DELETE FROM contract_run_tasks WHERE run_id = ?1",
+        params![run.run_id],
+    )
+    .expect("delete task rows");
+    db.execute(
+        "DELETE FROM contract_runs WHERE id = ?1",
+        params![run.run_id],
+    )
+    .expect("delete run row");
+
+    let report = doctor(temp.path()).expect("doctor");
+    assert!(
+        !report.ok,
+        "a co-deleted run row + signature must fail doctor (F5)"
+    );
+    assert!(
+        report.contract_row_issues.iter().any(|finding| {
+            finding.table == "contract_runs" && finding.subject_id == run.run_id
+        }),
+        "expected a ReferencedRowMissing for the deleted run: {:?}",
+        report.contract_row_issues
     );
 }

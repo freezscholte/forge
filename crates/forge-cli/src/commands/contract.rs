@@ -100,6 +100,12 @@ const ALLOWED_KEYS: [&str; 15] = [
     "authority",
 ];
 
+/// The only keys a `ccx.contract.v1` `acceptance` mapping may carry (R4 native
+/// strictness, F3): `fix` (required, non-vacuous) and `guard` (optional). Mirrors
+/// the top-level `ALLOWED_KEYS` discipline one level down so a typo'd key (e.g.
+/// `fixes:`) is a hard error rather than a silently-dropped, vacuously-green set.
+const ALLOWED_ACCEPTANCE_KEYS: [&str; 2] = ["fix", "guard"];
+
 const SCHEMA_V0: &str = "ccx.contract.v0";
 const SCHEMA_V1: &str = "ccx.contract.v1";
 
@@ -171,6 +177,9 @@ pub(crate) fn contract_response(
         }
         ContractCommand::Verdicts(args) => {
             crate::commands::contract_query::verdicts_response(request_id, args)
+        }
+        ContractCommand::Runs(args) => {
+            crate::commands::contract_query::runs_response(request_id, args)
         }
         ContractCommand::Resolve(args) => {
             crate::commands::contract_query::resolve_response(request_id, args)
@@ -941,6 +950,36 @@ impl Linter<'_> {
     // ---- R4: acceptance non-vacuity ------------------------------------------
 
     fn rule4_acceptance(&mut self, fix: &[String], guard: &[String], contract: &Value) {
+        // F3(a): the fix set is the task's own proof and MUST be non-vacuous. An empty
+        // fix set (absent `fix`, `fix: []`, or `acceptance: {}`/null) would make
+        // `contract verify` record a green aggregate having executed NOTHING. The
+        // guard set stays optional (empty guard is legal). ccx-lint.py does not gate
+        // this; native-strict is sanctioned (F3).
+        if fix.is_empty() {
+            self.add(
+                "R4",
+                Severity::Error,
+                "acceptance.fix must contain at least one command; an empty fix set proves nothing and would verify green having executed nothing",
+            );
+        }
+        // F3(b): R1-style unknown-key strictness one level down — only `fix`/`guard`
+        // are legal inside a v1 acceptance mapping, so `acceptance: {fixes: [...]}`
+        // is a hard error naming the stray key rather than a silently-dropped,
+        // vacuously-green contract.
+        if let Some(acc) = contract.get("acceptance").and_then(Value::as_object) {
+            let unknown: Vec<&str> = acc
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !ALLOWED_ACCEPTANCE_KEYS.contains(key))
+                .collect();
+            if !unknown.is_empty() {
+                self.add(
+                    "R4",
+                    Severity::Error,
+                    format!("unrecognized acceptance key(s): {}", unknown.join(", ")),
+                );
+            }
+        }
         let allow_globs = allowed_globs(contract);
         for cmd in fix.iter().chain(guard) {
             self.rule4_command(cmd, &allow_globs);
@@ -1532,25 +1571,9 @@ pub(crate) fn contract_dependency_closure(
 }
 
 pub(crate) fn parse_depends_on(source_yaml: &str) -> Result<Vec<String>> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(source_yaml)
-        .map_err(|err| anyhow!("frozen contract is not valid YAML: {err}"))?;
-    let Some(map) = parsed.as_mapping() else {
-        return Ok(Vec::new());
-    };
-    match map.get(serde_yaml::Value::from("depends_on")) {
-        None | Some(serde_yaml::Value::Null) => Ok(Vec::new()),
-        Some(serde_yaml::Value::Sequence(items)) => {
-            let mut ids = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(id) => ids.push(id.to_string()),
-                    None => return Err(anyhow!("depends_on: must be a list of ids")),
-                }
-            }
-            Ok(ids)
-        }
-        Some(_) => Err(anyhow!("depends_on: must be a list of ids")),
-    }
+    // Shares the single store-side id-list parser with the `neighbors` surface (F8)
+    // so the two frozen-YAML id-list readers cannot drift.
+    forge_store::parse_yaml_id_list_field(source_yaml, "depends_on")
 }
 
 /// Read a frozen revision's `allowed_changes.paths` / `.forbidden_paths` globs for
@@ -1686,6 +1709,97 @@ fn resolve_run_plan(
         })
         .collect();
     Ok((plan, ack))
+}
+
+/// Resolve and VALIDATE a `--dep <id>=<ref>` acknowledgement into the content ref
+/// whose tree may be overlaid as dependency `dep`'s produced patch (F2). The ref may
+/// name either a whole run (use its run-level patch) or a specific per-task row (use
+/// that task's own patch). Before returning a ref this enforces three bindings that
+/// the prior run-level `patch_content_ref` shortcut skipped, any of which is a typed
+/// `CONTRACT_NOT_INTEGRABLE` refusal:
+///
+///  1. the resolved record must actually pertain to contract `dep` — either the run's
+///     own `contract_id == dep` (run-level), or it carries a per-task row whose
+///     `task_id == dep` (per-task). A ref for an unrelated contract is refused so a
+///     mismatched patch can never be silently overlaid;
+///  2. that unit's outcome must be `completed` — a stopped/failed/blast run (or an
+///     incomplete task) has no integrable patch;
+///  3. its `base_head` must equal this run's base — a dep patch produced against a
+///     different base must not be re-attributed onto the current tree (KTD7/KTD8).
+///
+/// The per-task path also fixes the previously-refused legitimate case: a completed
+/// EARLY task inside a later-stopped run now resolves via its own per-task patch
+/// rather than the (absent) run-level patch.
+fn resolve_ack_dependency_ref(
+    cwd: &Path,
+    dep: &str,
+    ack_ref: &str,
+    base_commit: &str,
+) -> Result<String> {
+    let resolved = forge_store::contract_run_by_ref(cwd, ack_ref)?.ok_or_else(|| {
+        ForgeError::ContractNotIntegrable {
+            reason: format!(
+                "acknowledged dependency {dep} references {ack_ref}, which resolves to no run"
+            ),
+        }
+    })?;
+    // Base equality first: an ack produced against a different base is never integrable
+    // regardless of which unit it names.
+    if resolved.base_head.as_deref() != Some(base_commit) {
+        return Err(ForgeError::ContractNotIntegrable {
+            reason: format!(
+                "acknowledged dependency {dep} ({ack_ref}) was produced against base {}, but this run's base is {base_commit}",
+                resolved.base_head.as_deref().unwrap_or("<none>")
+            ),
+        }
+        .into());
+    }
+    // Run-level: the ref names a run whose own target contract IS dep.
+    if resolved.contract_id == dep {
+        if resolved.outcome != "completed" {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "acknowledged dependency {dep} ({ack_ref}) run did not complete (outcome {})",
+                    resolved.outcome
+                ),
+            }
+            .into());
+        }
+        return resolved.patch_content_ref.clone().ok_or_else(|| {
+            ForgeError::ContractNotIntegrable {
+                reason: format!("acknowledged dependency {dep} ({ack_ref}) has no produced patch"),
+            }
+            .into()
+        });
+    }
+    // Per-task: the ref resolves to a run that CONTAINS a task for contract dep (its
+    // task_id is the contract id). Use that task's own patch, requiring it completed.
+    if let Some(task) = resolved.tasks.iter().find(|task| task.task_id == dep) {
+        if task.outcome != "completed" {
+            return Err(ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "acknowledged dependency task {dep} ({ack_ref}) did not complete (outcome {})",
+                    task.outcome
+                ),
+            }
+            .into());
+        }
+        return task.patch_content_ref.clone().ok_or_else(|| {
+            ForgeError::ContractNotIntegrable {
+                reason: format!(
+                    "acknowledged dependency task {dep} ({ack_ref}) has no produced patch"
+                ),
+            }
+            .into()
+        });
+    }
+    Err(ForgeError::ContractNotIntegrable {
+        reason: format!(
+            "acknowledged dependency {dep} ({ack_ref}) resolves to a run for contract {} that has no task for {dep}",
+            resolved.contract_id
+        ),
+    }
+    .into())
 }
 
 /// Append the verbatim task-instruction stop wording to the store-emitted brief
@@ -1918,6 +2032,65 @@ fn fill_skipped(task_states: &mut Vec<TaskState>, plan: &[PlannedTask], stopped_
     }
 }
 
+/// Shared failure-recording prelude for the halt / crash / empty-patch / blast /
+/// mid-chain-IO branches of a contract run (F9): push the failing task's state, mark
+/// every dependent `skipped`, and build the run-record input. The caller passes the
+/// returned input to the store recorder appropriate to its branch (plain /
+/// with-stop / with-verdicts) — the only part that differs across branches.
+///
+/// `agent` is `Some` when the failing task's agent actually ran (halt/crash/empty/
+/// blast) and `None` for a pre-agent IO/store failure (F7). `error_excerpt`, when
+/// set, is stored (already redacted) on the failing task's stderr slot so an
+/// otherwise-opaque internal failure mid-chain stays triageable from the recorded run.
+#[allow(clippy::too_many_arguments)]
+fn build_failed_run_input(
+    task_states: &mut Vec<TaskState>,
+    plan: &[PlannedTask],
+    index: usize,
+    task: &PlannedTask,
+    task_outcome: &str,
+    agent: Option<&AgentOutcome>,
+    error_excerpt: Option<String>,
+    target: &PlannedTask,
+    base_commit: &str,
+    final_baseline: &Option<String>,
+    ack: &BTreeMap<String, String>,
+    run_outcome: &str,
+    exit_code: i64,
+) -> RecordContractRunInput {
+    let mut failing = match agent {
+        Some(agent) => TaskState::from_agent(task.task_id(), task_outcome, None, agent),
+        None => TaskState::agentless(task.task_id(), task_outcome, None),
+    };
+    if error_excerpt.is_some() {
+        failing.agent_stderr_excerpt = error_excerpt;
+    }
+    let agent_exit = failing.agent_exit_code;
+    task_states.push(failing);
+    fill_skipped(task_states, plan, index);
+    build_run_input(
+        target,
+        base_commit,
+        final_baseline,
+        ack,
+        run_outcome,
+        exit_code,
+        agent_exit,
+        None,
+        task_states,
+    )
+}
+
+/// Redact and cap an internal (IO/store) error's message for storage on a failed
+/// run's task row (F7). The message can carry a filesystem path or captured text, so
+/// it goes through the shared evidence redactor and the `EXCERPT_LIMIT` cap before it
+/// is persisted, never surfacing an un-redacted secret in the ledger.
+fn redact_internal_error(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    let (redacted, _kinds) = forge_content::redact_evidence_excerpt(&text);
+    truncate_to_char_boundary(&redacted, forge_evidence::EXCERPT_LIMIT).to_string()
+}
+
 /// `forge contract run` — materialize a scratch base, run the agent per task in
 /// dependency order, and record the run fail-closed. Envelope status is always
 /// SUCCESS (the run recorded its outcome); the outcome discriminator and the
@@ -2034,10 +2207,55 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                 ));
                 continue;
             }
+
+            // F7: any fallible per-task step (scratch materialization, worktree
+            // snapshot, agent spawn, diff, blast eval) that errors mid-chain must still
+            // record a `failed` run — otherwise the run id is lost with the invoking
+            // process's stdout, prior completed tasks' work is orphaned, and dependents
+            // are never marked skipped. The macro records that failed run (with the
+            // redacted error on the failing task) and then propagates the original
+            // error as an error envelope. Defined INSIDE the loop so `index`/`task`
+            // resolve (macro_rules binds free locals at the definition site), and
+            // written as a macro so `request_id` is moved only in the erroring
+            // (returning) arm — exactly like the outcome branches below, never on the
+            // happy path.
+            macro_rules! record_failed_on_err {
+                ($expr:expr) => {
+                    match $expr {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let excerpt = redact_internal_error(&err);
+                            let input = build_failed_run_input(
+                                &mut task_states,
+                                &plan,
+                                index,
+                                task,
+                                "failed",
+                                None,
+                                Some(excerpt),
+                                &target,
+                                &base_commit,
+                                &final_baseline,
+                                &ack,
+                                "failed",
+                                1,
+                            );
+                            forge_store::record_contract_run(&cwd, request_id, input)?;
+                            return Err(err);
+                        }
+                    }
+                };
+            }
+
             // KTD7: materialize the base into a fresh scratch workspace, then overlay
             // each dependency's produced tree on top per-id (never the user worktree).
-            let scratch = tempfile::tempdir().context("create scratch workspace")?;
-            materialize_content_ref(&repo_root, scratch.path(), &base_tree_ref)?;
+            let scratch =
+                record_failed_on_err!(tempfile::tempdir().context("create scratch workspace"));
+            record_failed_on_err!(materialize_content_ref(
+                &repo_root,
+                scratch.path(),
+                &base_tree_ref
+            ));
             for dep in &task.depends_on {
                 let dep_ref = if let Some(reference) = completed_outputs.get(dep) {
                     reference.clone()
@@ -2045,37 +2263,54 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                     let ack_ref = ack
                         .get(dep)
                         .ok_or_else(|| anyhow!("internal: dependency {dep} not acknowledged"))?;
-                    forge_store::contract_run_by_ref(&cwd, ack_ref)?
-                        .and_then(|run| run.patch_content_ref)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "acknowledged dependency {dep} ({ack_ref}) has no completed patch"
-                            )
-                        })?
+                    // F2: a --dep ack ref is validated and bound to <dep> (own contract
+                    // or per-task), completed, and same-base before its patch is
+                    // overlaid — a typed refusal, exactly like the preflight checks.
+                    resolve_ack_dependency_ref(&cwd, dep, ack_ref, &base_commit)?
                 };
-                materialize_content_ref(&repo_root, scratch.path(), &dep_ref)?;
+                record_failed_on_err!(materialize_content_ref(
+                    &repo_root,
+                    scratch.path(),
+                    &dep_ref
+                ));
             }
             // The diff baseline is (base + dep patches), NOT the raw base (KTD7).
-            let baseline =
-                snapshot_worktree_into_store_excluding(&repo_root, scratch.path(), &excluded)?
-                    .content_ref;
+            let baseline = record_failed_on_err!(snapshot_worktree_into_store_excluding(
+                &repo_root,
+                scratch.path(),
+                &excluded
+            ))
+            .content_ref;
 
-            let brief = forge_store::contract_brief(&cwd, &task.contract_id, Some(task.revision))?;
+            let brief = record_failed_on_err!(forge_store::contract_brief(
+                &cwd,
+                &task.contract_id,
+                Some(task.revision)
+            ));
             let prompt = assemble_prompt(&brief.brief);
-            let agent = run_agent(&args.agent_cmd, scratch.path(), &prompt)?;
+            let agent = record_failed_on_err!(run_agent(&args.agent_cmd, scratch.path(), &prompt));
 
             // Halt-on-unknown (R8): fail-closed ingest into a signed stop, halt, exit 2.
             if scratch.path().join(UNKNOWN_FILE).exists() {
                 let raw =
                     std::fs::read_to_string(scratch.path().join(UNKNOWN_FILE)).unwrap_or_default();
                 let (what, why, kind, evidence, malformed) = parse_unknown_fields(&raw);
-                task_states.push(TaskState::from_agent(
-                    task.task_id(),
+                // F9: shared push-failing-task + fill_skipped + build_run_input prelude.
+                let run_input = build_failed_run_input(
+                    &mut task_states,
+                    &plan,
+                    index,
+                    task,
                     "stopped",
+                    Some(&agent),
                     None,
-                    &agent,
-                ));
-                fill_skipped(&mut task_states, &plan, index);
+                    &target,
+                    &base_commit,
+                    &final_baseline,
+                    &ack,
+                    "stopped",
+                    2,
+                );
                 // F1: record the stopped run AND open its stop in ONE transaction, so
                 // a stop-insert failure can never leave an `outcome = "stopped"` run
                 // with no stop row to triage. The store sets the stop's `run_id` to
@@ -2083,17 +2318,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                 let (run, stop) = forge_store::record_contract_run_with_stop(
                     &cwd,
                     request_id.clone(),
-                    build_run_input(
-                        &target,
-                        &base_commit,
-                        &final_baseline,
-                        &ack,
-                        "stopped",
-                        2,
-                        Some(i64::from(agent.exit_code)),
-                        None,
-                        &task_states,
-                    ),
+                    run_input,
                     OpenContractStopInput {
                         contract_id: task.contract_id.clone(),
                         revision: task.revision,
@@ -2124,28 +2349,23 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
 
             // Crashed/unauthenticated agent (R11/AE5): nonzero exit, no UNKNOWN.md.
             if agent.exit_code != 0 {
-                task_states.push(TaskState::from_agent(
-                    task.task_id(),
+                // F9: shared failing-task + fill_skipped + build_run_input prelude.
+                let run_input = build_failed_run_input(
+                    &mut task_states,
+                    &plan,
+                    index,
+                    task,
                     "failed",
+                    Some(&agent),
                     None,
-                    &agent,
-                ));
-                fill_skipped(&mut task_states, &plan, index);
-                let run = forge_store::record_contract_run(
-                    &cwd,
-                    request_id,
-                    build_run_input(
-                        &target,
-                        &base_commit,
-                        &final_baseline,
-                        &ack,
-                        "failed",
-                        1,
-                        Some(i64::from(agent.exit_code)),
-                        None,
-                        &task_states,
-                    ),
-                )?;
+                    &target,
+                    &base_commit,
+                    &final_baseline,
+                    &ack,
+                    "failed",
+                    1,
+                );
+                let run = forge_store::record_contract_run(&cwd, request_id, run_input)?;
                 let data = json!({
                     "outcome": "failed",
                     "exit_code": 1,
@@ -2157,34 +2377,37 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             }
 
             // The agent patch is the tree diff of post-run vs the baseline (KTD7).
-            let post =
-                snapshot_worktree_into_store_excluding(&repo_root, scratch.path(), &excluded)?
-                    .content_ref;
-            let diff = diff_native_content_refs(&store, &baseline, &post, &DiffOptions::default())?;
+            let post = record_failed_on_err!(snapshot_worktree_into_store_excluding(
+                &repo_root,
+                scratch.path(),
+                &excluded
+            ))
+            .content_ref;
+            let diff = record_failed_on_err!(diff_native_content_refs(
+                &store,
+                &baseline,
+                &post,
+                &DiffOptions::default()
+            ));
             if diff.files.is_empty() {
                 // Empty patch never passes as success (R11/AE8): failed, exit 1.
-                task_states.push(TaskState::from_agent(
-                    task.task_id(),
+                // F9: shared failing-task + fill_skipped + build_run_input prelude.
+                let run_input = build_failed_run_input(
+                    &mut task_states,
+                    &plan,
+                    index,
+                    task,
                     "failed",
+                    Some(&agent),
                     None,
-                    &agent,
-                ));
-                fill_skipped(&mut task_states, &plan, index);
-                let run = forge_store::record_contract_run(
-                    &cwd,
-                    request_id,
-                    build_run_input(
-                        &target,
-                        &base_commit,
-                        &final_baseline,
-                        &ack,
-                        "failed",
-                        1,
-                        Some(i64::from(agent.exit_code)),
-                        None,
-                        &task_states,
-                    ),
-                )?;
+                    &target,
+                    &base_commit,
+                    &final_baseline,
+                    &ack,
+                    "failed",
+                    1,
+                );
+                let run = forge_store::record_contract_run(&cwd, request_id, run_input)?;
                 let data = json!({
                     "outcome": "failed",
                     "exit_code": 1,
@@ -2200,16 +2423,18 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             // chain with exit 3, records a `blast` verdict naming the path (never the
             // content), and does NOT persist the offending patch — the post tree object
             // the snapshot already wrote is left unreferenced so GC reclaims it (KTD3/R16).
-            let (allow, forbid) = contract_allowed_changes(&cwd, &task.contract_id, task.revision)?;
-            let blast = contract_blast::evaluate_blast(&diff, &allow, &forbid, scratch.path())?;
+            let (allow, forbid) = record_failed_on_err!(contract_allowed_changes(
+                &cwd,
+                &task.contract_id,
+                task.revision
+            ));
+            let blast = record_failed_on_err!(contract_blast::evaluate_blast(
+                &diff,
+                &allow,
+                &forbid,
+                scratch.path()
+            ));
             if blast.has_violation() {
-                task_states.push(TaskState::from_agent(
-                    task.task_id(),
-                    "failed",
-                    None,
-                    &agent,
-                ));
-                fill_skipped(&mut task_states, &plan, index);
                 // Prior tasks' pass verdicts + this task's failing verdicts, all atomic
                 // with the run row (record_contract_run_with_verdicts).
                 let mut verdicts = std::mem::take(&mut blast_verdicts);
@@ -2220,6 +2445,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         secret_content_detected = true;
                     }
                     verdicts.push(ContractRunVerdictInput {
+                        revision: task.revision,
                         task_id: Some(task.task_id()),
                         verdict_kind: "blast".to_string(),
                         command: None,
@@ -2233,23 +2459,27 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                         "detail": violation.detail,
                     }));
                 }
+                // F9: shared failing-task + fill_skipped + build_run_input prelude. The
+                // task outcome is `failed` while the run outcome is `blast_violation`.
                 // patch_content_ref is None on BOTH the run and the offending task, so a
                 // secret-bearing post tree is never referenced (R16 fail-closed guard).
+                let run_input = build_failed_run_input(
+                    &mut task_states,
+                    &plan,
+                    index,
+                    task,
+                    "failed",
+                    Some(&agent),
+                    None,
+                    &target,
+                    &base_commit,
+                    &final_baseline,
+                    &ack,
+                    "blast_violation",
+                    3,
+                );
                 let (run, _recorded) = forge_store::record_contract_run_with_verdicts(
-                    &cwd,
-                    request_id,
-                    build_run_input(
-                        &target,
-                        &base_commit,
-                        &final_baseline,
-                        &ack,
-                        "blast_violation",
-                        3,
-                        Some(i64::from(agent.exit_code)),
-                        None,
-                        &task_states,
-                    ),
-                    verdicts,
+                    &cwd, request_id, run_input, verdicts,
                 )?;
                 let data = json!({
                     "outcome": "blast_violation",
@@ -2268,6 +2498,7 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
             }
             // Clean blast: record a per-task pass verdict, kept for the final run row.
             blast_verdicts.push(ContractRunVerdictInput {
+                revision: task.revision,
                 task_id: Some(task.task_id()),
                 verdict_kind: "blast".to_string(),
                 command: None,
