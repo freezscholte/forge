@@ -582,3 +582,93 @@ fn contract_run_midchain_store_error_records_failed_run() {
         "the mid-chain error is recorded on the failing task row"
     );
 }
+
+// ---------------------------------------------------------------------------
+// U6 blast secret-content scan — diff-awareness (R16 "agent-authored content").
+// The scan must classify only the content the agent ADDED relative to the
+// pre-agent baseline, so modifying a file that already carries a secret-shaped
+// string signed into the base tree is NOT a false-positive violation.
+// ---------------------------------------------------------------------------
+
+/// Commit `content` at `rel` into the base tree via the ordinary lifecycle
+/// (`start → save → run → propose → check → accept`), so a later `contract run`'s
+/// baseline (base + dep patches) already contains that file. Mirrors the spoof
+/// sequence used elsewhere in the contract suite.
+fn seed_base_file(repo: &TestRepo, rel: &str, content: &str) {
+    repo.forge()
+        .args(["--json", "start", "seed base content"])
+        .assert()
+        .success();
+    write(repo, rel, content);
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+}
+
+#[test]
+fn contract_run_blast_modify_file_with_preexisting_secret_line_passes() {
+    // Dogfood #3 regression: out.txt already carries a secret-shaped assignment in
+    // the base tree. The agent MODIFIES it by appending a harmless line and adds NO
+    // secret. The diff-aware scan classifies only the added line, so the run
+    // completes (exit 0) with no blast violation — the pre-fix whole-post-state scan
+    // false-positived here because the base secret line was re-scanned.
+    let repo = run_repo();
+    // A pre-existing secret-shaped line, signed into the base tree.
+    seed_base_file(&repo, "out.txt", "api_key = \"AKIABASESEEDMARKER0000\"\n");
+    freeze_contract(&repo, "ccx-a", &[]);
+    // The agent appends only a harmless, non-secret line.
+    let agent = "printf 'harmless_added_line\\n' >> out.txt";
+    let env = contract_run(&repo, &["ccx-a"], agent, 0);
+    assert_eq!(env["data"]["outcome"], "completed");
+
+    // The base secret bytes must never surface in any verdict detail.
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM contract_run_verdicts WHERE COALESCE(detail, '') LIKE '%AKIABASESEEDMARKER%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0, "the base secret must never appear in a verdict");
+}
+
+#[test]
+fn contract_run_blast_add_secret_line_to_preexisting_file_refused() {
+    // Companion to the regression: the same file already carries a secret in the
+    // base, but now the agent ADDS a genuinely new secret-bearing line. The
+    // diff-aware scan flags the added line → blast violation, exit 3, naming the
+    // path (only) with the secret_content class.
+    let repo = run_repo();
+    seed_base_file(&repo, "out.txt", "api_key = \"AKIABASESEEDMARKER0000\"\n");
+    freeze_contract(&repo, "ccx-a", &[]);
+    // The agent appends a DIFFERENT, brand-new secret-shaped assignment.
+    let agent = "printf 'new_token = \"AKIANEWLYADDEDMARKER11\"\\n' >> out.txt";
+    let env = contract_run(&repo, &["ccx-a"], agent, 3);
+    assert_eq!(env["data"]["outcome"], "blast_violation");
+    assert_eq!(env["data"]["secret_content_detected"], true);
+    let violations = env["data"]["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["path"] == "out.txt" && v["class"] == "secret_content"),
+        "the added secret must be flagged by path only: {violations:?}"
+    );
+
+    // Neither the pre-existing nor the newly-added secret bytes may be persisted.
+    let conn = rusqlite::Connection::open(repo.path().join(".forge/forge.db")).unwrap();
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM contract_run_verdicts
+             WHERE COALESCE(detail, '') LIKE '%AKIA%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0, "no secret bytes may appear in a verdict detail");
+}

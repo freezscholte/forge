@@ -8,6 +8,7 @@ pub struct GcDryRunReport {
     pub unreachable_native_objects: Vec<String>,
     pub protected_native_objects: Vec<String>,
     pub pack_candidate_native_objects: Vec<String>,
+    pub deletable_loose_native_objects: Vec<String>,
     pub loose_duplicate_native_objects: Vec<String>,
     pub deletable_native_packs: Vec<String>,
     pub protection_window_days: u64,
@@ -56,6 +57,15 @@ pub fn gc_delete(cwd: &Path, expected_plan_digest: &str) -> Result<GcDryRunRepor
         deleted.push(object.clone());
         forge_content::maybe_crash("gc_after_unlink");
     }
+    // Unreachable, unprotected loose-only objects are never repacked; they are
+    // deleted directly (no packed copy exists, so `delete_loose_duplicate` would
+    // refuse — `delete_object` is the correct primitive here).
+    for object in &plan.deletable_loose_native_objects {
+        let id = forge_content_native::ObjectId::parse(object)?;
+        native_store.delete_object(&id)?;
+        deleted.push(object.clone());
+        forge_content::maybe_crash("gc_after_unlink");
+    }
     let mut deleted_packs = Vec::new();
     for pack_id in &plan.deletable_native_packs {
         native_store.delete_pack(pack_id)?;
@@ -69,6 +79,7 @@ struct GcPlan {
     unreachable_native_objects: Vec<String>,
     protected_native_objects: Vec<String>,
     pack_candidate_native_objects: Vec<String>,
+    deletable_loose_native_objects: Vec<String>,
     loose_duplicate_native_objects: Vec<String>,
     deletable_native_packs: Vec<String>,
     storage: StorageAccounting,
@@ -93,6 +104,7 @@ impl GcPlan {
             unreachable_native_objects: self.unreachable_native_objects,
             protected_native_objects: self.protected_native_objects,
             pack_candidate_native_objects: self.pack_candidate_native_objects,
+            deletable_loose_native_objects: self.deletable_loose_native_objects,
             loose_duplicate_native_objects: self.loose_duplicate_native_objects,
             deletable_native_packs: self.deletable_native_packs,
             protection_window_days: self.protection_window_days,
@@ -217,12 +229,22 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         }
     }
 
+    // Only REACHABLE loose objects are repack candidates. An unreachable,
+    // unprotected loose object is garbage: repacking it would re-stamp
+    // `packed_at_ms = now` and shield refused (e.g. secret-bearing) content
+    // inside a fresh protected pack instead of reclaiming it. Those objects
+    // are deleted outright by gc_delete via `deletable_loose_native_objects`.
     let mut pack_candidate_native_objects = Vec::new();
+    let mut deletable_loose_native_objects = Vec::new();
     for id in &loose {
         if !packed.contains(id)
             && !loose_object_protected(&native_store, id, now, protection_window)
         {
-            pack_candidate_native_objects.push(id.to_string());
+            if reachable.contains(id) {
+                pack_candidate_native_objects.push(id.to_string());
+            } else {
+                deletable_loose_native_objects.push(id.to_string());
+            }
         }
     }
 
@@ -247,6 +269,7 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
 
     let plan_digest = gc_plan_digest(
         &pack_candidate_native_objects,
+        &deletable_loose_native_objects,
         &loose_duplicate_native_objects,
         &deletable_native_packs,
         &protected_native_objects,
@@ -256,6 +279,7 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         unreachable_native_objects,
         protected_native_objects,
         pack_candidate_native_objects,
+        deletable_loose_native_objects,
         loose_duplicate_native_objects,
         deletable_native_packs,
         storage,
@@ -268,16 +292,22 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
 
 fn gc_plan_digest(
     pack_candidate_native_objects: &[String],
+    deletable_loose_native_objects: &[String],
     loose_duplicate_native_objects: &[String],
     deletable_native_packs: &[String],
     protected_native_objects: &[String],
     protection_window_days: u64,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"forge-gc-plan-v2\n");
+    hasher.update(b"forge-gc-plan-v3\n");
     hasher.update(format!("protection_window_days={protection_window_days}\n"));
     for id in pack_candidate_native_objects {
         hasher.update(b"pack ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    for id in deletable_loose_native_objects {
+        hasher.update(b"delete-unreachable-loose ");
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }

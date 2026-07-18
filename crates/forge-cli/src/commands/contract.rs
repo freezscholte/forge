@@ -2432,7 +2432,9 @@ fn run_response(request_id: Option<String>, args: ContractRunArgs) -> ResponseEn
                 &diff,
                 &allow,
                 &forbid,
-                scratch.path()
+                scratch.path(),
+                &store,
+                &baseline
             ));
             if blast.has_violation() {
                 // Prior tasks' pass verdicts + this task's failing verdicts, all atomic

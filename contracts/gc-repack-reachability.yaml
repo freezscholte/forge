@@ -1,0 +1,68 @@
+schema: ccx.contract.v1
+id: ccx-gc-repack-reachability
+revision: 1
+ticket: NER-TBD (LINEAR-PENDING.md item 1 — gc repack not reachability-filtered)
+task: Stop gc from repacking unreachable native objects so refused secret content is actually reclaimed instead of lingering zstd-compressed in a fresh protected pack.
+
+interface: |
+  In crates/forge-store/src/gc.rs, the pack-candidate selection feeding
+  write_pack_from_loose_objects currently includes every unprotected loose
+  object regardless of reachability. Change it so ONLY reachable objects are
+  candidates for repacking: an unreachable, unprotected loose object is
+  deleted by gc_delete and must never be copied into a new pack. Reachability
+  is the same set gc_plan already computes for its unreachable_native_objects
+  reporting — reuse that computation; do not build a second one.
+
+  Consequence to encode in tests: after a secret-content-refused contract run
+  leaves an unreferenced post-tree, a single gc dry-run + gc_delete cycle
+  (past the protection window for those loose objects) removes the secret
+  bytes from BOTH the loose store and every pack. Update the existing
+  flip-guard test gc_reclaims_secret_refused_unreferenced_post_tree in
+  crates/forge-cli/tests/forge_contract.rs: its RESIDUAL comment and the
+  assertion that the secret survives in a pack must flip to assert the secret
+  is fully gone (the test was written to fail on exactly this fix so it would
+  be revisited — revisit it).
+
+  Reachable objects keep today's behavior exactly: they remain repack
+  candidates, existing packs are still pruned via deletable_native_packs
+  when wholly unreachable, and pack_entry_protected / protection-window
+  semantics for reachable content are unchanged.
+
+invariants:
+  - forge doctor stays green over repositories with packed and loose content
+    before and after gc.
+  - No reachable object is ever deleted or lost by gc (existing
+    gc_retains_referenced_run_patch_object and forge_pack_gc suites keep
+    passing, updated only if an assertion text mentions the old repack set).
+  - gc deletion still requires clean doctor, --yes, and --plan-digest from a
+    prior dry-run; no change to that gate.
+
+acceptance:
+  fix:
+    - cargo test -p forge-cli --test forge_contract
+    - cargo test -p forge-store
+  guard:
+    - cargo test -p forge-cli --test forge_pack_gc
+    - cargo test -p forge-content-native
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - scope: crates/forge-store/src/gc.rs
+    reason: The protection window for reachable objects and the doctor/--yes/--plan-digest deletion gate are load-bearing safety behavior; narrow the repack candidate set only.
+    source_evidence: docs/code-reviews/2026-07-18-ccx-native-contracts.md (Defer-able section)
+  - scope: crates/forge-cli/tests/forge_contract.rs
+    reason: The flip-guard test must be updated, not deleted; its purpose is to pin the new reclamation behavior with a pack-content assertion.
+    source_evidence: RESIDUAL comment in gc_reclaims_secret_refused_unreferenced_post_tree
+
+allowed_changes:
+  paths:
+    - crates/forge-store/src/gc.rs
+    - crates/forge-cli/tests/forge_contract.rs
+    - crates/forge-cli/tests/forge_pack_gc.rs
+  forbidden_paths:
+    - crates/forge-content-native/src/pack.rs
+
+authority:
+  source: docs/code-reviews/2026-07-18-ccx-native-contracts.md + LINEAR-PENDING.md
+  confidence: high
+  reviewer: Jan Skolte

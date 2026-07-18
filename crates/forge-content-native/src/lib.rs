@@ -23,10 +23,14 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 
+mod blob_read;
 mod pack;
 pub mod provenance;
 mod status_cache;
 mod workspace_equality;
+
+use blob_read::object_id_from_content_ref;
+pub use blob_read::read_blob_at_path;
 pub use workspace_equality::tree_equality_drift;
 
 pub use provenance::{attribute_lines, path_provenance, LineAttribution, PathProvenanceEntry};
@@ -1026,9 +1030,9 @@ impl NativeRefStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TreeObject {
-    schema_version: u32,
-    entries: Vec<TreeEntry>,
+pub(crate) struct TreeObject {
+    pub(crate) schema_version: u32,
+    pub(crate) entries: Vec<TreeEntry>,
 }
 
 /// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
@@ -1106,16 +1110,16 @@ pub struct CommitObject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TreeEntry {
-    name: String,
-    kind: TreeEntryKind,
-    mode: u32,
-    object: String,
+pub(crate) struct TreeEntry {
+    pub(crate) name: String,
+    pub(crate) kind: TreeEntryKind,
+    pub(crate) mode: u32,
+    pub(crate) object: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum TreeEntryKind {
+pub(crate) enum TreeEntryKind {
     File,
     Dir,
 }
@@ -1135,15 +1139,7 @@ struct FileEntry {
 /// The tree-entry mode for a symlink: git's `120000`. A symlink leaf is a `TreeEntryKind::File`
 /// whose blob is the target bytes and whose mode is this; folding mode into the diff key
 /// (`FileFingerprint`) keeps a symlink distinct from a regular file with identical bytes.
-const SYMLINK_MODE: u32 = 0o120000;
-
-fn object_id_from_content_ref(content_ref: &str) -> Result<ObjectId> {
-    ObjectId::parse(
-        content_ref
-            .strip_prefix(FORGE_TREE_PREFIX)
-            .ok_or_else(|| anyhow!("unsupported content ref"))?,
-    )
-}
+pub(crate) const SYMLINK_MODE: u32 = 0o120000;
 
 fn write_tree(
     store: &NativeObjectStore,

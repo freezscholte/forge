@@ -2789,46 +2789,47 @@ fn gc_reclaims_secret_refused_unreferenced_post_tree() {
         "the refused post-tree must be unreferenced and collectable"
     );
 
-    // Run the dry-run + delete cycle TWICE. The FIRST gc_delete removes the loose
-    // plaintext object, but because `pack_candidate_native_objects` is NOT
-    // reachability-filtered (gc.rs), it also REPACKS every unprotected loose object —
-    // including this unreachable secret tree — into a fresh zstd pack. So a loose-only
-    // scan would falsely report the secret scrubbed while it survives compressed in a
-    // pack. The SECOND cycle would prune a now-wholly-unreachable pack via
-    // `deletable_native_packs` IF that pack were past the protection window.
-    for _ in 0..2 {
-        let dry = gc_dry_run(&repo);
-        let digest = dry["plan_digest"].as_str().unwrap().to_string();
-        gc_delete(&repo, &digest);
-        backdate_all_native_objects(&repo);
-    }
+    // A SINGLE dry-run + delete cycle is enough. `pack_candidate_native_objects` is
+    // reachability-filtered (gc.rs), so the unreachable secret tree is never repacked
+    // into a fresh (protection-window-shielded) pack; it is reported under
+    // `deletable_loose_native_objects` and deleted outright by gc_delete.
+    let dry = gc_dry_run(&repo);
+    assert!(
+        !dry["deletable_loose_native_objects"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the unreachable, unprotected secret objects must be planned for direct deletion"
+    );
+    assert!(
+        dry["pack_candidate_native_objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| !array_contains_str(
+                &dry["unreachable_native_objects"],
+                candidate.as_str().unwrap()
+            )),
+        "no unreachable object may be a repack candidate"
+    );
+    let digest = dry["plan_digest"].as_str().unwrap().to_string();
+    gc_delete(&repo, &digest);
 
-    // What IS unconditionally true and load-bearing: the LOOSE plaintext object is gone.
+    // The load-bearing guarantee (was RESIDUAL, now closed): the secret plaintext is
+    // gone from the LOOSE store AND from every pack — gc no longer launders refused
+    // content into a fresh zstd pack whose re-stamped `packed_at_ms` would shield it.
     assert!(
         !any_object_contains(&repo, "AKIASEKRETGCMARKER"),
         "gc must reclaim the loose plaintext secret object"
     );
+    assert!(
+        !any_pack_object_contains(&repo, "AKIASEKRETGCMARKER"),
+        "gc must not repack the unreachable secret tree; one gc cycle scrubs it from \
+         every pack as well as the loose store"
+    );
     // doctor stays green throughout (no dangling refs, chain intact).
     let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
     assert_eq!(report["data"]["ok"], true);
-
-    // RESIDUAL (honest): the second pass does NOT reclaim the secret-bearing pack,
-    // because gc re-stamps `packed_at_ms = now` when it writes the repack, so the fresh
-    // pack is inside the protection window and `pack_entry_protected` shields it — even
-    // though every backdated loose object it was built from was long past the window.
-    // Net effect: a secret-content-refused post-tree's plaintext is scrubbed from the
-    // LOOSE store but lingers zstd-compressed in a protected pack until the window
-    // elapses. This is a known gc property (repack-of-unreachable + fresh packed_at_ms),
-    // filed for follow-up triage; it does not weaken the loose-scrub guarantee above.
-    // The assertion documents the observed state so a future fix (reachability-filtered
-    // repack, or inheriting the loose mtime as packed_at_ms) will flip it and force this
-    // test to be revisited.
-    assert!(
-        any_pack_object_contains(&repo, "AKIASEKRETGCMARKER"),
-        "RESIDUAL: the secret currently survives in a protected pack after two gc passes; \
-         if this assertion fails, gc now scrubs the pack too — update this test and close \
-         the residual"
-    );
 }
 
 #[test]

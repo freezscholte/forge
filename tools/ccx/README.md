@@ -4,14 +4,13 @@
 > lint / brief / blast / run / verify natively as first-class signed ledger
 > records (see the "Contract-Driven Agent Work" section of the top-level
 > `README.md` and `docs/plans/completed/2026-07-10-001-feat-ccx-native-contracts-plan.md`).
-> These scripts remain **authoritative** until the R21 retirement dogfood — a
-> full native chain (author → freeze → run → stop → triage → verify → integrate)
-> with the agent invocation as the only script glue — is recorded. That
-> retirement scenario now runs green as
-> `native_chain_end_to_end_retirement_criterion` in
-> `crates/forge-cli/tests/forge_contract_retirement.rs`; the scripts stay in place until the
-> criterion is formally recorded in the release audit. Nothing below is
-> deprecated yet.
+> **Retired as the authoritative surface (2026-07-18).** The native
+> `forge contract` family (lint / freeze / brief / run / verify / integrate /
+> stops / show / runs / verdicts / resolve) covers every stage below; the R21
+> retirement dogfood is recorded in `docs/P9_RELEASE_AUDIT.md` and
+> `docs/code-reviews/2026-07-18-dogfood3-gc-repack.md`. These scripts remain
+> in-tree as the frozen reference implementation (byte-parity fixtures and
+> self-tests still exercise them); use `forge contract` for new work.
 
 A small, Git-compatible toolkit for running **context-closed tasks**:
 implementation work executed by fresh agent sessions from byte-stable
