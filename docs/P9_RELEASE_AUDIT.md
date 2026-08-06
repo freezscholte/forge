@@ -398,7 +398,7 @@ policy management, and identity governance remain product follow-ons.
 The contract-driven agent-work surface (`forge contract` family: lint, freeze,
 brief, run, integrate, verify, stops, show, runs, verdicts, resolve — plan
 `docs/plans/completed/2026-07-10-001-feat-ccx-native-contracts-plan.md`) merged
-to main at `035e8f3` after two multi-model review gates (triage:
+to main at `dca3fc2` after two multi-model review gates (triage:
 `docs/code-reviews/2026-07-18-ccx-native-contracts.md`).
 
 **R21 retirement criterion: satisfied in anger** (dogfood #3, 2026-07-18,
@@ -406,7 +406,7 @@ record: `docs/code-reviews/2026-07-18-dogfood3-gc-repack.md`): a real
 Fable-agent contract run implemented the gc repack-reachability fix through
 the native surface end-to-end — author → freeze → run (first run refused by
 the blast secret-content gate, triaged as a tooling defect and fixed as
-diff-aware scanning `29f70d6`) → rerun completed → verify green (fix=2
+diff-aware scanning `feb02a9`) → rerun completed → verify green (fix=2
 guard=3) → integrate → accept → doctor green — with the agent invocation as
 the only script glue. Per the plan's staged-stability decision, the contract
 ledger kinds and their envelope surfaces are now **adopter-grade stable**, and
@@ -416,4 +416,25 @@ implementation and for their self-tests.
 
 Additional supportable claim: forge gc never repacks unreachable objects;
 refused (e.g. secret-bearing) content is reclaimed from the loose store and
-packs in one gc cycle (`b5d7f3c`).
+packs in one gc cycle (`925d3ee`).
+
+## Addendum 2026-08-06 — rc11: history publication + gate rerun
+
+Before publication, the unpushed local history was rewritten with
+`git filter-repo` to remove `experiments/**` (the CCX research record): 12
+experiments-only commits dropped, mixed commits kept their code changes, final
+tree byte-identical. The full unredacted record is archived in the private
+`forge-vcs/forge-research` repository (`f2d9e05`, with `PROVENANCE.md`).
+Commit hashes cited in earlier addenda were remapped accordingly
+(`035e8f3` → `dca3fc2`, `29f70d6` → `feb02a9`, `b5d7f3c` → `925d3ee`). The
+cleaned history was pushed to `main` at `3711ddb` with GitHub Actions CI
+green.
+
+The full release gate (`bash scripts/dogfood-release-gate.sh`) was rerun at
+`3711ddb` on 2026-08-06 and passed end-to-end: fmt, clippy, workspace tests
+all green; e2e PASS=95 FAIL=0; hosted/third-party attestation PASS=26 FAIL=0;
+native sync litmus PASS=32 FAIL=0; peer sync PASS=26 FAIL=0; no-git peer sync
+PASS=26 FAIL=0; TypeScript native dogfood PASS=44 FAIL=0; storage-scale smoke
+PASS=30 FAIL=0. The `v0.1.0-rc11` tag is cut on the commit adding this
+addendum (rc10 was tagged 2026-07-06 at `6238c53`, before the dogfood #3
+and history-publication work recorded above).

@@ -54,7 +54,7 @@ a new-secret-line-added case still refuses.
 
 ## Examples
 
-- Fix: `29f70d6` (`contract_blast.rs` diff-aware scan + `blob_read` baseline
+- Fix: `feb02a9` (`contract_blast.rs` diff-aware scan + `blob_read` baseline
   access); regression tests in `crates/forge-cli/tests/forge_contract_hardening.rs`.
 - Trigger: dogfood #3 run 1 (`docs/code-reviews/2026-07-18-dogfood3-gc-repack.md`).
 - Same family as gitleaks' protect-mode staged-diff scanning: mature secret

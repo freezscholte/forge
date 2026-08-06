@@ -14,7 +14,7 @@ Notable machinery wins even in refusal:
 - The violated run was discoverable cold via `forge contract runs --json` — the query surface added by the branch review (F12) for exactly this scenario.
 - The gate failed closed: verdict recorded, patch not persisted, dependents halted, exit 3 with envelope `outcome: blast_violation`.
 
-**Triage:** tooling defect, not contract ambiguity — no revision bump. Fixed as diff-aware scanning (`29f70d6`): modified files scan only agent-added lines against the baseline blob (new `forge-content-native` blob-read module); added files still scan whole; new-secret refusal, bounds, and path-only reporting unchanged. Regression test reproduces the exact run-1 scenario.
+**Triage:** tooling defect, not contract ambiguity — no revision bump. Fixed as diff-aware scanning (`feb02a9`): modified files scan only agent-added lines against the baseline blob (new `forge-content-native` blob-read module); added files still scan whole; new-secret refusal, bounds, and path-only reporting unchanged. Regression test reproduces the exact run-1 scenario.
 
 ## Run 2 — completed (exit 0), chain green end-to-end
 
