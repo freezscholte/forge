@@ -1,5 +1,49 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc11
+
+Forge v0.1.0-rc11 is a public release candidate that ships the contract-driven
+agent-work surface: agent tasks are now first-class, ledger-recorded Forge
+objects that can be authored, frozen, run, verified, and integrated entirely
+through the native CLI.
+
+### Changed
+
+- Added the `forge contract` family — `lint`, `freeze`, `brief`, `run`,
+  `integrate`, `verify`, `stops`, `show`, `runs`, `verdicts`, `resolve` — with
+  fail-closed scratch runs, typed stop codes, and redacted agent-output capture.
+- Made the blast secret-content gate diff-aware: modified files are scanned only
+  on the agent-authored delta against the baseline blob, so pre-existing content
+  no longer triggers refusals; new files still scan whole.
+- Fixed `forge gc` to never repack unreachable objects: refused (e.g.
+  secret-bearing) content is reclaimed from both the loose store and packs in a
+  single gc cycle.
+- Extended `forge doctor` and gc coverage to the contract ledger kinds.
+- Retired the overlapping `tools/ccx` script stages; the scripts remain in-tree
+  as the frozen reference implementation. Contract ledger kinds and their
+  envelope surfaces are now adopter-grade stable.
+
+### Verification
+
+The aggregate dogfood gate passed at the tagged commit on 2026-08-06:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 604 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+The contract surface itself was proven in anger by dogfood #3: a real agent
+contract run implemented the gc repack-reachability fix end-to-end (author →
+freeze → run → verify → integrate → accept → doctor green), recorded in
+`docs/code-reviews/2026-07-18-dogfood3-gc-repack.md` and the release audit
+addenda in `docs/P9_RELEASE_AUDIT.md`.
+
 ## v0.1.0-rc10
 
 Forge v0.1.0-rc10 is a public release candidate focused on making native
